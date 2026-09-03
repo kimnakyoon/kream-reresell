@@ -34,6 +34,9 @@ class Settings:
     min_margin_rate: float = field(default_factory=lambda: _float("MIN_MARGIN_RATE", 0.10))
     bid_days: int = field(default_factory=lambda: _int("BID_DAYS", 7))
     max_products: int = field(default_factory=lambda: _int("MAX_PRODUCTS", 30))
+    # 이미지/동영상/폰트를 받지 않아 페이지를 빨리 띄운다. 화면 확인이 필요하면 .env 에 BLOCK_IMAGES=0
+    block_images: bool = field(
+        default_factory=lambda: os.environ.get("BLOCK_IMAGES", "1").strip().lower() not in ("0", "false", "no"))
 
     # 실행 모드
     dry_run: bool = False          # 판단만 하고 입찰 폼은 건드리지 않는다

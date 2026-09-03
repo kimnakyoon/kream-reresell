@@ -57,12 +57,28 @@ def _wait_for_port(port: int, timeout_sec: float) -> bool:
     return False
 
 
+# 판정에 전혀 쓰지 않는 리소스. 상품 페이지는 이미지가 용량의 대부분이라 이것만 안 받아도 훨씬 빠르다.
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+
+
+def _abort_heavy(route) -> None:
+    if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+        route.abort()
+    else:
+        route.continue_()
+
+
+def block_heavy_resources(context: BrowserContext) -> None:
+    context.route("**/*", _abort_heavy)
+
+
 @contextlib.contextmanager
 def real_chrome_context(playwright: Playwright, window_size: str = "1400,1000",
-                        profile_dir: Path | None = None):
+                        profile_dir: Path | None = None, block_images: bool = True):
     """크롬을 직접 실행해 CDP 로 붙은 BrowserContext (with 문으로 쓴다).
 
     창은 항상 보이게 띄운다 - headless 는 봇 탐지 점수가 바닥이다.
+    block_images 가 True 면 이미지/동영상/폰트를 받지 않는다 (화면에 그림은 안 보이지만 동작은 같다).
     """
     profile = (profile_dir or PROFILE_DIR).resolve()  # 상대경로를 주면 크롬이 조용히 종료한다
     profile.mkdir(parents=True, exist_ok=True)
@@ -88,6 +104,8 @@ def real_chrome_context(playwright: Playwright, window_size: str = "1400,1000",
         browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
         context: BrowserContext = browser.contexts[0] if browser.contexts else browser.new_context()
         context.set_default_timeout(15_000)
+        if block_images:
+            block_heavy_resources(context)
         yield context
     finally:
         if browser is not None:

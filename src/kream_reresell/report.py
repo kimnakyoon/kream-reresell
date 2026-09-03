@@ -1,10 +1,10 @@
-"""실행 결과를 엑셀 보고서(data/reports/kream_YYYYMMDD_HHMMSS.xlsx) 로 정리한다."""
+"""실행 결과를 엑셀 보고서(바탕화면\\KREAM 결과\\KREAM 입찰결과 날짜.xlsx) 로 정리한다."""
 
 from __future__ import annotations
 
 import logging
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -147,10 +147,3 @@ def open_file(path: Path) -> None:
         os.startfile(str(path))  # type: ignore[attr-defined]
     except Exception as e:  # noqa: BLE001
         log.warning("파일을 열지 못했습니다(%s): %s", e, path)
-
-
-def result_to_dict(r: ProductResult) -> dict:
-    d = asdict(r)
-    d["margin"] = r.margin
-    d["margin_rate"] = r.margin_rate
-    return d

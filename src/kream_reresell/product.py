@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
-from .dates import parse_trade_date, parse_won
+from .dates import parse_trade_date
 
 log = logging.getLogger(__name__)
 
@@ -29,16 +29,13 @@ class SalesStats:
     reached_window_end: bool  # 기간 밖(더 오래된) 행까지 봤는지
 
 
-@dataclass
-class ProductInfo:
-    product_id: int
-    name: str
-    price_a: int  # 빠른배송 가격 = 내가 팔게 될 예상가
-
-
 def open_product(page: Page, url: str) -> str:
     page.goto(url, wait_until="domcontentloaded")
-    page.wait_for_timeout(2000)
+    try:
+        page.get_by_role("button", name="구매하기", exact=True).first.wait_for(state="visible", timeout=15_000)
+    except PlaywrightTimeout as e:
+        raise SkipProduct("상품 페이지가 뜨지 않음 ('구매하기' 버튼 없음)") from e
+    page.wait_for_timeout(300)
     title = page.title().split(" 정품")[0].strip()
     return title
 
@@ -50,13 +47,28 @@ def read_sales_stats(page: Page, lookback_days: int, need: int) -> SalesStats:
 
     need 개를 채우거나 기간 밖 행이 나오면 더 읽지 않는다.
     """
-    more = page.get_by_role("button", name="거래 내역 더보기").first
+    # 아직 리셀 거래(빠른배송)가 열리지 않은 상품은 체결 거래/입찰 표 자체가 없다.
+    # 나중에 생길 수 있으므로 매 실행마다 확인은 하고, 없으면 기다리지 않고 바로 넘긴다.
+    if page.get_by_text("체결 거래", exact=True).count() == 0:
+        raise SkipProduct("체결 거래 표가 없는 상품 (아직 리셀 거래 없음) - 바로 넘김")
+    # 상품 페이지의 체결 표에 행이 그려질 때까지 기다린다 - 그 전에 누르면 하이드레이션 전이라 클릭이 먹지 않는다
     try:
-        more.scroll_into_view_if_needed()
-        more.click()
-    except PlaywrightTimeout as e:
-        raise SkipProduct("'거래 내역 더보기' 버튼을 찾지 못함 (거래 내역 없음?)") from e
-    page.wait_for_timeout(1500)
+        page.wait_for_function(f"() => ({_SALES_ROWS_JS})().length > 0", timeout=10_000)
+    except PlaywrightTimeout:
+        pass
+    more = page.get_by_role("button", name="거래 내역 더보기").first
+    for attempt in range(3):
+        try:
+            more.scroll_into_view_if_needed()
+            more.click()
+            # 패널 루트 클래스는 숨겨진 모바일 복제본에도 붙어 있어 locator 의 visible 판정을 쓸 수 없다
+            page.wait_for_function(_SALES_PANEL_VISIBLE_JS, timeout=4000)
+            break
+        except PlaywrightTimeout:
+            log.debug("거래 내역 패널 열기 재시도 %d", attempt + 1)
+    else:
+        raise SkipProduct("'거래 내역 더보기' 패널이 열리지 않음")
+    page.wait_for_timeout(500)
 
     cutoff = datetime.now() - timedelta(days=lookback_days)
     fast = total = 0
@@ -88,7 +100,7 @@ def read_sales_stats(page: Page, lookback_days: int, need: int) -> SalesStats:
             stale = 0
         prev_count = len(rows)
         page.evaluate(_SCROLL_SALES_JS)
-        page.wait_for_timeout(1200)
+        page.wait_for_timeout(700)
 
     stats = SalesStats(fast, total, len(rows), reached_end)
     log.info("체결 내역: %d행 읽음, %d일 내 빠른배송 %d건 / 전체 %d건%s",
@@ -103,7 +115,7 @@ def _close_sales_panel(page: Page) -> None:
         if not page.evaluate(_SALES_PANEL_VISIBLE_JS):
             return
         page.evaluate(_CLICK_PANEL_CLOSE_JS)
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(400)
     if page.evaluate(_SALES_PANEL_VISIBLE_JS):
         raise SkipProduct("체결 내역 패널을 닫지 못함")
 
@@ -185,21 +197,25 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int) -> int:
     모달 루트는 .bottom-sheet__layer--open.layer-option-picker (사이즈 목록 + 배송 선택 + 버튼).
     """
     buy = page.get_by_role("button", name="구매하기", exact=True).first
-    buy.scroll_into_view_if_needed()
-    buy.click()
     modal = page.locator(MODAL_SELECTOR).first
-    try:
-        modal.wait_for(state="visible", timeout=8000)
-        modal.get_by_role("button", name="장바구니 담기").first.wait_for(state="visible", timeout=8000)
-    except PlaywrightTimeout as e:
-        raise SkipProduct("구매하기 모달이 뜨지 않음") from e
-    page.wait_for_timeout(800)
+    for attempt in range(3):
+        try:
+            buy.scroll_into_view_if_needed()
+            buy.click()
+            modal.wait_for(state="visible", timeout=4000)
+            modal.get_by_role("button", name="장바구니 담기").first.wait_for(state="visible", timeout=4000)
+            break
+        except PlaywrightTimeout:
+            log.debug("구매하기 모달 열기 재시도 %d", attempt + 1)
+    else:
+        raise SkipProduct("구매하기 모달이 뜨지 않음")
+    page.wait_for_timeout(400)
 
     if "ONE SIZE" not in modal.inner_text():
         raise SkipProduct("옵션(사이즈)이 있는 상품 - 지금은 ONE SIZE 상품만 진행")
     # ONE SIZE 가 이미 선택돼 있어도 한 번 눌러 확실히 한다
     modal.get_by_text("ONE SIZE", exact=False).first.click()
-    page.wait_for_timeout(800)
+    page.wait_for_timeout(400)
 
     price_a = _parse_fast_price(modal.inner_text())
     if price_a is None:
@@ -207,7 +223,7 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int) -> int:
     log.info("A(빠른배송 가격) = %s원", f"{price_a:,}")
 
     modal.get_by_text("일반배송", exact=False).first.click()
-    page.wait_for_timeout(800)
+    page.wait_for_timeout(400)
     go = modal.get_by_role("button", name=re.compile("구매 입찰")).first
     try:
         go.wait_for(state="visible", timeout=5000)
@@ -215,7 +231,11 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int) -> int:
         raise SkipProduct("'즉시 구매 / 구매 입찰' 버튼이 없음") from e
     go.click()
     page.wait_for_url(re.compile(rf"/buy/{product_id}"), timeout=15_000)
-    page.wait_for_timeout(1500)
+    try:
+        page.get_by_text("즉시 판매가", exact=True).first.wait_for(state="visible", timeout=10_000)
+    except PlaywrightTimeout as e:
+        raise SkipProduct("구매 페이지가 뜨지 않음 ('즉시 판매가' 없음)") from e
+    page.wait_for_timeout(300)
     return price_a
 
 

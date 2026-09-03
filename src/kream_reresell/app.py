@@ -49,7 +49,7 @@ def run_job(settings: Settings, category: str, product_ids: list[int] | None = N
     settings_line = describe_settings(settings, category)
     log.info("%s | %s", mode, settings_line)
 
-    with sync_playwright() as pw, real_chrome_context(pw) as context:
+    with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images) as context:
         page = context.pages[0] if context.pages else context.new_page()
         auth.ensure_logged_in(page, settings)
 

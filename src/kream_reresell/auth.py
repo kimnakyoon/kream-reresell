@@ -36,7 +36,12 @@ def is_logged_in(page: Page) -> bool:
 
 def _check_home(page: Page) -> bool:
     page.goto(HOME, wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
+    # 상단 유틸 메뉴(로그인 또는 로그아웃 링크)가 그려질 때까지만 기다린다
+    try:
+        page.locator("a:has-text('로그아웃'), a:has-text('로그인')").first.wait_for(state="attached", timeout=10_000)
+    except Exception:  # noqa: BLE001
+        pass
+    page.wait_for_timeout(300)
     return is_logged_in(page)
 
 

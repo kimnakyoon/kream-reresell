@@ -37,7 +37,8 @@ def open_category(page: Page, category: str) -> None:
     cid = KNOWN_CATEGORY_IDS.get(category)
     if cid is not None:
         page.goto(f"{RANKING_URL}&category_filter={cid}", wait_until="domcontentloaded")
-        page.wait_for_timeout(2000)
+        page.locator('a[href*="/products/"]').first.wait_for(state="visible", timeout=15_000)
+        page.wait_for_timeout(500)
         return
 
     page.goto(RANKING_URL, wait_until="domcontentloaded")
@@ -78,7 +79,7 @@ def collect_products(page: Page, limit: int) -> list[RankedProduct]:
         else:
             stale_rounds = 0
         page.mouse.wheel(0, 2500)
-        page.wait_for_timeout(1200)
+        page.wait_for_timeout(800)
     result = list(seen.values())[:limit]
     log.info("랭킹 상품 %d개 수집", len(result))
     return result
