@@ -26,12 +26,17 @@ def main() -> int:
         print("run_log.csv 가 없습니다"); return 1
     src = RUN_LOG_PATH if RUN_LOG_PATH.exists() else paths[-1]
     rows = list(csv.DictReader(src.open(encoding="utf-8-sig")))
-    # 마지막 블록: 뒤에서부터 순위가 1이 나오는 곳까지
+    # 마지막 블록: 뒤에서부터 1위 행을 만날 때마다 상품군 하나가 끝난 것.
+    # 같은 상품군의 1위가 두 번째로 나오면 그 앞은 이전 실행이므로 거기서 멈춘다.
     start = 0
+    seen_cats: set[str] = set()
     for i in range(len(rows) - 1, -1, -1):
         if rows[i].get("rank") == "1":
+            cat = rows[i].get("category", "")
+            if cat in seen_cats:
+                break
+            seen_cats.add(cat)
             start = i
-            break
     block = rows[start:]
     results = []
     for row in block:
@@ -42,7 +47,8 @@ def main() -> int:
         pid = _int(row["product_id"]) or 0
         r = report.ProductResult(
             rank=_int(row["rank"]) or 0, product_id=pid, name=row["name"],
-            url=f"https://kream.co.kr/products/{pid}", status=status, detail=detail,
+            url=f"https://kream.co.kr/products/{pid}", category=row.get("category", ""),
+            status=status, detail=detail,
             fast_sales=_int(row.get("fast_sales", "")), price_a=_int(row.get("price_a", "")),
             price_b=_int(row.get("price_b", "")), time=row["time"],
         )

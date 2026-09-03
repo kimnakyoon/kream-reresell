@@ -203,10 +203,25 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int) -> int:
             buy.scroll_into_view_if_needed()
             buy.click()
             modal.wait_for(state="visible", timeout=4000)
+        except PlaywrightTimeout:
+            log.debug("구매하기 모달 열기 재시도 %d", attempt + 1)
+            continue
+        # 사이즈 옵션 상품(신발 등)은 모달에 사이즈 목록만 있고 ONE SIZE / '장바구니 담기' 가 없다.
+        # ONE SIZE 가 그려지면 바로 진행하고, 2초 안에 안 나오는데 내용은 있으면 옵션 상품으로 보고 건너뛴다.
+        try:
+            page.wait_for_function(
+                f"() => {{ const m = document.querySelector('{MODAL_SELECTOR}');"
+                " return !!m && m.innerText.includes('ONE SIZE'); }", timeout=2000)
+        except PlaywrightTimeout:
+            if len(modal.inner_text().strip()) > 20:
+                raise SkipProduct("옵션(사이즈)이 있는 상품 - 지금은 ONE SIZE 상품만 진행") from None
+            log.debug("구매하기 모달 내용 대기 재시도 %d", attempt + 1)
+            continue
+        try:
             modal.get_by_role("button", name="장바구니 담기").first.wait_for(state="visible", timeout=4000)
             break
         except PlaywrightTimeout:
-            log.debug("구매하기 모달 열기 재시도 %d", attempt + 1)
+            log.debug("구매하기 모달 내용 대기 재시도 %d", attempt + 1)
     else:
         raise SkipProduct("구매하기 모달이 뜨지 않음")
     page.wait_for_timeout(400)

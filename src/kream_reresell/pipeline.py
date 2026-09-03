@@ -23,10 +23,10 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
     """상품 하나를 새 탭에서 처리한다."""
     page: Page = context.new_page()
     pid = item.product_id
-    r = ProductResult(rank=item.rank, product_id=pid, name=item.name, url=item.url)
+    r = ProductResult(rank=item.rank, product_id=pid, name=item.name, url=item.url, category=item.category)
     try:
         r.name = product_mod.open_product(page, item.url) or item.name
-        log.info("[%d위] %s (%s)", item.rank, r.name, item.url)
+        log.info("[%s %d위] %s (%s)", item.category, item.rank, r.name, item.url)
         if settings.inspect:
             dump(page, f"{pid}_0_product")
 
@@ -82,7 +82,7 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
         r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log.info("[%d위] 결과: %s - %s", item.rank, r.status, r.detail)
         append_run_log({
-            "rank": r.rank, "product_id": pid, "name": r.name,
+            "category": r.category, "rank": r.rank, "product_id": pid, "name": r.name,
             "fast_sales": r.fast_sales if r.fast_sales is not None else "",
             "price_a": r.price_a or "", "price_b": r.price_b or "",
             "status": r.status, "detail": r.detail,
@@ -115,7 +115,7 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
             log.info("[%d위] %s - 이미 입찰한 상품, 건너뜀", item.rank, item.name)
             results.append(ProductResult(
                 rank=item.rank, product_id=item.product_id, name=item.name, url=item.url,
-                status="건너뜀", detail=f"이미 입찰함 ({prev.placed_at[:16]}, {prev.price:,}원)",
+                category=item.category, status="건너뜀", detail=f"이미 입찰함 ({prev.placed_at[:16]}, {prev.price:,}원)",
                 bid_price=prev.price, bid_days=prev.bid_days,
             ))
             if on_result:

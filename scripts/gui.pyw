@@ -15,7 +15,7 @@ import threading
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox
 
 if sys.platform == "win32" and sys.stdout is not None:
     # pythonw.exe(콘솔 없는 실행)에서는 stdout/stderr 가 None 이라 건드리면 안 된다.
@@ -27,13 +27,15 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from kream_reresell.app import run_job  # noqa: E402
 from kream_reresell.config import LOG_DIR, Settings  # noqa: E402
+from kream_reresell.ranking import ALL_CATEGORIES, DEFAULT_CATEGORY  # noqa: E402
 from kream_reresell.report import REPORT_DIR  # noqa: E402
 
-WINDOW_WIDTH = 640
-WINDOW_HEIGHT = 600
+WINDOW_WIDTH = 660
+WINDOW_HEIGHT = 700
 RIGHT_MARGIN = 40
 
-CATEGORIES = ["가방", "지갑", "시계", "주얼리", "뷰티", "아이웨어", "키링", "상의", "팬츠", "패딩", "후디", "바람막이", "트레이딩카드"]
+# 상품군 체크박스는 랭킹 칩 순서(ALL_CATEGORIES)대로 나열하고, 체크한 것을 그 순서대로 실행한다.
+CATEGORY_COLUMNS = 6
 
 
 class QueueHandler(logging.Handler):
@@ -71,13 +73,29 @@ class App:
         frame = tk.LabelFrame(root, text="실행 설정")
         frame.pack(fill="x", padx=12, pady=(12, 4))
 
+        # 상품군: 전부 나열해 두고 체크한 것을 위→아래, 왼쪽→오른쪽(랭킹 칩 순서) 순으로 실행한다
+        cat_frame = tk.LabelFrame(frame, text="상품군 (체크한 것을 나열된 순서대로 실행)")
+        cat_frame.pack(fill="x", padx=12, pady=(6, 2))
+        self.category_vars: dict[str, tk.BooleanVar] = {}
+        grid = tk.Frame(cat_frame)
+        grid.pack(fill="x", padx=6, pady=(4, 2))
+        for i, name in enumerate(ALL_CATEGORIES):
+            var = tk.BooleanVar(value=(name == DEFAULT_CATEGORY))
+            self.category_vars[name] = var
+            cb = tk.Checkbutton(grid, text=name, variable=var, anchor="w")
+            cb.grid(row=i // CATEGORY_COLUMNS, column=i % CATEGORY_COLUMNS, sticky="w", padx=(0, 6), pady=1)
+        for col in range(CATEGORY_COLUMNS):
+            grid.columnconfigure(col, weight=1)
+        sel = tk.Frame(cat_frame)
+        sel.pack(fill="x", padx=6, pady=(0, 4))
+        tk.Button(sel, text="전체 선택", command=lambda: self._set_all_categories(True)).pack(side="left")
+        tk.Button(sel, text="전체 해제", command=lambda: self._set_all_categories(False)).pack(side="left", padx=(6, 0))
+        tk.Label(sel, text="※ 신발/러닝화/부츠도 고를 수 있지만, 사이즈 옵션이 있는 상품은 건너뜁니다",
+                 fg="#888").pack(side="left", padx=(12, 0))
+
         row1 = tk.Frame(frame)
         row1.pack(fill="x", **pad)
-        tk.Label(row1, text="상품군").pack(side="left")
-        self.category = ttk.Combobox(row1, values=CATEGORIES, width=14)
-        self.category.set("가방")
-        self.category.pack(side="left", padx=(6, 18))
-        tk.Label(row1, text="상품 수").pack(side="left")
+        tk.Label(row1, text="상품군마다 볼 상품 수").pack(side="left")
         self.limit = tk.Spinbox(row1, from_=1, to=200, width=6)
         self.limit.delete(0, "end")
         self.limit.insert(0, str(self.base.max_products))
@@ -101,7 +119,7 @@ class App:
                                     bg="#222", fg="white", activebackground="#444", activeforeground="white",
                                     command=self.start)
         self.run_button.pack(side="left")
-        self.stop_button = tk.Button(buttons, text="중지 (이 상품까지만)", width=20, height=2, state="disabled",
+        self.stop_button = tk.Button(buttons, text="중지 (이 상품까지만, 남은 상품군 안 함)", width=30, height=2, state="disabled",
                                      command=self.request_stop)
         self.stop_button.pack(side="left", padx=(8, 0))
         self.status = tk.Label(buttons, text="대기 중", fg="#333")
@@ -148,6 +166,14 @@ class App:
         self.log_box.configure(state="disabled")
 
     # ------------------------------------------------------------ 실행
+    def _set_all_categories(self, value: bool) -> None:
+        for var in self.category_vars.values():
+            var.set(value)
+
+    def selected_categories(self) -> list[str]:
+        """체크된 상품군을 나열된(랭킹 칩) 순서대로."""
+        return [name for name in ALL_CATEGORIES if self.category_vars[name].get()]
+
     def start(self) -> None:
         if self.worker and self.worker.is_alive():
             return
@@ -156,10 +182,15 @@ class App:
         except ValueError:
             messagebox.showerror("입력 오류", "상품 수는 숫자로 넣어주세요.")
             return
-        category = self.category.get().strip() or "가방"
+        categories = self.selected_categories()
+        if not categories:
+            messagebox.showerror("입력 오류", "상품군을 하나 이상 체크해 주세요.")
+            return
+        cat_text = " → ".join(categories)
         dry = self.mode.get() == "dry"
         if not dry and not messagebox.askyesno(
-                "실제 입찰", f"'{category}' 상위 {limit}개 중 조건에 맞는 상품에 실제로 구매 입찰을 넣습니다.\n"
+                "실제 입찰", f"상품군 {len(categories)}개를 순서대로 돌며 각각 상위 {limit}개 중 조건에 맞는 상품에 "
+                             f"실제로 구매 입찰을 넣습니다.\n\n{cat_text}\n\n"
                              "배송방법은 창고보관, 포인트는 최대 사용입니다.\n\n진행할까요?"):
             return
 
@@ -169,14 +200,15 @@ class App:
         self.last_report = None
         self.open_report_button.configure(state="disabled")
         self._set_busy(True, "실행 중... (크롬 창을 건드리지 마세요)")
-        self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 시작: {category} 상위 {limit}개, {'판단만' if dry else '실제 입찰'} =====")
+        self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 시작: {cat_text} / 상품군마다 상위 {limit}개, "
+                  f"{'판단만' if dry else '실제 입찰'} =====")
 
-        self.worker = threading.Thread(target=self._worker, args=(settings, category), daemon=True)
+        self.worker = threading.Thread(target=self._worker, args=(settings, categories), daemon=True)
         self.worker.start()
 
-    def _worker(self, settings: Settings, category: str) -> None:
+    def _worker(self, settings: Settings, categories: list[str]) -> None:
         try:
-            job = run_job(settings, category, should_stop=self.stop_flag.is_set)
+            job = run_job(settings, categories, should_stop=self.stop_flag.is_set)
             self.q.put(("done", job))
         except Exception as e:  # noqa: BLE001
             logging.getLogger("gui").exception("실행 중 오류")

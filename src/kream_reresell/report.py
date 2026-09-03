@@ -37,6 +37,7 @@ class ProductResult:
     product_id: int
     name: str
     url: str
+    category: str = ""          # 랭킹 상품군 (가방, 신발 ...)
     status: str = ""            # 입찰완료 / 입찰대상(dry-run) / 건너뜀 / 중단 / 오류 / 확인필요
     detail: str = ""            # 사유
     fast_sales: int | None = None      # 기간 내 빠른배송 체결 수
@@ -61,10 +62,12 @@ class ProductResult:
 
 
 COLUMNS = [
-    ("순위", 6), ("상품명", 46), ("상품ID", 10), ("판정", 12), ("사유 / 결과", 46),
+    ("상품군", 10), ("순위", 6), ("상품명", 46), ("상품ID", 10), ("판정", 12), ("사유 / 결과", 46),
     ("30일 빠른배송", 13), ("30일 전체", 10), ("A 빠른배송가", 14), ("B 즉시판매가", 14),
     ("A−B", 11), ("마진율", 9), ("입찰가", 12), ("입찰기한", 9), ("처리시각", 20), ("링크", 40),
 ]
+_COL = {title: i for i, (title, _) in enumerate(COLUMNS, start=1)}   # 제목 -> 열 번호
+_MONEY_COLS = [_COL[t] for t in ("A 빠른배송가", "B 즉시판매가", "A−B", "입찰가")]
 
 STATUS_FILL = {
     "입찰완료": "C6EFCE",
@@ -104,17 +107,17 @@ def write_report(results: list[ProductResult], settings_line: str, mode: str,
 
     for i, r in enumerate(results, start=header_row + 1):
         values = [
-            r.rank, r.name, r.product_id, r.status, r.detail,
+            r.category, r.rank, r.name, r.product_id, r.status, r.detail,
             r.fast_sales, r.total_sales, r.price_a, r.price_b,
             r.margin, r.margin_rate, r.bid_price,
             f"{r.bid_days}일" if r.bid_days else None, r.time, r.url,
         ]
         for col, v in enumerate(values, start=1):
             ws.cell(row=i, column=col, value=v)
-        for col in (8, 9, 10, 12):
+        for col in _MONEY_COLS:
             ws.cell(row=i, column=col).number_format = "#,##0"
-        ws.cell(row=i, column=11).number_format = "0.0%"
-        link = ws.cell(row=i, column=15)
+        ws.cell(row=i, column=_COL["마진율"]).number_format = "0.0%"
+        link = ws.cell(row=i, column=_COL["링크"])
         link.hyperlink = r.url
         link.font = Font(color="0563C1", underline="single")
         fill = STATUS_FILL.get(r.status)
@@ -123,7 +126,7 @@ def write_report(results: list[ProductResult], settings_line: str, mode: str,
                 ws.cell(row=i, column=col).fill = PatternFill("solid", fgColor=fill)
     ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(COLUMNS))}{header_row + max(len(results), 1)}"
 
-    # 요약 시트
+    # 요약 시트: 판정별 합계 + 상품군별 판정 수
     ss = wb.create_sheet("요약")
     counts: dict[str, int] = {}
     for r in results:
@@ -131,9 +134,27 @@ def write_report(results: list[ProductResult], settings_line: str, mode: str,
     ss["A1"] = "판정"
     ss["B1"] = "상품 수"
     ss["A1"].font = ss["B1"].font = Font(bold=True)
-    for i, (k, v) in enumerate(sorted(counts.items()), start=2):
-        ss.cell(row=i, column=1, value=k)
-        ss.cell(row=i, column=2, value=v)
+    row = 2
+    for k, v in sorted(counts.items()):
+        ss.cell(row=row, column=1, value=k)
+        ss.cell(row=row, column=2, value=v)
+        row += 1
+
+    categories: list[str] = []
+    for r in results:
+        if r.category and r.category not in categories:
+            categories.append(r.category)
+    if len(categories) > 1:
+        row += 1
+        statuses = sorted(counts)
+        ss.cell(row=row, column=1, value="상품군").font = Font(bold=True)
+        for j, st in enumerate(statuses, start=2):
+            ss.cell(row=row, column=j, value=st).font = Font(bold=True)
+        for cat in categories:
+            row += 1
+            ss.cell(row=row, column=1, value=cat)
+            for j, st in enumerate(statuses, start=2):
+                ss.cell(row=row, column=j, value=sum(1 for r in results if r.category == cat and r.status == st))
     ss.column_dimensions["A"].width = 14
 
     wb.save(path)
