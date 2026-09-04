@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PlaywrightTimeout
@@ -355,16 +355,38 @@ def run(context: BrowserContext, page: Page, settings: Settings,
     return results
 
 
-def open_bid_products(context: BrowserContext, page: Page) -> dict[int, OpenBid]:
-    """마이페이지 구매 입찰 목록을 상품 ID -> 입찰 로 돌려준다. 입찰할 때 이미 입찰 중인 상품을 건너뛰는 데 쓴다.
+@dataclass
+class OpenBids:
+    """마이페이지에 지금 살아 있는 구매 입찰. 입찰할 때 이미 입찰 중인 상품을 건너뛰는 유일한 기준."""
+    by_product: dict[int, OpenBid] = field(default_factory=dict)   # 상품 ID 를 알아낸 입찰
+    unread: list[OpenBid] = field(default_factory=list)            # 상품 ID 를 못 읽은 입찰 (상품명으로만 대조)
+
+    def __contains__(self, product_id: int) -> bool:
+        return product_id in self.by_product
+
+    def __len__(self) -> int:
+        return len(self.by_product) + len(self.unread)
+
+    def by_name(self, name: str) -> OpenBid | None:
+        """상품 ID 를 못 읽은 입찰 중 상품명(마이페이지 표기 = 상품 페이지 제목)이 같은 것."""
+        name = name.strip()
+        for b in self.unread:
+            if b.name.strip() == name:
+                return b
+        return None
+
+
+def open_bid_products(context: BrowserContext, page: Page) -> OpenBids:
+    """마이페이지 구매 입찰 목록을 읽어 상품 ID -> 입찰 로 돌려준다. 입찰할 때 이미 입찰 중인 상품을 건너뛰는 데 쓴다.
 
     목록 API 에는 상품 ID 가 없다. 이 프로그램이 넣은 입찰(bids.json)과 상품명·희망가가 같으면 그 ID 를 쓰고,
-    아니면 상세 페이지로 이동해 API 응답만 받는다 (하나에 1~2초). 상품 ID 를 알아낸 것은 상태와 무관하게 건너뛰기 대상에 넣는다.
+    아니면 상세 페이지로 이동해 API 응답만 받는다 (하나에 1~2초). 상품 ID 를 알아낸 것은 상태와 무관하게 건너뛰기 대상에 넣고,
+    끝내 못 읽은 입찰은 unread 에 남겨 상품명으로 대조한다.
     """
     bids = list_open_bids(page)
     out: dict[int, OpenBid] = {}
     if not bids:
-        return out
+        return OpenBids()
     known = load_bids()
     unknown: list[OpenBid] = []
     for bid in bids:
@@ -392,7 +414,8 @@ def open_bid_products(context: BrowserContext, page: Page) -> dict[int, OpenBid]
             except Exception:  # noqa: BLE001
                 pass
     log.info("마이페이지에 입찰 중인 상품 %d개: %s", len(out), ", ".join(str(pid) for pid in out) or "-")
-    unread = [b.bid_id for b in bids if not b.product_id]
+    unread = [b for b in bids if not b.product_id]
     if unread:
-        log.warning("상품 ID 를 못 읽은 입찰 %d건 (#%s) - 그 상품은 건너뛰지 못할 수 있음", len(unread), ", #".join(map(str, unread)))
-    return out
+        log.warning("상품 ID 를 못 읽은 입찰 %d건 (#%s) - 그 상품은 상품명으로만 대조해 건너뜀",
+                    len(unread), ", #".join(str(b.bid_id) for b in unread))
+    return OpenBids(by_product=out, unread=unread)
