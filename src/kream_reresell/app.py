@@ -69,7 +69,8 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
     log.info("%s | %s", mode, settings_line)
 
     results: list[ProductResult] = []
-    with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images) as context:
+    with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images,
+                                                        show_chrome=settings.show_chrome) as context:
         page = context.pages[0] if context.pages else context.new_page()
         auth.ensure_logged_in(page, settings)
         # 마이페이지에 이미 입찰 중인 상품은 건너뛴다 (bids.json 과 별개로 실제 목록을 본다)
@@ -126,7 +127,8 @@ def run_cancel_job(settings: Settings,
     settings_line = describe_cancel_settings(settings)
     log.info("%s | %s", mode, settings_line)
 
-    with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images) as context:
+    with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images,
+                                                        show_chrome=settings.show_chrome) as context:
         page = context.pages[0] if context.pages else context.new_page()
         auth.ensure_logged_in(page, settings)
         results = cancel.run(context, page, settings, should_stop=should_stop, on_result=on_result)

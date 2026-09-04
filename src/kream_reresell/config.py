@@ -24,6 +24,11 @@ def _float(name: str, default: float) -> float:
     return float(raw) if raw else default
 
 
+def _bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    return raw in ("1", "true", "yes") if raw else default
+
+
 @dataclass
 class Settings:
     kream_id: str = field(default_factory=lambda: os.environ.get("KREAM_ID", "").strip())
@@ -35,8 +40,10 @@ class Settings:
     bid_days: int = field(default_factory=lambda: _int("BID_DAYS", 7))
     max_products: int = field(default_factory=lambda: _int("MAX_PRODUCTS", 30))
     # 이미지/동영상/폰트를 받지 않아 페이지를 빨리 띄운다. 화면 확인이 필요하면 .env 에 BLOCK_IMAGES=0
-    block_images: bool = field(
-        default_factory=lambda: os.environ.get("BLOCK_IMAGES", "1").strip().lower() not in ("0", "false", "no"))
+    block_images: bool = field(default_factory=lambda: _bool("BLOCK_IMAGES", True))
+    # 크롬 창을 화면에 보이게 둘지. 기본은 화면 밖으로 치워 두고 GUI 상태창으로만 진행을 본다.
+    # 직접 로그인이 필요하면 자동으로 불러온다. 화면을 보며 점검하려면 .env 에 SHOW_CHROME=1 또는 --show-chrome
+    show_chrome: bool = field(default_factory=lambda: _bool("SHOW_CHROME", False))
 
     # 실행 모드
     dry_run: bool = False          # 판단만 하고 입찰 폼은 건드리지 않는다
@@ -45,6 +52,8 @@ class Settings:
     inspect: bool = False          # 화면마다 접근성 스냅샷을 dumps/ 에 남긴다
 
     def validate(self) -> None:
+        if self.stop_before_submit:
+            self.show_chrome = True  # 마지막 버튼 직전에 멈추는 점검은 사람이 화면을 보는 게 목적
         if self.bid_days not in BID_DAY_CHOICES:
             raise ValueError(f"BID_DAYS 는 {BID_DAY_CHOICES} 중 하나여야 합니다: {self.bid_days}")
         if not 0 <= self.min_margin_rate < 1:

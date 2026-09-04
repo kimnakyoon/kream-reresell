@@ -9,7 +9,7 @@ from kream_reresell.config import Settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
 settings = Settings()
-with sync_playwright() as pw, real_chrome_context(pw) as ctx:
+with sync_playwright() as pw, real_chrome_context(pw, show_chrome=settings.show_chrome) as ctx:
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     page.goto("https://kream.co.kr/", wait_until="domcontentloaded"); page.wait_for_timeout(1500)
     print("before:", auth.is_logged_in(page))

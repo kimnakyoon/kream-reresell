@@ -49,6 +49,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stop-before-submit", action="store_true", help="마지막 '입찰하기' 직전에 멈춤")
     p.add_argument("--force", action="store_true", help="거래량/마진 조건 무시 (점검용)")
     p.add_argument("--inspect", action="store_true", help="화면마다 dumps/ 에 스냅샷 저장")
+    p.add_argument("--show-chrome", action="store_true",
+                   help="크롬 창을 화면에 보이게 둔다 (기본: 화면 밖에서 실행. --stop-before-submit 이면 자동으로 켜짐)")
     p.add_argument("--open", action="store_true", help="끝나고 엑셀 보고서를 자동으로 연다 (기본: 저장만)")
     return p.parse_args()
 
@@ -65,6 +67,8 @@ def main() -> int:
     setup_logging()
     settings = Settings(dry_run=args.dry_run, stop_before_submit=args.stop_before_submit,
                         force=args.force, inspect=args.inspect)
+    if args.show_chrome:
+        settings.show_chrome = True
     if args.limit:
         settings.max_products = args.limit
     job = run_job(settings, categories, product_ids=args.product)

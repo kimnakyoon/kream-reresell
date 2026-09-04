@@ -12,6 +12,7 @@ import time
 
 from playwright.sync_api import Page
 
+from . import browser
 from .config import Settings
 
 log = logging.getLogger(__name__)
@@ -91,11 +92,13 @@ def ensure_logged_in(page: Page, settings: Settings) -> None:
     else:
         log.warning("KREAM_ID/KREAM_PW 가 없습니다 - 크롬 창에서 직접 로그인해 주세요")
 
-    page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    deadline = time.monotonic() + MANUAL_LOGIN_WAIT_SEC
-    while time.monotonic() < deadline:
-        page.wait_for_timeout(2000)
-        if "/login" not in page.url and _check_home(page):
-            log.info("로그인 확인됨")
-            return
+    # 사람이 로그인해야 하니 그동안만 크롬 창을 화면 안으로 불러온다
+    with browser.window_shown():
+        page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        deadline = time.monotonic() + MANUAL_LOGIN_WAIT_SEC
+        while time.monotonic() < deadline:
+            page.wait_for_timeout(2000)
+            if "/login" not in page.url and _check_home(page):
+                log.info("로그인 확인됨")
+                return
     raise LoginFailed(f"{MANUAL_LOGIN_WAIT_SEC}초 안에 로그인이 되지 않았습니다.")

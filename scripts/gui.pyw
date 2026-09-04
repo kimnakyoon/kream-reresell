@@ -1,6 +1,7 @@
 """KREAM 자동입찰 - 더블클릭으로 실행하는 창 (송장 자동화 GUI 와 같은 방식).
 
-[입찰] 을 누르면 크롬 창이 뜨고 랭킹 → 상품 → 입찰까지 자동으로 진행한다.
+[입찰] 을 누르면 랭킹 → 상품 → 입찰까지 자동으로 진행한다. 크롬은 화면 밖에서 돌아가고
+(작업표시줄에만 남음) 진행 상황은 이 창에만 표시된다. [크롬 창 보기] 를 켜면 실행 중에도 불러올 수 있다.
 [입찰취소] 는 마이페이지 > 구매 내역 > 구매 입찰 목록을 순서대로 다시 판정해 기준 미달 입찰을 지운다.
 끝나면 바탕화면\\KREAM 결과\\ 에 엑셀 보고서가 저장된다 (자동으로 열지는 않는다).
 [중지] 는 지금 보고 있는 상품(입찰)을 끝낸 뒤 멈춘다.
@@ -26,6 +27,7 @@ if sys.platform == "win32" and sys.stdout is not None:
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from kream_reresell import browser  # noqa: E402
 from kream_reresell.app import run_cancel_job, run_job  # noqa: E402
 from kream_reresell.config import LOG_DIR, Settings  # noqa: E402
 from kream_reresell.ranking import ALL_CATEGORIES, DEFAULT_CATEGORY  # noqa: E402
@@ -107,6 +109,9 @@ class App:
         self.mode = tk.StringVar(value="real")
         tk.Radiobutton(row2, text="실제 실행 (입찰 / 입찰취소)", variable=self.mode, value="real").pack(side="left")
         tk.Radiobutton(row2, text="판단만 (입찰·취소 안 함)", variable=self.mode, value="dry").pack(side="left", padx=(12, 0))
+        self.show_chrome = tk.BooleanVar(value=self.base.show_chrome)
+        tk.Checkbutton(row2, text="크롬 창 보기", variable=self.show_chrome,
+                       command=self.toggle_chrome_window).pack(side="right")
 
         cond = (f"조건: 최근 {self.base.lookback_days}일 빠른배송 {self.base.min_fast_sales}건 이상 · "
                 f"마진 (A−B) > A×{self.base.min_margin_rate*100:.0f}% · 입찰 {self.base.bid_days}일 · 창고보관 · 포인트 최대 사용")
@@ -200,12 +205,12 @@ class App:
                              "배송방법은 창고보관, 포인트는 최대 사용입니다.\n\n진행할까요?"):
             return
 
-        settings = Settings(dry_run=dry)
+        settings = self._make_settings(dry)
         settings.max_products = limit
         self.stop_flag.clear()
         self.last_report = None
         self.open_report_button.configure(state="disabled")
-        self._set_busy(True, "실행 중... (크롬 창을 건드리지 마세요)")
+        self._set_busy(True, "실행 중...")
         self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 시작: {cat_text} / 상품군마다 상위 {limit}개, "
                   f"{'판단만' if dry else '실제 입찰'} =====")
 
@@ -231,11 +236,11 @@ class App:
                           f"마진 (A−B) > A×{self.base.min_margin_rate*100:.0f}%).\n\n"
                           "기준에 못 미치는 입찰은 실제로 지웁니다 (되돌릴 수 없음).\n\n진행할까요?"):
             return
-        settings = Settings(dry_run=dry)
+        settings = self._make_settings(dry)
         self.stop_flag.clear()
         self.last_report = None
         self.open_report_button.configure(state="disabled")
-        self._set_busy(True, "입찰취소 실행 중... (크롬 창을 건드리지 마세요)")
+        self._set_busy(True, "입찰취소 실행 중...")
         self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 입찰취소 시작: 구매 입찰 목록 전체, "
                   f"{'판단만' if dry else '기준 미달 입찰 지움'} =====")
         self.worker = threading.Thread(target=self._cancel_worker, args=(settings,), daemon=True)
@@ -248,6 +253,16 @@ class App:
         except Exception as e:  # noqa: BLE001
             logging.getLogger("gui").exception("입찰취소 중 오류")
             self.q.put(("error", f"{type(e).__name__}: {e}"))
+
+    def _make_settings(self, dry: bool) -> Settings:
+        return Settings(dry_run=dry, show_chrome=self.show_chrome.get())
+
+    def toggle_chrome_window(self) -> None:
+        """실행 중이면 크롬 창을 바로 불러오거나 치운다. 대기 중이면 다음 실행에만 반영된다."""
+        show = self.show_chrome.get()
+        moved = browser.show_window() if show else browser.hide_window()
+        if moved:
+            self._log("크롬 창을 화면으로 불러왔습니다 (창을 조작하지는 마세요)" if show else "크롬 창을 화면 밖으로 치웠습니다")
 
     def request_stop(self) -> None:
         self.stop_flag.set()
