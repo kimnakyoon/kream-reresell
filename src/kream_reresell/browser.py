@@ -224,7 +224,9 @@ def real_chrome_context(playwright: Playwright, window_size: str = "1400,1000",
     browser = None
     try:
         if not _wait_for_port(port, CDP_READY_TIMEOUT_SEC):
-            raise RuntimeError(f"크롬이 디버깅 포트({port})를 {CDP_READY_TIMEOUT_SEC}초 안에 열지 않았습니다.")
+            # 같은 프로필을 쓰는 크롬이 이미 떠 있으면(예: GUI 가 실행 중일 때 명령행을 또 돌림) 새 크롬은 조용히 종료된다
+            raise RuntimeError(f"크롬이 디버깅 포트({port})를 {CDP_READY_TIMEOUT_SEC}초 안에 열지 않았습니다. "
+                               "이 프로그램의 다른 실행(GUI 또는 명령행)이 아직 크롬을 쓰고 있지 않은지 확인해 주세요.")
         browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
         _active_window = ChromeWindow(proc.pid, hidden=not show_chrome)
         if not show_chrome:

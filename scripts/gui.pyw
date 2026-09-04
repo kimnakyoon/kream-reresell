@@ -6,6 +6,8 @@
 [입찰 기준] 표에서 A(빠른배송 가격) 금액 구간별 최소 마진율과 상품 금액 상한(A 가 넘으면 바로 건너뜀)을 정한다.
 [입찰]/[입찰취소]/[기준 저장] 을 누르면 data/bid_rules.json 에 저장돼 다음 실행과 명령행에도 쓰인다.
 끝나면 바탕화면\\KREAM 결과\\ 에 엑셀 보고서가 저장된다 (자동으로 열지는 않는다).
+[내역] 은 달을 고르면 보관 판매(종료) 에서 그 달에 거래된 판매를 구매 내역(종료) 과 짝지어
+정산 시트 모양의 엑셀(바탕화면\\KREAM 내역 YYYY-MM.xlsx) 로 저장한다.
 [중지] 는 지금 보고 있는 상품(입찰)을 끝낸 뒤 멈춘다.
 """
 
@@ -30,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from kream_reresell import browser  # noqa: E402
-from kream_reresell.app import run_cancel_job, run_job  # noqa: E402
+from kream_reresell.app import run_cancel_job, run_history_job, run_job  # noqa: E402
 from kream_reresell.config import LOG_DIR, RULES_PATH, Settings  # noqa: E402
 from kream_reresell.ranking import ALL_CATEGORIES, DEFAULT_CATEGORY  # noqa: E402
 from kream_reresell.report import REPORT_DIR  # noqa: E402
@@ -137,6 +139,10 @@ class App:
                                        bg="#8B0000", fg="white", activebackground="#B22222", activeforeground="white",
                                        command=self.start_cancel)
         self.cancel_button.pack(side="left", padx=(8, 0))
+        self.history_button = tk.Button(buttons, text="내역", width=12, height=2, font=("맑은 고딕", 11, "bold"),
+                                        bg="#1F4E79", fg="white", activebackground="#2E75B6", activeforeground="white",
+                                        command=self.start_history)
+        self.history_button.pack(side="left", padx=(8, 0))
         self.stop_button = tk.Button(buttons, text="중지 (지금 것까지만)", width=20, height=2, state="disabled",
                                      command=self.request_stop)
         self.stop_button.pack(side="left", padx=(8, 0))
@@ -368,6 +374,43 @@ class App:
             logging.getLogger("gui").exception("입찰취소 중 오류")
             self.q.put(("error", f"{type(e).__name__}: {e}"))
 
+    def start_history(self) -> None:
+        """[내역]: 달을 고르면 보관 판매 거래일시가 그 달인 판매를 구매 내역과 짝지어 엑셀로 저장한다."""
+        if self.worker and self.worker.is_alive():
+            return
+        choice = MonthDialog(self.root).show()
+        if choice is None:
+            return
+        year, month = choice
+        settings = Settings(show_chrome=self.show_chrome.get())
+        self.stop_flag.clear()
+        self.last_report = None
+        self.open_report_button.configure(state="disabled")
+        self._set_busy(True, f"{year}년 {month}월 내역 정리 중...")
+        self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 내역 정리 시작: {year}년 {month}월 "
+                  f"(보관 판매 거래일시 기준, 구매 내역과 짝 맞춤) =====")
+        self.worker = threading.Thread(target=self._history_worker, args=(settings, year, month), daemon=True)
+        self.worker.start()
+
+    def _history_worker(self, settings: Settings, year: int, month: int) -> None:
+        try:
+            job = run_history_job(settings, year, month, should_stop=self.stop_flag.is_set)
+            self.q.put(("history_done", job))
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger("gui").exception("내역 정리 중 오류")
+            self.q.put(("error", f"{type(e).__name__}: {e}"))
+
+    def _finish_history(self, job) -> None:
+        self.last_report = job.report_path
+        self.open_report_button.configure(state="normal")
+        r = job.result
+        summary = f"{r.year}년 {r.month}월 판매 {len(r.sales)}건"
+        if r.unmatched:
+            summary += f" (매입 내역 못 찾음 {len(r.unmatched)}건 - 엑셀의 노란 줄)"
+        self._set_busy(False, f"완료: {summary}")
+        self._log(f"===== 완료 - {summary}\n엑셀: {job.report_path}")
+        messagebox.showinfo("내역 정리 완료", f"{summary}\n\n엑셀이 저장되었습니다:\n{job.report_path}")
+
     def _make_settings(self, dry: bool, rules: BidRules) -> Settings:
         return Settings(dry_run=dry, show_chrome=self.show_chrome.get(), rules=rules)
 
@@ -386,6 +429,7 @@ class App:
     def _set_busy(self, busy: bool, text: str = "") -> None:
         self.run_button.configure(state="disabled" if busy else "normal")
         self.cancel_button.configure(state="disabled" if busy else "normal")
+        self.history_button.configure(state="disabled" if busy else "normal")
         self.stop_button.configure(state="normal" if busy else "disabled")
         self.status.configure(text=text or ("대기 중" if not busy else ""))
 
@@ -398,6 +442,8 @@ class App:
                     self._log(payload)
                 elif kind == "done":
                     self._finish(payload)
+                elif kind == "history_done":
+                    self._finish_history(payload)
                 elif kind == "error":
                     self._set_busy(False, "오류로 중단")
                     messagebox.showerror("오류", payload)
@@ -424,6 +470,79 @@ class App:
     def open_last_report(self) -> None:
         if self.last_report and self.last_report.exists():
             os.startfile(str(self.last_report))  # type: ignore[attr-defined]
+
+
+class MonthDialog:
+    """[내역] 을 누르면 뜨는 창: 연도와 달을 고르고 [실행] 으로 확인한다. 취소하면 None."""
+
+    def __init__(self, parent: tk.Tk) -> None:
+        self.result: tuple[int, int] | None = None
+        today = datetime.now()
+        # 보통 지난달을 정리하므로 지난달을 기본으로 둔다
+        last_year, last_month = (today.year - 1, 12) if today.month == 1 else (today.year, today.month - 1)
+
+        self.top = tk.Toplevel(parent)
+        self.top.title("내역 정리 - 달 선택")
+        self.top.resizable(False, False)
+        self.top.transient(parent)
+        self.top.grab_set()
+
+        tk.Label(self.top, text="보관 판매 > 보관 상세의 거래일시가 고른 달인 판매를 정리합니다.\n"
+                                "구매 내역(종료) 에서 매입 건을 찾아 짝짓고, 바탕화면에 엑셀로 저장합니다.",
+                 justify="left", anchor="w").pack(fill="x", padx=16, pady=(14, 8))
+
+        row = tk.Frame(self.top)
+        row.pack(fill="x", padx=16)
+        tk.Label(row, text="연도").pack(side="left")
+        self.year = tk.Spinbox(row, from_=2020, to=today.year + 1, width=6, justify="center")
+        self.year.delete(0, "end")
+        self.year.insert(0, str(last_year))
+        self.year.pack(side="left", padx=(6, 0))
+
+        grid = tk.LabelFrame(self.top, text="달")
+        grid.pack(fill="x", padx=16, pady=(8, 4))
+        self.month = tk.IntVar(value=last_month)
+        for m in range(1, 13):
+            tk.Radiobutton(grid, text=f"{m}월", variable=self.month, value=m, width=5, anchor="w") \
+                .grid(row=(m - 1) // 6, column=(m - 1) % 6, sticky="w", padx=4, pady=2)
+
+        buttons = tk.Frame(self.top)
+        buttons.pack(fill="x", padx=16, pady=(8, 14))
+        tk.Button(buttons, text="실행", width=12, font=("맑은 고딕", 10, "bold"),
+                  bg="#1F4E79", fg="white", activebackground="#2E75B6", activeforeground="white",
+                  command=self._ok).pack(side="left")
+        tk.Button(buttons, text="취소", width=10, command=self._cancel).pack(side="left", padx=(8, 0))
+        self.top.bind("<Return>", lambda _e: self._ok())
+        self.top.bind("<Escape>", lambda _e: self._cancel())
+        self.top.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        # 부모 창 가운데에 띄운다
+        self.top.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        w, h = self.top.winfo_width(), self.top.winfo_height()
+        self.top.geometry(f"+{px + (pw - w) // 2}+{py + (ph - h) // 3}")
+
+    def _ok(self) -> None:
+        try:
+            year = int(self.year.get())
+        except ValueError:
+            messagebox.showerror("입력 오류", "연도는 숫자로 넣어주세요.", parent=self.top)
+            return
+        month = self.month.get()
+        if not messagebox.askyesno("내역 정리", f"{year}년 {month}월 판매 내역을 정리해 바탕화면에 엑셀로 저장합니다.\n\n"
+                                            "실행할까요?", parent=self.top):
+            return
+        self.result = (year, month)
+        self.top.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.top.destroy()
+
+    def show(self) -> tuple[int, int] | None:
+        self.top.wait_window()
+        return self.result
 
 
 def main() -> None:

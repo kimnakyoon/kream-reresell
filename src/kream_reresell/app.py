@@ -13,9 +13,10 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-from . import auth, cancel, pipeline, ranking, report
+from . import auth, cancel, history, history_report, pipeline, ranking, report
 from .browser import real_chrome_context
 from .config import Settings
+from .history import HistoryResult
 from .ranking import DEFAULT_CATEGORY
 from .report import ProductResult
 
@@ -27,6 +28,26 @@ class JobResult:
     results: list[ProductResult]
     report_path: Path
     mode: str
+
+
+@dataclass
+class HistoryJobResult:
+    result: HistoryResult
+    report_path: Path
+
+
+def run_history_job(settings: Settings, year: int, month: int,
+                    should_stop: Callable[[], bool] | None = None) -> HistoryJobResult:
+    """[내역]: 보관 판매 거래일시가 year-month 인 판매를 구매 내역과 짝지어 바탕화면에 엑셀로 저장한다."""
+    log.info("판매 내역 정리: %d년 %d월 (보관 판매 거래일시 기준)", year, month)
+    with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images,
+                                                        show_chrome=settings.show_chrome) as context:
+        page = context.pages[0] if context.pages else context.new_page()
+        auth.ensure_logged_in(page, settings)
+        result = history.collect(page, year, month, should_stop=should_stop)
+    path = history_report.write_history(result)
+    log.info("판매 %d건, 매입 못 찾음 %d건 → %s", len(result.sales), len(result.unmatched), path)
+    return HistoryJobResult(result=result, report_path=path)
 
 
 def describe_mode(settings: Settings, kind: str = "입찰") -> str:
