@@ -19,32 +19,50 @@ from .store import BidRecord, append_run_log, load_bids, save_bid
 log = logging.getLogger(__name__)
 
 
+def evaluate(page: Page, url: str, r: ProductResult, settings: Settings, stop_early: bool = True) -> str | None:
+    """상품 페이지를 열어 거래량 / A / B 를 읽어 r 에 채우고 입찰 조건을 판정한다.
+
+    조건 미달이면 사유 문자열을, 충족이면 None 을 돌려준다. 입찰과 입찰취소가 같은 기준을 쓴다.
+    stop_early 가 True 면 거래량 미달에서 바로 돌아온다 (A/B 는 읽지 않음).
+    조건을 다 봤으면 page 는 구매 페이지(/buy/{id}) 에 있다.
+    """
+    pid = r.product_id
+    r.name = product_mod.open_product(page, url) or r.name
+    if settings.inspect:
+        dump(page, f"{pid}_0_product")
+
+    stats = product_mod.read_sales_stats(page, settings.lookback_days, settings.min_fast_sales)
+    r.fast_sales, r.total_sales = stats.fast_in_window, stats.total_in_window
+    sales_reason = None
+    if stats.fast_in_window < settings.min_fast_sales:
+        sales_reason = f"{settings.lookback_days}일 빠른배송 {stats.fast_in_window}건 < {settings.min_fast_sales}건"
+        if stop_early:
+            return sales_reason
+
+    r.price_a = product_mod.read_price_a_and_go_to_buy(page, pid)
+    if settings.inspect:
+        dump(page, f"{pid}_1_buy_page")
+    r.price_b = product_mod.read_price_b(page)
+
+    rate = r.margin_rate or 0.0
+    log.info("A-B = %s원 (A의 %.1f%%), 기준 %.0f%%", f"{r.margin:,}", rate * 100, settings.min_margin_rate * 100)
+    if sales_reason:
+        return sales_reason
+    if rate <= settings.min_margin_rate:
+        return f"마진 {rate*100:.1f}% <= 기준 {settings.min_margin_rate*100:.0f}%"
+    return None
+
+
 def process_product(context: BrowserContext, item: RankedProduct, settings: Settings) -> ProductResult:
     """상품 하나를 새 탭에서 처리한다."""
     page: Page = context.new_page()
     pid = item.product_id
     r = ProductResult(rank=item.rank, product_id=pid, name=item.name, url=item.url, category=item.category)
     try:
-        r.name = product_mod.open_product(page, item.url) or item.name
         log.info("[%s %d위] %s (%s)", item.category, item.rank, r.name, item.url)
-        if settings.inspect:
-            dump(page, f"{pid}_0_product")
-
-        stats = product_mod.read_sales_stats(page, settings.lookback_days, settings.min_fast_sales)
-        r.fast_sales, r.total_sales = stats.fast_in_window, stats.total_in_window
-        if stats.fast_in_window < settings.min_fast_sales and not settings.force:
-            r.status, r.detail = "건너뜀", f"{settings.lookback_days}일 빠른배송 {stats.fast_in_window}건 < {settings.min_fast_sales}건"
-            return r
-
-        r.price_a = product_mod.read_price_a_and_go_to_buy(page, pid)
-        if settings.inspect:
-            dump(page, f"{pid}_1_buy_page")
-        r.price_b = product_mod.read_price_b(page)
-
-        rate = r.margin_rate or 0.0
-        log.info("A-B = %s원 (A의 %.1f%%), 기준 %.0f%%", f"{r.margin:,}", rate * 100, settings.min_margin_rate * 100)
-        if rate <= settings.min_margin_rate and not settings.force:
-            r.status, r.detail = "건너뜀", f"마진 {rate*100:.1f}% <= 기준 {settings.min_margin_rate*100:.0f}%"
+        reason = evaluate(page, item.url, r, settings, stop_early=not settings.force)
+        if reason and not settings.force:
+            r.status, r.detail = "건너뜀", reason
             return r
 
         r.bid_price, r.bid_days = r.price_b, settings.bid_days
@@ -58,10 +76,10 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
             bid_mod.submit_bid(page, r.price_b, settings, pid)
         except bid_mod.BidUncertain as e:
             # 입찰이 들어갔을 수 있으므로 기록해 두고(중복 입찰 방지) 사람이 확인하게 한다
-            _record_bid(r, stats.fast_in_window, settings, note=" (확인 필요)")
+            _record_bid(r, r.fast_sales or 0, settings, note=" (확인 필요)")
             r.status, r.detail = "확인필요", f"{e} - 마이페이지에서 입찰 여부 확인"
             return r
-        _record_bid(r, stats.fast_in_window, settings)
+        _record_bid(r, r.fast_sales or 0, settings)
         r.status, r.detail = "입찰완료", f"{r.price_b:,}원 / {settings.bid_days}일 / 창고보관"
         return r
     except product_mod.SkipProduct as e:
@@ -103,13 +121,29 @@ def _record_bid(r: ProductResult, fast_sales: int, settings: Settings, note: str
 
 def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
         should_stop: Callable[[], bool] | None = None,
-        on_result: Callable[[ProductResult], None] | None = None) -> list[ProductResult]:
+        on_result: Callable[[ProductResult], None] | None = None,
+        open_bids: dict | None = None) -> list[ProductResult]:
+    """open_bids: 마이페이지에 지금 입찰 중인 상품 (상품 ID -> cancel.OpenBid). 그 상품은 건너뛴다."""
     already = load_bids()
+    open_bids = open_bids or {}
     results: list[ProductResult] = []
     for item in items:
         if should_stop and should_stop():
             log.info("사용자 요청으로 중지 - 남은 %d개는 보지 않음", len(items) - len(results))
             break
+        if item.product_id in open_bids and not settings.force:
+            ob = open_bids[item.product_id]
+            log.info("[%d위] %s - 마이페이지에 이미 입찰 중, 건너뜀", item.rank, item.name)
+            results.append(ProductResult(
+                rank=item.rank, product_id=item.product_id, name=item.name, url=item.url,
+                category=item.category, status="건너뜀",
+                detail=f"마이페이지에 이미 입찰 중 (입찰 #{ob.bid_id}, {ob.price:,}원, 마감 {ob.deadline or ob.expires_at[:10]})"
+                       if ob.price else f"마이페이지에 이미 입찰 중 (입찰 #{ob.bid_id})",
+                bid_price=ob.price,
+            ))
+            if on_result:
+                on_result(results[-1])
+            continue
         if item.product_id in already and not settings.force:
             prev = already[item.product_id]
             log.info("[%d위] %s - 이미 입찰한 상품, 건너뜀", item.rank, item.name)

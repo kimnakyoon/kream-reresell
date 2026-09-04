@@ -72,26 +72,34 @@ _MONEY_COLS = [_COL[t] for t in ("A 빠른배송가", "B 즉시판매가", "A−
 STATUS_FILL = {
     "입찰완료": "C6EFCE",
     "입찰대상": "FFEB9C",
+    "입찰취소": "C6EFCE",
+    "취소대상": "FFEB9C",
     "확인필요": "F8CBAD",
     "오류": "FFC7CE",
     "중단": "FFC7CE",
 }
 
+BID_LEGEND = ("판정: 입찰완료 = 실제 입찰됨 / 입찰대상 = dry-run에서 조건 충족 / 건너뜀 = 조건 미달 또는 처리 불가 / "
+              "확인필요 = 마이페이지에서 입찰 여부 확인")
+CANCEL_LEGEND = ("판정: 입찰취소 = 조건 미달이라 입찰을 지움 / 취소대상 = dry-run에서 조건 미달 / 입찰유지 = 조건 충족 / "
+                 "확인필요 = 판단 불가 또는 지웠는지 불확실 - 마이페이지에서 확인")
+
 
 def write_report(results: list[ProductResult], settings_line: str, mode: str,
-                 path: Path | None = None) -> Path:
+                 path: Path | None = None, kind: str = "입찰") -> Path:
+    """kind 는 파일 이름과 판정 설명에 쓴다: '입찰' 또는 '입찰취소'."""
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    path = path or REPORT_DIR / f"KREAM 입찰결과 {datetime.now():%Y-%m-%d %H%M}.xlsx"
+    path = path or REPORT_DIR / f"KREAM {kind}결과 {datetime.now():%Y-%m-%d %H%M}.xlsx"
 
     wb = Workbook()
     ws = wb.active
     ws.title = "결과"
 
-    ws["A1"] = f"KREAM 리리셀 실행 결과 - {mode}"
+    ws["A1"] = f"KREAM 리리셀 {kind} 결과 - {mode}"
     ws["A1"].font = Font(bold=True, size=14)
     ws["A2"] = settings_line
     ws["A3"] = f"실행 시각: {datetime.now():%Y-%m-%d %H:%M}  |  상품 {len(results)}개"
-    ws["A4"] = "판정: 입찰완료 = 실제 입찰됨 / 입찰대상 = dry-run에서 조건 충족 / 건너뜀 = 조건 미달 또는 처리 불가 / 확인필요 = 마이페이지에서 입찰 여부 확인"
+    ws["A4"] = CANCEL_LEGEND if kind == "입찰취소" else BID_LEGEND
     ws["A4"].font = Font(color="666666", size=9)
 
     header_row = 6

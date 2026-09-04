@@ -1,8 +1,9 @@
 """KREAM 자동입찰 - 더블클릭으로 실행하는 창 (송장 자동화 GUI 와 같은 방식).
 
-[실행] 을 누르면 크롬 창이 뜨고 랭킹 → 상품 → 입찰까지 자동으로 진행한다.
+[입찰] 을 누르면 크롬 창이 뜨고 랭킹 → 상품 → 입찰까지 자동으로 진행한다.
+[입찰취소] 는 마이페이지 > 구매 내역 > 구매 입찰 목록을 순서대로 다시 판정해 기준 미달 입찰을 지운다.
 끝나면 바탕화면\\KREAM 결과\\ 에 엑셀 보고서가 저장된다 (자동으로 열지는 않는다).
-[중지] 는 지금 보고 있는 상품을 끝낸 뒤 멈춘다.
+[중지] 는 지금 보고 있는 상품(입찰)을 끝낸 뒤 멈춘다.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ if sys.platform == "win32" and sys.stdout is not None:
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from kream_reresell.app import run_job  # noqa: E402
+from kream_reresell.app import run_cancel_job, run_job  # noqa: E402
 from kream_reresell.config import LOG_DIR, Settings  # noqa: E402
 from kream_reresell.ranking import ALL_CATEGORIES, DEFAULT_CATEGORY  # noqa: E402
 from kream_reresell.report import REPORT_DIR  # noqa: E402
@@ -104,22 +105,27 @@ class App:
         row2 = tk.Frame(frame)
         row2.pack(fill="x", **pad)
         self.mode = tk.StringVar(value="real")
-        tk.Radiobutton(row2, text="실제 입찰", variable=self.mode, value="real").pack(side="left")
-        tk.Radiobutton(row2, text="판단만 (입찰 안 함)", variable=self.mode, value="dry").pack(side="left", padx=(12, 0))
+        tk.Radiobutton(row2, text="실제 실행 (입찰 / 입찰취소)", variable=self.mode, value="real").pack(side="left")
+        tk.Radiobutton(row2, text="판단만 (입찰·취소 안 함)", variable=self.mode, value="dry").pack(side="left", padx=(12, 0))
 
         cond = (f"조건: 최근 {self.base.lookback_days}일 빠른배송 {self.base.min_fast_sales}건 이상 · "
                 f"마진 (A−B) > A×{self.base.min_margin_rate*100:.0f}% · 입찰 {self.base.bid_days}일 · 창고보관 · 포인트 최대 사용")
         tk.Label(frame, text=cond, fg="#555", anchor="w", justify="left", wraplength=580).pack(fill="x", padx=12, pady=(0, 6))
-        tk.Label(frame, text="(숫자는 프로젝트 폴더의 .env 에서 바꿉니다)", fg="#888", anchor="w").pack(fill="x", padx=12, pady=(0, 6))
+        tk.Label(frame, text="(숫자는 프로젝트 폴더의 .env 에서 바꿉니다. 상품군·상품 수는 [입찰]에만 쓰입니다)",
+                 fg="#888", anchor="w").pack(fill="x", padx=12, pady=(0, 6))
 
         # ---- 버튼
         buttons = tk.Frame(root)
         buttons.pack(fill="x", padx=12, pady=4)
-        self.run_button = tk.Button(buttons, text="실행", width=14, height=2, font=("맑은 고딕", 11, "bold"),
+        self.run_button = tk.Button(buttons, text="입찰", width=12, height=2, font=("맑은 고딕", 11, "bold"),
                                     bg="#222", fg="white", activebackground="#444", activeforeground="white",
                                     command=self.start)
         self.run_button.pack(side="left")
-        self.stop_button = tk.Button(buttons, text="중지 (이 상품까지만, 남은 상품군 안 함)", width=30, height=2, state="disabled",
+        self.cancel_button = tk.Button(buttons, text="입찰취소", width=12, height=2, font=("맑은 고딕", 11, "bold"),
+                                       bg="#8B0000", fg="white", activebackground="#B22222", activeforeground="white",
+                                       command=self.start_cancel)
+        self.cancel_button.pack(side="left", padx=(8, 0))
+        self.stop_button = tk.Button(buttons, text="중지 (지금 것까지만)", width=20, height=2, state="disabled",
                                      command=self.request_stop)
         self.stop_button.pack(side="left", padx=(8, 0))
         self.status = tk.Label(buttons, text="대기 중", fg="#333")
@@ -214,13 +220,43 @@ class App:
             logging.getLogger("gui").exception("실행 중 오류")
             self.q.put(("error", f"{type(e).__name__}: {e}"))
 
+    def start_cancel(self) -> None:
+        """마이페이지 구매 입찰 목록을 순서대로 다시 판정해 기준 미달 입찰을 지운다."""
+        if self.worker and self.worker.is_alive():
+            return
+        dry = self.mode.get() == "dry"
+        if not dry and not messagebox.askyesno(
+                "입찰취소", "마이페이지 > 구매 내역 > 구매 입찰 목록을 순서대로 보며, 상품마다 입찰할 때와 같은 기준으로\n"
+                          f"다시 판정합니다 (최근 {self.base.lookback_days}일 빠른배송 {self.base.min_fast_sales}건 이상, "
+                          f"마진 (A−B) > A×{self.base.min_margin_rate*100:.0f}%).\n\n"
+                          "기준에 못 미치는 입찰은 실제로 지웁니다 (되돌릴 수 없음).\n\n진행할까요?"):
+            return
+        settings = Settings(dry_run=dry)
+        self.stop_flag.clear()
+        self.last_report = None
+        self.open_report_button.configure(state="disabled")
+        self._set_busy(True, "입찰취소 실행 중... (크롬 창을 건드리지 마세요)")
+        self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 입찰취소 시작: 구매 입찰 목록 전체, "
+                  f"{'판단만' if dry else '기준 미달 입찰 지움'} =====")
+        self.worker = threading.Thread(target=self._cancel_worker, args=(settings,), daemon=True)
+        self.worker.start()
+
+    def _cancel_worker(self, settings: Settings) -> None:
+        try:
+            job = run_cancel_job(settings, should_stop=self.stop_flag.is_set)
+            self.q.put(("done", job))
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger("gui").exception("입찰취소 중 오류")
+            self.q.put(("error", f"{type(e).__name__}: {e}"))
+
     def request_stop(self) -> None:
         self.stop_flag.set()
-        self.status.configure(text="지금 상품까지 보고 멈춥니다...")
+        self.status.configure(text="지금 것까지 보고 멈춥니다...")
         self.stop_button.configure(state="disabled")
 
     def _set_busy(self, busy: bool, text: str = "") -> None:
         self.run_button.configure(state="disabled" if busy else "normal")
+        self.cancel_button.configure(state="disabled" if busy else "normal")
         self.stop_button.configure(state="normal" if busy else "disabled")
         self.status.configure(text=text or ("대기 중" if not busy else ""))
 

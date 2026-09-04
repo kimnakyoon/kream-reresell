@@ -57,3 +57,16 @@ def append_run_log(row: dict) -> None:
         if new:
             w.writeheader()
         w.writerow(row)
+
+
+def remove_bid(product_id: int) -> bool:
+    """입찰을 지웠을 때 이력에서 빼서, 나중에 조건이 다시 맞으면 새로 입찰할 수 있게 한다."""
+    bids = load_bids()
+    if product_id not in bids:
+        return False
+    del bids[product_id]
+    BIDS_PATH.write_text(
+        json.dumps({str(k): asdict(v) for k, v in bids.items()}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return True
