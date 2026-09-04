@@ -274,7 +274,8 @@ def review_bid(context: BrowserContext, bid: OpenBid, settings: Settings) -> Pro
         r.product_id, r.url, r.bid_price = bid.product_id or 0, bid.product_url, bid.price
         log.info("[입찰 %d번째] %s (%s)", bid.order, bid.name, bid.product_url)
         # 거래량이 모자라도 A/B 까지 읽어 보고서에 남긴다 (지운 이유를 나중에 볼 수 있게)
-        reason = pipeline.evaluate(page, bid.product_url, r, settings, stop_early=False)
+        # 상품 금액 상한은 새로 입찰할 때만 쓰는 규칙이라 이미 넣은 입찰에는 적용하지 않는다
+        reason = pipeline.evaluate(page, bid.product_url, r, settings, stop_early=False, price_limit=False)
         when = f"마감 {bid.deadline or bid.expires_at[:10]}"
         if reason is None:
             r.status, r.detail = "입찰유지", f"조건 충족 ({when})"

@@ -39,7 +39,7 @@ def describe_mode(settings: Settings, kind: str = "입찰") -> str:
 
 def describe_settings(settings: Settings, categories: list[str]) -> str:
     return (f"조건: 최근 {settings.lookback_days}일 빠른배송 {settings.min_fast_sales}건 이상, "
-            f"마진 (A−B) > A×{settings.min_margin_rate*100:.0f}%, 입찰기한 {settings.bid_days}일, "
+            f"{settings.rules.describe()}, 입찰기한 {settings.bid_days}일, "
             f"상품군 {' → '.join(categories)} (상품군마다 {settings.max_products}개)"
             + (", 조건 무시(--force)" if settings.force else ""))
 
@@ -114,7 +114,7 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
 
 def describe_cancel_settings(settings: Settings) -> str:
     return (f"입찰취소 기준: 최근 {settings.lookback_days}일 빠른배송 {settings.min_fast_sales}건 미만이거나 "
-            f"마진 (A−B) <= A×{settings.min_margin_rate*100:.0f}% 이면 입찰을 지움 "
+            f"마진 기준에 못 미치면 입찰을 지움 ({settings.rules.describe()}) "
             f"(마이페이지 > 구매 내역 > 구매 입찰 순서대로)")
 
 

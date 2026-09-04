@@ -3,6 +3,8 @@
 [입찰] 을 누르면 랭킹 → 상품 → 입찰까지 자동으로 진행한다. 크롬은 화면 밖에서 돌아가고
 (작업표시줄에만 남음) 진행 상황은 이 창에만 표시된다. [크롬 창 보기] 를 켜면 실행 중에도 불러올 수 있다.
 [입찰취소] 는 마이페이지 > 구매 내역 > 구매 입찰 목록을 순서대로 다시 판정해 기준 미달 입찰을 지운다.
+[입찰 기준] 표에서 A(빠른배송 가격) 금액 구간별 최소 마진율과 상품 금액 상한(A 가 넘으면 바로 건너뜀)을 정한다.
+[입찰]/[입찰취소]/[기준 저장] 을 누르면 data/bid_rules.json 에 저장돼 다음 실행과 명령행에도 쓰인다.
 끝나면 바탕화면\\KREAM 결과\\ 에 엑셀 보고서가 저장된다 (자동으로 열지는 않는다).
 [중지] 는 지금 보고 있는 상품(입찰)을 끝낸 뒤 멈춘다.
 """
@@ -29,12 +31,13 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from kream_reresell import browser  # noqa: E402
 from kream_reresell.app import run_cancel_job, run_job  # noqa: E402
-from kream_reresell.config import LOG_DIR, Settings  # noqa: E402
+from kream_reresell.config import LOG_DIR, RULES_PATH, Settings  # noqa: E402
 from kream_reresell.ranking import ALL_CATEGORIES, DEFAULT_CATEGORY  # noqa: E402
 from kream_reresell.report import REPORT_DIR  # noqa: E402
+from kream_reresell.rules import BidRules, Tier  # noqa: E402
 
 WINDOW_WIDTH = 660
-WINDOW_HEIGHT = 700
+WINDOW_HEIGHT = 900
 RIGHT_MARGIN = 40
 
 # 상품군 체크박스는 랭킹 칩 순서(ALL_CATEGORIES)대로 나열하고, 체크한 것을 그 순서대로 실행한다.
@@ -62,7 +65,7 @@ class App:
         self.root = root
         root.title("KREAM 자동입찰")
         _place_right_center(root)
-        root.minsize(560, 480)
+        root.minsize(560, 620)
 
         self.q: queue.Queue = queue.Queue()
         self.stop_flag = threading.Event()
@@ -114,10 +117,14 @@ class App:
                        command=self.toggle_chrome_window).pack(side="right")
 
         cond = (f"조건: 최근 {self.base.lookback_days}일 빠른배송 {self.base.min_fast_sales}건 이상 · "
-                f"마진 (A−B) > A×{self.base.min_margin_rate*100:.0f}% · 입찰 {self.base.bid_days}일 · 창고보관 · 포인트 최대 사용")
+                f"마진 (A−B) > A×[아래 입찰 기준의 구간별 %] · 입찰 {self.base.bid_days}일 · 창고보관 · 포인트 최대 사용")
         tk.Label(frame, text=cond, fg="#555", anchor="w", justify="left", wraplength=580).pack(fill="x", padx=12, pady=(0, 6))
-        tk.Label(frame, text="(숫자는 프로젝트 폴더의 .env 에서 바꿉니다. 상품군·상품 수는 [입찰]에만 쓰입니다)",
+        tk.Label(frame, text="(거래량·기간·입찰기한은 프로젝트 폴더의 .env 에서 바꿉니다. 상품군·상품 수는 [입찰]에만 쓰입니다)",
                  fg="#888", anchor="w").pack(fill="x", padx=12, pady=(0, 6))
+
+        # ---- 입찰 기준 (금액 구간별 마진율 + 입찰가 상한)
+        self.tier_rows: list[dict] = []
+        self._build_rules_panel(root)
 
         # ---- 버튼
         buttons = tk.Frame(root)
@@ -139,7 +146,7 @@ class App:
         # ---- 로그
         log_frame = tk.LabelFrame(root, text="진행 상황")
         log_frame.pack(fill="both", expand=True, padx=12, pady=4)
-        self.log_box = tk.Text(log_frame, height=16, wrap="word", state="disabled", font=("맑은 고딕", 9))
+        self.log_box = tk.Text(log_frame, height=10, wrap="word", state="disabled", font=("맑은 고딕", 9))
         scroll = tk.Scrollbar(log_frame, command=self.log_box.yview)
         self.log_box.configure(yscrollcommand=scroll.set)
         self.log_box.pack(side="left", fill="both", expand=True)
@@ -176,6 +183,107 @@ class App:
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
+    # ------------------------------------------------------------ 입찰 기준
+    def _build_rules_panel(self, parent: tk.Misc) -> None:
+        panel = tk.LabelFrame(parent, text="입찰 기준 (A = 빠른배송 가격, B = 즉시 판매가)")
+        panel.pack(fill="x", padx=12, pady=4)
+
+        self.tier_grid = tk.Frame(panel)
+        self.tier_grid.pack(fill="x", padx=12, pady=(6, 2))
+        for col, text in enumerate(("A 부터 (원)", "A 미만 (원, 비우면 끝없음)", "최소 마진율 (%)")):
+            tk.Label(self.tier_grid, text=text, fg="#555").grid(row=0, column=col, sticky="w", padx=(0, 10))
+
+        row = tk.Frame(panel)
+        row.pack(fill="x", padx=12, pady=(2, 2))
+        tk.Button(row, text="구간 추가", command=self._add_tier_row_after_last).pack(side="left")
+        tk.Label(row, text="상품 금액 상한: A 가").pack(side="left", padx=(16, 4))
+        self.limit_entry = tk.Entry(row, width=10, justify="right")
+        self.limit_entry.pack(side="left")
+        tk.Label(row, text="원을 넘으면 바로 건너뜀 (비우면 제한 없음)").pack(side="left", padx=(4, 0))
+        tk.Button(row, text="기준 저장", command=self.save_rules).pack(side="right")
+
+        tk.Label(panel, text="※ A 가 어느 구간에도 없으면 건너뜁니다. 상품 금액 상한을 넘는 상품은 B 도 읽지 않고 넘어갑니다 "
+                             "(이미 넣은 입찰을 다시 판정하는 [입찰취소] 에는 상한을 쓰지 않습니다). "
+                             "[입찰]/[입찰취소] 를 누를 때 자동 저장되어 명령행 실행에도 쓰입니다.",
+                 fg="#888", anchor="w", justify="left", wraplength=600).pack(fill="x", padx=12, pady=(0, 6))
+        self._load_rules_into_panel(self.base.rules)
+
+    def _load_rules_into_panel(self, rules: BidRules) -> None:
+        for r in list(self.tier_rows):
+            self._remove_tier_row(r)
+        for t in rules.tiers:
+            self._add_tier_row(str(t.lo), "" if t.hi is None else str(t.hi), f"{t.margin_pct:g}")
+        self.limit_entry.delete(0, "end")
+        if rules.max_price_a is not None:
+            self.limit_entry.insert(0, str(rules.max_price_a))
+
+    def _add_tier_row(self, lo: str = "", hi: str = "", pct: str = "") -> None:
+        widgets = {}
+        for key, val, width in (("lo", lo, 12), ("hi", hi, 12), ("pct", pct, 7)):
+            e = tk.Entry(self.tier_grid, width=width, justify="right")
+            e.insert(0, val)
+            widgets[key] = e
+        row = {"widgets": widgets}
+        widgets["del"] = tk.Button(self.tier_grid, text="삭제", command=lambda: self._remove_tier_row(row))
+        self.tier_rows.append(row)
+        self._regrid_tier_rows()
+
+    def _add_tier_row_after_last(self) -> None:
+        """새 구간의 '부터' 는 마지막 구간의 '미만' 값으로 채운다."""
+        lo = self.tier_rows[-1]["widgets"]["hi"].get().strip() if self.tier_rows else "0"
+        self._add_tier_row(lo, "", "")
+
+    def _remove_tier_row(self, row: dict) -> None:
+        for w in row["widgets"].values():
+            w.destroy()
+        self.tier_rows.remove(row)
+        self._regrid_tier_rows()
+
+    def _regrid_tier_rows(self) -> None:
+        for i, row in enumerate(self.tier_rows, start=1):
+            w = row["widgets"]
+            w["lo"].grid(row=i, column=0, sticky="w", padx=(0, 10), pady=1)
+            w["hi"].grid(row=i, column=1, sticky="w", padx=(0, 10), pady=1)
+            w["pct"].grid(row=i, column=2, sticky="w", padx=(0, 10), pady=1)
+            w["del"].grid(row=i, column=3, sticky="w", pady=1)
+
+    def _read_rules(self) -> BidRules:
+        """표의 값을 읽어 검사한다. 잘못됐으면 ValueError (메시지는 사용자에게 보여줄 문장)."""
+        tiers = []
+        for i, row in enumerate(self.tier_rows, start=1):
+            w = row["widgets"]
+            lo, hi, pct = (w[k].get().replace(",", "").strip() for k in ("lo", "hi", "pct"))
+            if not lo and not hi and not pct:
+                continue
+            try:
+                tiers.append(Tier(lo=int(lo or 0), hi=int(hi) if hi else None, margin_pct=float(pct)))
+            except ValueError as e:
+                raise ValueError(f"{i}번째 구간의 숫자를 확인해 주세요 (부터 {lo!r}, 미만 {hi!r}, 마진 {pct!r})") from e
+        limit = self.limit_entry.get().replace(",", "").replace("원", "").strip()
+        try:
+            max_price_a = int(limit) if limit else None
+        except ValueError as e:
+            raise ValueError(f"상품 금액 상한은 숫자(원)로 넣어주세요: {limit!r}") from e
+        rules = BidRules(tiers=tiers, max_price_a=max_price_a)
+        rules.validate()
+        return rules
+
+    def _apply_rules(self) -> BidRules | None:
+        """표를 읽어 저장하고 돌려준다. 잘못됐으면 안내창을 띄우고 None."""
+        try:
+            rules = self._read_rules()
+            rules.save(RULES_PATH)
+        except ValueError as e:
+            messagebox.showerror("입찰 기준 오류", str(e))
+            return None
+        self._load_rules_into_panel(rules)   # 정렬된 순서로 다시 보여준다
+        return rules
+
+    def save_rules(self) -> None:
+        rules = self._apply_rules()
+        if rules:
+            self._log(f"입찰 기준 저장: {rules.describe()}  ({RULES_PATH})")
+
     # ------------------------------------------------------------ 실행
     def _set_all_categories(self, value: bool) -> None:
         for var in self.category_vars.values():
@@ -198,21 +306,24 @@ class App:
             messagebox.showerror("입력 오류", "상품군을 하나 이상 체크해 주세요.")
             return
         cat_text = " → ".join(categories)
+        rules = self._apply_rules()
+        if rules is None:
+            return
         dry = self.mode.get() == "dry"
         if not dry and not messagebox.askyesno(
                 "실제 입찰", f"상품군 {len(categories)}개를 순서대로 돌며 각각 상위 {limit}개 중 조건에 맞는 상품에 "
-                             f"실제로 구매 입찰을 넣습니다.\n\n{cat_text}\n\n"
+                             f"실제로 구매 입찰을 넣습니다.\n\n{cat_text}\n\n{rules.describe()}\n\n"
                              "배송방법은 창고보관, 포인트는 최대 사용입니다.\n\n진행할까요?"):
             return
 
-        settings = self._make_settings(dry)
+        settings = self._make_settings(dry, rules)
         settings.max_products = limit
         self.stop_flag.clear()
         self.last_report = None
         self.open_report_button.configure(state="disabled")
         self._set_busy(True, "실행 중...")
         self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 시작: {cat_text} / 상품군마다 상위 {limit}개, "
-                  f"{'판단만' if dry else '실제 입찰'} =====")
+                  f"{'판단만' if dry else '실제 입찰'} =====\n입찰 기준: {rules.describe()}")
 
         self.worker = threading.Thread(target=self._worker, args=(settings, categories), daemon=True)
         self.worker.start()
@@ -229,20 +340,23 @@ class App:
         """마이페이지 구매 입찰 목록을 순서대로 다시 판정해 기준 미달 입찰을 지운다."""
         if self.worker and self.worker.is_alive():
             return
+        rules = self._apply_rules()
+        if rules is None:
+            return
         dry = self.mode.get() == "dry"
         if not dry and not messagebox.askyesno(
                 "입찰취소", "마이페이지 > 구매 내역 > 구매 입찰 목록을 순서대로 보며, 상품마다 입찰할 때와 같은 기준으로\n"
-                          f"다시 판정합니다 (최근 {self.base.lookback_days}일 빠른배송 {self.base.min_fast_sales}건 이상, "
-                          f"마진 (A−B) > A×{self.base.min_margin_rate*100:.0f}%).\n\n"
+                          f"다시 판정합니다 (최근 {self.base.lookback_days}일 빠른배송 {self.base.min_fast_sales}건 이상,\n"
+                          f"{rules.describe()}).\n\n"
                           "기준에 못 미치는 입찰은 실제로 지웁니다 (되돌릴 수 없음).\n\n진행할까요?"):
             return
-        settings = self._make_settings(dry)
+        settings = self._make_settings(dry, rules)
         self.stop_flag.clear()
         self.last_report = None
         self.open_report_button.configure(state="disabled")
         self._set_busy(True, "입찰취소 실행 중...")
         self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 입찰취소 시작: 구매 입찰 목록 전체, "
-                  f"{'판단만' if dry else '기준 미달 입찰 지움'} =====")
+                  f"{'판단만' if dry else '기준 미달 입찰 지움'} =====\n입찰 기준: {rules.describe()}")
         self.worker = threading.Thread(target=self._cancel_worker, args=(settings,), daemon=True)
         self.worker.start()
 
@@ -254,8 +368,8 @@ class App:
             logging.getLogger("gui").exception("입찰취소 중 오류")
             self.q.put(("error", f"{type(e).__name__}: {e}"))
 
-    def _make_settings(self, dry: bool) -> Settings:
-        return Settings(dry_run=dry, show_chrome=self.show_chrome.get())
+    def _make_settings(self, dry: bool, rules: BidRules) -> Settings:
+        return Settings(dry_run=dry, show_chrome=self.show_chrome.get(), rules=rules)
 
     def toggle_chrome_window(self) -> None:
         """실행 중이면 크롬 창을 바로 불러오거나 치운다. 대기 중이면 다음 실행에만 반영된다."""

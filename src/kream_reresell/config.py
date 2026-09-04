@@ -8,8 +8,15 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .rules import BidRules
+
 ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(ROOT / ".env")
+
+DATA_DIR = ROOT / "data"
+DUMP_DIR = ROOT / "dumps"
+LOG_DIR = ROOT / "logs"
+RULES_PATH = DATA_DIR / "bid_rules.json"   # GUI [입찰 기준] 에서 저장한 금액 구간별 마진율 / 상품 금액 상한
 
 BID_DAY_CHOICES = (1, 3, 7, 30, 60, 90, 180)
 
@@ -36,7 +43,10 @@ class Settings:
 
     lookback_days: int = field(default_factory=lambda: _int("LOOKBACK_DAYS", 30))
     min_fast_sales: int = field(default_factory=lambda: _int("MIN_FAST_SALES", 15))
+    # 기본 마진율 (.env). data/bid_rules.json 이 없을 때 금액 구간 하나짜리 기준으로 쓴다
     min_margin_rate: float = field(default_factory=lambda: _float("MIN_MARGIN_RATE", 0.10))
+    # 금액 구간별 최소 마진율 + 상품 금액 상한. GUI 에서 고치면 data/bid_rules.json 에 저장된다
+    rules: BidRules = field(default_factory=lambda: BidRules.load(RULES_PATH, _float("MIN_MARGIN_RATE", 0.10)))
     bid_days: int = field(default_factory=lambda: _int("BID_DAYS", 7))
     max_products: int = field(default_factory=lambda: _int("MAX_PRODUCTS", 30))
     # 이미지/동영상/폰트를 받지 않아 페이지를 빨리 띄운다. 화면 확인이 필요하면 .env 에 BLOCK_IMAGES=0
@@ -58,8 +68,4 @@ class Settings:
             raise ValueError(f"BID_DAYS 는 {BID_DAY_CHOICES} 중 하나여야 합니다: {self.bid_days}")
         if not 0 <= self.min_margin_rate < 1:
             raise ValueError(f"MIN_MARGIN_RATE 는 0 이상 1 미만이어야 합니다: {self.min_margin_rate}")
-
-
-DATA_DIR = ROOT / "data"
-DUMP_DIR = ROOT / "dumps"
-LOG_DIR = ROOT / "logs"
+        self.rules.validate()

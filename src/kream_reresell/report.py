@@ -43,8 +43,9 @@ class ProductResult:
     fast_sales: int | None = None      # 기간 내 빠른배송 체결 수
     total_sales: int | None = None     # 기간 내 전체 체결 수
     price_a: int | None = None         # 빠른배송 가격 (예상 판매가)
-    price_b: int | None = None         # 즉시 판매가 (입찰가)
-    bid_price: int | None = None
+    price_b: int | None = None         # 즉시 판매가
+    margin_min: float | None = None    # 이 상품(A 금액 구간)에 적용된 최소 마진율 (0.10 = 10%)
+    bid_price: int | None = None       # 입찰가 (= B)
     bid_days: int | None = None
     time: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
@@ -64,7 +65,7 @@ class ProductResult:
 COLUMNS = [
     ("상품군", 10), ("순위", 6), ("상품명", 46), ("상품ID", 10), ("판정", 12), ("사유 / 결과", 46),
     ("30일 빠른배송", 13), ("30일 전체", 10), ("A 빠른배송가", 14), ("B 즉시판매가", 14),
-    ("A−B", 11), ("마진율", 9), ("입찰가", 12), ("입찰기한", 9), ("처리시각", 20), ("링크", 40),
+    ("A−B", 11), ("마진율", 9), ("기준마진", 9), ("입찰가", 12), ("입찰기한", 9), ("처리시각", 20), ("링크", 40),
 ]
 _COL = {title: i for i, (title, _) in enumerate(COLUMNS, start=1)}   # 제목 -> 열 번호
 _MONEY_COLS = [_COL[t] for t in ("A 빠른배송가", "B 즉시판매가", "A−B", "입찰가")]
@@ -117,7 +118,7 @@ def write_report(results: list[ProductResult], settings_line: str, mode: str,
         values = [
             r.category, r.rank, r.name, r.product_id, r.status, r.detail,
             r.fast_sales, r.total_sales, r.price_a, r.price_b,
-            r.margin, r.margin_rate, r.bid_price,
+            r.margin, r.margin_rate, r.margin_min, r.bid_price,
             f"{r.bid_days}일" if r.bid_days else None, r.time, r.url,
         ]
         for col, v in enumerate(values, start=1):
@@ -125,6 +126,7 @@ def write_report(results: list[ProductResult], settings_line: str, mode: str,
         for col in _MONEY_COLS:
             ws.cell(row=i, column=col).number_format = "#,##0"
         ws.cell(row=i, column=_COL["마진율"]).number_format = "0.0%"
+        ws.cell(row=i, column=_COL["기준마진"]).number_format = "0.0%"
         link = ws.cell(row=i, column=_COL["링크"])
         link.hyperlink = r.url
         link.font = Font(color="0563C1", underline="single")
