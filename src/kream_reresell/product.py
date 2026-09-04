@@ -51,11 +51,8 @@ def read_sales_stats(page: Page, lookback_days: int, need: int) -> SalesStats:
     # 나중에 생길 수 있으므로 매 실행마다 확인은 하고, 없으면 기다리지 않고 바로 넘긴다.
     if page.get_by_text("체결 거래", exact=True).count() == 0:
         raise SkipProduct("체결 거래 표가 없는 상품 (아직 리셀 거래 없음) - 바로 넘김")
-    # 상품 페이지의 체결 표에 행이 그려질 때까지 기다린다 - 그 전에 누르면 하이드레이션 전이라 클릭이 먹지 않는다
-    try:
-        page.wait_for_function(f"() => ({_SALES_ROWS_JS})().length > 0", timeout=10_000)
-    except PlaywrightTimeout:
-        pass
+    # 본문의 체결 표는 role=tabpanel 이 아니라 _SALES_ROWS_JS 로 잡히지 않는다 (2026-09-04 실측) - 여기서 행을 기다리면
+    # 매번 타임아웃만 채우므로 바로 누른다. 하이드레이션 전이라 클릭이 안 먹으면 아래 재시도가 받아 준다.
     more = page.get_by_role("button", name="거래 내역 더보기").first
     for attempt in range(3):
         try:
@@ -66,9 +63,14 @@ def read_sales_stats(page: Page, lookback_days: int, need: int) -> SalesStats:
             break
         except PlaywrightTimeout:
             log.debug("거래 내역 패널 열기 재시도 %d", attempt + 1)
+            page.wait_for_timeout(700)
     else:
         raise SkipProduct("'거래 내역 더보기' 패널이 열리지 않음")
-    page.wait_for_timeout(500)
+    # 패널이 뜬 뒤 행이 그려질 때까지만 기다린다 (실측 0.3초쯤). 행이 없는 패널이면 3초 뒤 그대로 진행해 0건으로 센다.
+    try:
+        page.wait_for_function(f"() => ({_SALES_ROWS_JS})().length > 0", timeout=3000)
+    except PlaywrightTimeout:
+        pass
 
     cutoff = datetime.now() - timedelta(days=lookback_days)
     fast = total = 0
