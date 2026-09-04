@@ -163,6 +163,15 @@ def read_bid_info(page: Page, bid: OpenBid) -> dict | None:
     return data
 
 
+def ensure_product_id(page: Page, bid: OpenBid) -> dict | None:
+    """상세 페이지에서 상품 ID · 희망가를 채운다 (API 응답, 안 되면 '상품 상세' 버튼으로). API 응답(dict)이 있으면 돌려준다."""
+    data = read_bid_info(page, bid)
+    if data is None:
+        page.wait_for_load_state("domcontentloaded")
+        bid.product_id = _product_id_via_button(page, bid)
+    return data
+
+
 def match_known_bid(bid: OpenBid, known: dict[int, BidRecord]) -> int | None:
     """이 프로그램이 넣은 입찰(bids.json)과 상품명·희망가가 같으면 그 상품 ID (상세를 열지 않아도 됨)."""
     if not bid.price:
@@ -401,9 +410,7 @@ def open_bid_products(context: BrowserContext, page: Page) -> OpenBids:
         try:
             for bid in unknown:
                 try:
-                    if read_bid_info(tab, bid) is None:
-                        tab.wait_for_load_state("domcontentloaded")
-                        bid.product_id = _product_id_via_button(tab, bid)
+                    ensure_product_id(tab, bid)
                 except Exception as e:  # noqa: BLE001
                     log.warning("입찰 #%d 상세를 읽지 못함: %s", bid.bid_id, e)
                 if bid.product_id:

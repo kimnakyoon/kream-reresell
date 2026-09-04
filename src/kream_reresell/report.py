@@ -75,6 +75,9 @@ STATUS_FILL = {
     "입찰대상": "FFEB9C",
     "입찰취소": "C6EFCE",
     "취소대상": "FFEB9C",
+    "변경완료": "C6EFCE",
+    "변경대상": "FFEB9C",
+    "변경안함": "DDEBF7",
     "확인필요": "F8CBAD",
     "오류": "FFC7CE",
     "중단": "FFC7CE",
@@ -84,6 +87,11 @@ BID_LEGEND = ("판정: 입찰완료 = 실제 입찰됨 / 입찰대상 = dry-run�
               "건너뜀 = 이미 입찰 중, 조건 미달, 또는 입찰을 시도했지만 넣지 못함 / 확인필요 = 마이페이지에서 입찰 여부 확인")
 CANCEL_LEGEND = ("판정: 입찰취소 = 조건 미달이라 입찰을 지움 / 취소대상 = dry-run에서 조건 미달 / 입찰유지 = 조건 충족 / "
                  "확인필요 = 판단 불가 또는 지웠는지 불확실 - 마이페이지에서 확인")
+REBID_LEGEND = ("판정: 변경완료 = 밀린 입찰의 희망가를 B 로 올림 / 변경대상 = dry-run에서 올릴 조건 충족 / "
+                "순위유지 = 즉시 판매가가 내 희망가 이하라 밀리지 않음 / 변경안함 = 밀렸지만 기준 미달이라 그대로 둠 / "
+                "변경못함 = 변경 화면이 예상과 달라 못 올림 / 확인필요 = 판단 불가 또는 올렸는지 불확실 - 마이페이지에서 확인. "
+                "상품군 열 = 몇 번째 사이클인지, 입찰가 열 = 처리 뒤 내 희망가")
+LEGENDS = {"입찰": BID_LEGEND, "입찰취소": CANCEL_LEGEND, "재입찰": REBID_LEGEND}
 
 
 def write_report(results: list[ProductResult], settings_line: str, mode: str,
@@ -100,7 +108,7 @@ def write_report(results: list[ProductResult], settings_line: str, mode: str,
     ws["A1"].font = Font(bold=True, size=14)
     ws["A2"] = settings_line
     ws["A3"] = f"실행 시각: {datetime.now():%Y-%m-%d %H:%M}  |  상품 {len(results)}개"
-    ws["A4"] = CANCEL_LEGEND if kind == "입찰취소" else BID_LEGEND
+    ws["A4"] = LEGENDS.get(kind, BID_LEGEND)
     ws["A4"].font = Font(color="666666", size=9)
 
     header_row = 6

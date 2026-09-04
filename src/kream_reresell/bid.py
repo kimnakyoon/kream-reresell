@@ -20,6 +20,11 @@ from .debug import dump
 log = logging.getLogger(__name__)
 
 
+# 마지막 '입찰하기' 뒤의 완료 문구. 새 입찰은 '구매 입찰이 완료되었습니다', 입찰 변경([입찰 변경하기] 로 희망가를 올린 경우)은
+# 같은 화면을 쓰므로 '변경' 표현도 받아 준다.
+COMPLETED_RE = re.compile(r"구매 입찰이 (완료|변경)|입찰 변경이 완료")
+
+
 class BidAborted(Exception):
     """안전장치에 걸려 입찰을 중단했다."""
 
@@ -144,7 +149,7 @@ def submit_bid(page: Page, price: int, settings: Settings, pid: int) -> None:
         raise StoppedBeforeSubmit("마지막 '입찰하기' 직전에 멈춤 (--stop-before-submit)")
     final.click()
     try:
-        page.get_by_text(re.compile(r"구매 입찰이 완료")).first.wait_for(state="visible", timeout=20_000)
+        page.get_by_text(COMPLETED_RE).first.wait_for(state="visible", timeout=20_000)
     except PlaywrightTimeout as e:
         dump(page, f"{pid}_no_completion")
         raise BidUncertain("마지막 '입찰하기' 를 눌렀으나 '구매 입찰이 완료' 문구를 확인하지 못함") from e
@@ -154,7 +159,7 @@ def submit_bid(page: Page, price: int, settings: Settings, pid: int) -> None:
 
 
 def _completed(page: Page) -> bool:
-    return page.get_by_text(re.compile(r"구매 입찰이 완료")).count() > 0
+    return page.get_by_text(COMPLETED_RE).count() > 0
 
 
 def _check_required_items(page: Page) -> int:

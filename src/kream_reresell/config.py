@@ -49,6 +49,8 @@ class Settings:
     rules: BidRules = field(default_factory=lambda: BidRules.load(RULES_PATH, _float("MIN_MARGIN_RATE", 0.10)))
     bid_days: int = field(default_factory=lambda: _int("BID_DAYS", 7))
     max_products: int = field(default_factory=lambda: _int("MAX_PRODUCTS", 30))
+    # [재입찰] 사이클 시작 간격(분). 구매 입찰 목록을 한 바퀴 돈 뒤 다음 바퀴를 이 간격으로 시작한다 (봇 탐지 대비, 1분 이상)
+    rebid_interval_min: float = field(default_factory=lambda: _float("REBID_INTERVAL_MIN", 5))
     # 이미지/동영상/폰트를 받지 않아 페이지를 빨리 띄운다. 화면 확인이 필요하면 .env 에 BLOCK_IMAGES=0
     block_images: bool = field(default_factory=lambda: _bool("BLOCK_IMAGES", True))
     # 크롬 창을 화면에 보이게 둘지. 기본은 화면 밖으로 치워 두고 GUI 상태창으로만 진행을 본다.
@@ -68,4 +70,6 @@ class Settings:
             raise ValueError(f"BID_DAYS 는 {BID_DAY_CHOICES} 중 하나여야 합니다: {self.bid_days}")
         if not 0 <= self.min_margin_rate < 1:
             raise ValueError(f"MIN_MARGIN_RATE 는 0 이상 1 미만이어야 합니다: {self.min_margin_rate}")
+        if self.rebid_interval_min < 1:
+            raise ValueError(f"재입찰 사이클 간격은 1분 이상이어야 합니다 (사이트 차단 방지): {self.rebid_interval_min}")
         self.rules.validate()

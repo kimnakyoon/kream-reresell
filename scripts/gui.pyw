@@ -3,6 +3,9 @@
 [입찰] 을 누르면 랭킹 → 상품 → 입찰까지 자동으로 진행한다. 크롬은 화면 밖에서 돌아가고
 (작업표시줄에만 남음) 진행 상황은 이 창에만 표시된다. [크롬 창 보기] 를 켜면 실행 중에도 불러올 수 있다.
 [입찰취소] 는 마이페이지 > 구매 내역 > 구매 입찰 목록을 순서대로 다시 판정해 기준 미달 입찰을 지운다.
+[재입찰] 은 같은 목록을 [중지] 를 누를 때까지 반복해서 돌며, 즉시 판매가가 내 희망가보다 높아진(밀린) 입찰을
+상품 페이지에서 처음 입찰 때 기준으로 다시 판정하고 충족하면 [입찰 변경하기] 로 희망가를 최신 B 로 올린다
+(사이클 간격은 설정칸, 기본 5분 - 너무 빠르면 사이트가 막을 수 있다).
 [입찰 기준] 표에서 A(빠른배송 가격) 금액 구간별 최소 마진율과 상품 금액 상한(A 가 넘으면 바로 건너뜀)을 정한다.
 [입찰]/[입찰취소]/[기준 저장] 을 누르면 data/bid_rules.json 에 저장돼 다음 실행과 명령행에도 쓰인다.
 끝나면 바탕화면\\KREAM 결과\\ 에 엑셀 보고서가 저장된다 (자동으로 열지는 않는다).
@@ -32,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from kream_reresell import browser  # noqa: E402
-from kream_reresell.app import run_cancel_job, run_history_job, run_job  # noqa: E402
+from kream_reresell.app import run_cancel_job, run_history_job, run_job, run_rebid_job  # noqa: E402
 from kream_reresell.config import LOG_DIR, RULES_PATH, Settings  # noqa: E402
 from kream_reresell.ranking import ALL_CATEGORIES, DEFAULT_CATEGORY  # noqa: E402
 from kream_reresell.report import REPORT_DIR  # noqa: E402
@@ -108,12 +111,18 @@ class App:
         self.limit.delete(0, "end")
         self.limit.insert(0, str(self.base.max_products))
         self.limit.pack(side="left", padx=(6, 0))
+        tk.Label(row1, text="재입찰 사이클 간격(분)").pack(side="left", padx=(24, 0))
+        self.rebid_interval = tk.Spinbox(row1, from_=1, to=120, width=5)
+        self.rebid_interval.delete(0, "end")
+        self.rebid_interval.insert(0, f"{self.base.rebid_interval_min:g}")
+        self.rebid_interval.pack(side="left", padx=(6, 0))
+        tk.Label(row1, text="(1분 이상. 너무 짧으면 사이트가 막을 수 있음)", fg="#888").pack(side="left", padx=(6, 0))
 
         row2 = tk.Frame(frame)
         row2.pack(fill="x", **pad)
         self.mode = tk.StringVar(value="real")
-        tk.Radiobutton(row2, text="실제 실행 (입찰 / 입찰취소)", variable=self.mode, value="real").pack(side="left")
-        tk.Radiobutton(row2, text="판단만 (입찰·취소 안 함)", variable=self.mode, value="dry").pack(side="left", padx=(12, 0))
+        tk.Radiobutton(row2, text="실제 실행 (입찰 / 입찰취소 / 재입찰)", variable=self.mode, value="real").pack(side="left")
+        tk.Radiobutton(row2, text="판단만 (입찰·취소·변경 안 함)", variable=self.mode, value="dry").pack(side="left", padx=(12, 0))
         self.show_chrome = tk.BooleanVar(value=self.base.show_chrome)
         tk.Checkbutton(row2, text="크롬 창 보기", variable=self.show_chrome,
                        command=self.toggle_chrome_window).pack(side="right")
@@ -121,8 +130,9 @@ class App:
         cond = (f"조건: 최근 {self.base.lookback_days}일 빠른배송 {self.base.min_fast_sales}건 이상 · "
                 f"마진 (A−B) > A×[아래 입찰 기준의 구간별 %] · 입찰 {self.base.bid_days}일 · 창고보관 · 포인트 최대 사용")
         tk.Label(frame, text=cond, fg="#555", anchor="w", justify="left", wraplength=580).pack(fill="x", padx=12, pady=(0, 6))
-        tk.Label(frame, text="(거래량·기간·입찰기한은 프로젝트 폴더의 .env 에서 바꿉니다. 상품군·상품 수는 [입찰]에만 쓰입니다)",
-                 fg="#888", anchor="w").pack(fill="x", padx=12, pady=(0, 6))
+        tk.Label(frame, text="(거래량·기간·입찰기한은 프로젝트 폴더의 .env 에서 바꿉니다. 상품군·상품 수는 [입찰]에만, "
+                             "사이클 간격은 [재입찰]에만 쓰입니다)",
+                 fg="#888", anchor="w", justify="left", wraplength=600).pack(fill="x", padx=12, pady=(0, 6))
 
         # ---- 입찰 기준 (금액 구간별 마진율 + 입찰가 상한)
         self.tier_rows: list[dict] = []
@@ -139,11 +149,15 @@ class App:
                                        bg="#8B0000", fg="white", activebackground="#B22222", activeforeground="white",
                                        command=self.start_cancel)
         self.cancel_button.pack(side="left", padx=(8, 0))
+        self.rebid_button = tk.Button(buttons, text="재입찰", width=12, height=2, font=("맑은 고딕", 11, "bold"),
+                                      bg="#B36B00", fg="white", activebackground="#D98C1F", activeforeground="white",
+                                      command=self.start_rebid)
+        self.rebid_button.pack(side="left", padx=(8, 0))
         self.history_button = tk.Button(buttons, text="내역", width=12, height=2, font=("맑은 고딕", 11, "bold"),
                                         bg="#1F4E79", fg="white", activebackground="#2E75B6", activeforeground="white",
                                         command=self.start_history)
         self.history_button.pack(side="left", padx=(8, 0))
-        self.stop_button = tk.Button(buttons, text="중지 (지금 것까지만)", width=20, height=2, state="disabled",
+        self.stop_button = tk.Button(buttons, text="중지 (지금 것까지만)", width=18, height=2, state="disabled",
                                      command=self.request_stop)
         self.stop_button.pack(side="left", padx=(8, 0))
         self.status = tk.Label(buttons, text="대기 중", fg="#333")
@@ -374,6 +388,49 @@ class App:
             logging.getLogger("gui").exception("입찰취소 중 오류")
             self.q.put(("error", f"{type(e).__name__}: {e}"))
 
+    def start_rebid(self) -> None:
+        """[재입찰]: 구매 입찰 목록을 반복해서 돌며 밀린 입찰의 희망가를 [입찰 변경하기] 로 최신 B 로 올린다. [중지] 까지 계속."""
+        if self.worker and self.worker.is_alive():
+            return
+        try:
+            interval = float(self.rebid_interval.get())
+        except ValueError:
+            messagebox.showerror("입력 오류", "재입찰 사이클 간격은 숫자(분)로 넣어주세요.")
+            return
+        if interval < 1:
+            messagebox.showerror("입력 오류", "재입찰 사이클 간격은 1분 이상이어야 합니다 (너무 빠르면 사이트가 막을 수 있습니다).")
+            return
+        rules = self._apply_rules()
+        if rules is None:
+            return
+        dry = self.mode.get() == "dry"
+        if not dry and not messagebox.askyesno(
+                "재입찰", "마이페이지 > 구매 내역 > 구매 입찰 목록을 순서대로 보며, 즉시 판매가가 내 희망가보다 높아진(밀린) 입찰을\n"
+                        "상품 페이지에서 처음 입찰 때와 같은 기준으로 다시 판정하고\n"
+                        f"(최근 {self.base.lookback_days}일 빠른배송 {self.base.min_fast_sales}건 이상, {rules.describe()}),\n"
+                        f"충족하면 [입찰 변경하기] 로 희망가를 최신 즉시 판매가로 올립니다 (마감 {self.base.bid_days}일, 창고보관).\n\n"
+                        f"[중지] 를 누를 때까지 {interval:g}분 간격으로 계속 반복합니다.\n\n진행할까요?"):
+            return
+        settings = self._make_settings(dry, rules)
+        settings.rebid_interval_min = interval
+        self.stop_flag.clear()
+        self.last_report = None
+        self.open_report_button.configure(state="disabled")
+        self._set_busy(True, "재입찰 실행 중...")
+        self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 재입찰 시작: 구매 입찰 목록 반복 ({interval:g}분 간격), "
+                  f"{'판단만' if dry else '밀린 입찰의 희망가를 올림'} - [중지] 를 누를 때까지 =====\n입찰 기준: {rules.describe()}")
+        self.worker = threading.Thread(target=self._rebid_worker, args=(settings,), daemon=True)
+        self.worker.start()
+
+    def _rebid_worker(self, settings: Settings) -> None:
+        try:
+            job = run_rebid_job(settings, should_stop=self.stop_flag.is_set,
+                                on_status=lambda text: self.q.put(("status", text)))
+            self.q.put(("done", job))
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger("gui").exception("재입찰 중 오류")
+            self.q.put(("error", f"{type(e).__name__}: {e}"))
+
     def start_history(self) -> None:
         """[내역]: 달을 고르면 보관 판매 거래일시가 그 달인 판매를 구매 내역과 짝지어 엑셀로 저장한다."""
         if self.worker and self.worker.is_alive():
@@ -429,6 +486,7 @@ class App:
     def _set_busy(self, busy: bool, text: str = "") -> None:
         self.run_button.configure(state="disabled" if busy else "normal")
         self.cancel_button.configure(state="disabled" if busy else "normal")
+        self.rebid_button.configure(state="disabled" if busy else "normal")
         self.history_button.configure(state="disabled" if busy else "normal")
         self.stop_button.configure(state="normal" if busy else "disabled")
         self.status.configure(text=text or ("대기 중" if not busy else ""))
@@ -440,6 +498,9 @@ class App:
                 kind, payload = self.q.get_nowait()
                 if kind == "log":
                     self._log(payload)
+                elif kind == "status":
+                    if not self.stop_flag.is_set():   # 중지를 눌렀으면 "멈춥니다..." 표시를 유지
+                        self.status.configure(text=payload)
                 elif kind == "done":
                     self._finish(payload)
                 elif kind == "history_done":

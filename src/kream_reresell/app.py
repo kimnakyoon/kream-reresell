@@ -13,12 +13,14 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-from . import auth, cancel, history, history_report, pipeline, ranking, report
+from datetime import datetime
+
+from . import auth, cancel, history, history_report, pipeline, ranking, rebid, report
 from .browser import real_chrome_context
 from .config import Settings
 from .history import HistoryResult
 from .ranking import DEFAULT_CATEGORY
-from .report import ProductResult
+from .report import REPORT_DIR, ProductResult
 
 log = logging.getLogger(__name__)
 
@@ -159,4 +161,70 @@ def run_cancel_job(settings: Settings,
         log.info("[입찰 %d번째] %-40s %s - %s", r.rank, r.name[:40], r.status, r.detail)
     path = report.write_report(results, settings_line, mode, kind="입찰취소")
     log.info("엑셀 보고서: %s", path)
+    return JobResult(results=results, report_path=path, mode=mode)
+
+
+def describe_rebid_settings(settings: Settings) -> str:
+    return (f"재입찰 기준: 마이페이지 > 구매 내역 > 구매 입찰 순서대로, 즉시 판매가(B) 가 내 희망가보다 높은(밀린) 입찰만 "
+            f"상품 페이지에서 처음 입찰 때와 같은 기준으로 다시 판정 (최근 {settings.lookback_days}일 빠른배송 "
+            f"{settings.min_fast_sales}건 이상, {settings.rules.describe()}) 하고, 충족하면 [입찰 변경하기] 로 희망가를 "
+            f"최신 B 로 올림 (마감 {settings.bid_days}일, 창고보관). 사이클 간격 {settings.rebid_interval_min:g}분")
+
+
+def _write_rebid_report(results: list[ProductResult], settings_line: str, mode: str, path: Path) -> Path:
+    """사이클마다 같은 파일에 덮어쓴다. 사용자가 엑셀로 열어 둔 상태면 시각을 붙인 다른 이름으로 저장."""
+    try:
+        return report.write_report(results, settings_line, mode, path=path, kind="재입찰")
+    except PermissionError:
+        alt = path.with_name(f"{path.stem} ({datetime.now():%H%M%S}){path.suffix}")
+        log.warning("보고서가 열려 있어 다른 이름으로 저장: %s", alt)
+        return report.write_report(results, settings_line, mode, path=alt, kind="재입찰")
+
+
+def run_rebid_job(settings: Settings,
+                  should_stop: Callable[[], bool] | None = None,
+                  on_result: Callable[[ProductResult], None] | None = None,
+                  on_status: Callable[[str], None] | None = None,
+                  max_cycles: int | None = None) -> JobResult:
+    """[재입찰]: 구매 입찰 목록을 반복해서 돌며 밀린 입찰의 희망가를 올린다. 중지할 때까지 (또는 max_cycles 만큼) 돈다.
+
+    보고서는 사이클이 끝날 때마다 같은 파일에 덮어써서, 중간에 프로그램이 죽어도 그때까지의 결과가 남는다.
+    """
+    settings.validate()
+    mode = describe_mode(settings, "재입찰")
+    settings_line = describe_rebid_settings(settings)
+    log.info("%s | %s", mode, settings_line)
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    path = REPORT_DIR / f"KREAM 재입찰결과 {datetime.now():%Y-%m-%d %H%M}.xlsx"
+    results: list[ProductResult] = []
+
+    def collect(r: ProductResult) -> None:
+        results.append(r)
+        if on_result:
+            on_result(r)
+
+    def cycle_done(cycle: int, _cycle_results: list[ProductResult]) -> None:
+        nonlocal path
+        path = _write_rebid_report(results, settings_line, mode, path)
+
+    try:
+        with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images,
+                                                            show_chrome=settings.show_chrome) as context:
+            page = context.pages[0] if context.pages else context.new_page()
+            auth.ensure_logged_in(page, settings)
+            rebid.run(context, page, settings, should_stop=should_stop, on_result=collect,
+                      on_status=on_status, on_cycle=cycle_done, max_cycles=max_cycles)
+    except KeyboardInterrupt:
+        log.info("Ctrl+C 로 중지")
+    finally:
+        try:
+            path = _write_rebid_report(results, settings_line, mode, path)
+            log.info("엑셀 보고서: %s", path)
+        except Exception:  # noqa: BLE001
+            log.exception("보고서 저장 실패")
+
+    counts: dict[str, int] = {}
+    for r in results:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    log.info("==== 재입찰 결과: %s ====", ", ".join(f"{k} {v}건" for k, v in sorted(counts.items())) or "처리한 입찰 없음")
     return JobResult(results=results, report_path=path, mode=mode)
