@@ -14,7 +14,10 @@
   5. 목록 끝까지 가면 한 사이클. 중지할 때까지 사이클을 반복하되, 사이클 시작 간격(설정, 기본 5분)을 지키고
      입찰 사이에도 2~4초 무작위로 쉰다 (봇 탐지 대비). 오류가 연달아 나면 다음 사이클 전에 10분 더 쉰다.
 
-밀렸지만 기준에 못 미치는 입찰은 올리지 않고 그대로 둔다 (변경안함) - 지우는 것은 [입찰취소] 의 몫.
+밀렸는데 기준(거래량 · 마진)에 못 미쳐 올릴 수 없는 입찰은 [입찰취소] 와 같은 방식으로 지운다
+(상세의 '입찰 지우기' → 확인창 → DELETE 204 확인, cancel.delete_bid). 판단할 수 없는 경우(상품 페이지 오류 등)는 지우지 않는다.
+상품 금액 상한은 새로 입찰할 때만 쓰는 규칙이라 ([입찰취소] 와 같음) 기준은 충족하는데 A 가 상한을 넘기만 하는 입찰은
+올리지도 지우지도 않고 그대로 둔다 (변경안함).
 """
 
 from __future__ import annotations
@@ -31,11 +34,12 @@ from playwright.sync_api import BrowserContext, Page, TimeoutError as Playwright
 from . import auth, pipeline
 from . import bid as bid_mod
 from . import product as product_mod
-from .cancel import CancelAborted, OpenBid, ensure_product_id, list_open_bids, match_known_bid
+from .cancel import (CancelAborted, CancelUncertain, OpenBid, delete_bid, ensure_product_id, list_open_bids,
+                     match_known_bid)
 from .config import Settings
 from .debug import dump
 from .report import ProductResult
-from .store import BidRecord, append_run_log, load_bids, save_bid
+from .store import BidRecord, append_run_log, load_bids, remove_bid, save_bid
 
 log = logging.getLogger(__name__)
 
@@ -153,11 +157,28 @@ def rebid_one(context: BrowserContext, bid: OpenBid, settings: Settings, cycle: 
             log.info("구매 페이지를 바로 열지 못해 상품 페이지부터 확인")
 
         # 처음 입찰할 때와 같은 기준 (거래량 · 최신 A · 최신 B · 마진 · 상품 금액 상한). 거래량이 모자라도 A/B 는 읽어 보고서에 남긴다
-        reason = pipeline.evaluate(page, bid.product_url, r, settings, stop_early=False, price_limit=True)
+        # 거래량 · 마진 기준은 상한 없이 판정한다. 못 미치면 올릴 수 없으니 지운다 ([입찰취소] 와 같은 기준·방식)
+        reason = pipeline.evaluate(page, bid.product_url, r, settings, stop_early=False, price_limit=False)
         if reason:
-            r.status, r.detail = "변경안함", (f"밀렸지만 기준 미달이라 올리지 않음: {reason} "
-                                           f"(내 {bid.price:,}원, 지금 B {r.price_b:,}원)" if r.price_b else
-                                           f"밀렸지만 기준 미달이라 올리지 않음: {reason}")
+            why = f"밀렸는데 기준 미달이라 올릴 수 없음: {reason} (내 {bid.price:,}원, 지금 B {r.price_b:,}원)"
+            if settings.dry_run:
+                r.status, r.detail = "취소대상", f"dry-run: {why}"
+                return r
+            try:
+                delete_bid(page, bid, settings)
+            except CancelAborted as e:
+                r.status, r.detail = "확인필요", f"{why} - 그런데 지우지 못함 (안전장치: {e})"
+                return r
+            except CancelUncertain as e:
+                r.status, r.detail = "확인필요", f"{why} - {e}, 마이페이지에서 확인"
+                return r
+            remove_bid(bid.product_id)
+            r.status, r.detail = "입찰취소", f"{why} -> 입찰 #{bid.bid_id} 지움"
+            return r
+        if settings.rules.over_limit(r.price_a):
+            # 상한은 새로 입찰할 때만 쓰는 규칙 - 기준은 충족하니 지우지 않고, 새 입찰 규칙상 올리지도 않는다
+            r.status, r.detail = "변경안함", (f"밀렸지만 A {r.price_a:,}원 > 상품 금액 상한 {settings.rules.max_price_a:,}원이라 "
+                                           f"올리지 않음 (기준은 충족해 지우지도 않음, 내 {bid.price:,}원, 지금 B {r.price_b:,}원)")
             return r
         new_price = r.price_b
         if new_price <= bid.price:
