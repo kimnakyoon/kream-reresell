@@ -15,13 +15,15 @@
   5. 목록 끝까지 가면 한 사이클. 중지할 때까지 사이클을 반복하되, 사이클 시작 간격(설정, 기본 5분)을 지키고
      입찰 사이에도 2~4초 무작위로 쉰다 (봇 탐지 대비).
 
-사이트가 응답을 안 줄 때 (2026-09-05 실측): 상품 페이지 자체는 뜨는데 구매 페이지의 '즉시 판매가' 와 체결 내역 패널의 행처럼
-API 로 채우는 부분만 비는 시간대가 있었다 (한 번 시작하면 계속 두드리는 동안 20분 넘게 이어졌고, 7분쯤 쉬면 풀렸다).
-구매 페이지에 와 있는데 '즉시 판매가' 가 안 그려지면 상품 페이지를 다시 돌지 않고 바로 판단 불가로 끝낸다 (그 경로가 도움이 된 적 없이
-30~40초만 더 썼다). 판단 불가(확인필요)·오류가 연달아 TROUBLE_STREAK 건 나오면 최대 10분 쉬되 2분마다 구매 페이지를 한 번 열어 보고
-풀렸으면 로그인 상태를 확인한 뒤 바로 이어서 본다. 같은 사이클에서 또 그러면 사이클을 끊고 다음 사이클 전에 10분 더 쉰다.
-판단 불가로 끝난 입찰은 화면 스냅샷을 dumps/ 에 남긴다.
-구매 페이지가 로그인 화면으로 넘어가면(로그인이 풀림) 다시 로그인하고 그 입찰을 한 번 더 본다.
+즉시 판매가가 없을 때: 구매 페이지에 와 있는데 '즉시 판매가' 가 안 그려지면 (사용자 결정, 2026-09-05) 상품 페이지를 돌지 않고
+바로 그 입찰을 지운다 (입찰취소, 방식은 기준 미달 때와 같다. 지우기 전에 상세 API 로 살아 있는 입찰인지 보고, 이미 체결·삭제된
+입찰이면 건너뜀). 지우지 못하면 확인필요. 지운 상품은 bids.json 에서도 빼서 [입찰]이 조건이 맞으면 다시 넣을 수 있게 한다.
+사이트가 응답을 안 주는 시간대(2026-09-05 실측: API 로 채우는 부분만 비는 상태가 계속 두드리는 동안 20분 넘게 이어졌고, 7분쯤 쉬면
+풀렸다)에도 같은 일이 생기므로, 이렇게 지운 건도 판단 불가·오류와 함께 '연달아 난 수' 에 넣는다: 연달아 TROUBLE_STREAK 건 나오면
+최대 10분 쉬되 2분마다 구매 페이지를 한 번 열어 보고 풀렸으면 로그인 상태를 확인한 뒤 바로 이어서 본다. 같은 사이클에서 또 그러면
+사이클을 끊고 다음 사이클 전에 10분 더 쉰다. 판단 불가·즉시 판매가 없음으로 끝난 입찰은 화면 스냅샷을 dumps/ 에 남긴다.
+구매 페이지가 로그인 화면으로 넘어가면(로그인이 풀림) 다시 로그인하고 그 입찰을 한 번 더 본다. 목록 페이지가 로그인 화면으로
+넘어가도 (로그인 화면 주소에도 returnUrl 로 tab=bidding 이 들어가 0건으로 읽히던 문제, 2026-09-05) 다시 로그인하고 목록을 다시 읽는다.
 
 밀렸는데 기준(거래량 · 마진)에 못 미쳐 올릴 수 없는 입찰은 [입찰취소] 와 같은 방식으로 지운다
 (상세의 '입찰 지우기' → 확인창 → DELETE 204 확인, cancel.delete_bid). 판단할 수 없는 경우(상품 페이지 오류 등)는 지우지 않는다.
@@ -39,13 +41,13 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from urllib.parse import quote_plus, urlparse
 
-from playwright.sync_api import BrowserContext, Page, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeout
 
 from . import auth, pipeline
 from . import bid as bid_mod
 from . import product as product_mod
 from .cancel import (CancelAborted, CancelUncertain, OpenBid, apply_known, delete_bid, ensure_product_id,
-                     list_open_bids, match_known_bid)
+                     list_open_bids, match_known_bid, read_bid_info)
 from .config import Settings
 from .debug import dump
 from .report import ProductResult
@@ -61,6 +63,8 @@ TROUBLE_PAUSE_SEC = 600          # 최대 10분 쉬고 로그인 상태를 확�
                                  # 다음 사이클 전에 10분 더 쉰다 (계속 두드리면 풀리지 않는다 - 2026-09-05 실측)
 TROUBLE_PROBE_SEC = 120          # 쉬는 동안 이만큼마다 한 번 구매 페이지를 열어 보고, '즉시 판매가' 가 그려지면 바로 이어서 본다
 MAX_LIST_FAILURES = 3            # 목록을 연달아 이만큼 못 읽으면 멈춘다
+ERROR_BACKOFF_SEC = 120          # 목록을 못 읽었을 때 다시 시도하기 전에 쉬는 시간
+NO_B_PREFIX = "즉시 판매가 없음"   # 즉시 판매가가 없어 지운(또는 지우려 한) 결과의 사유 머리 - 연달아 난 수를 셀 때 쓴다
 
 
 class LoginLost(Exception):
@@ -98,11 +102,20 @@ _BODY_CONTAINS_JS = "(needle) => document.body.innerText.replace(/\\s+/g, '').in
 def read_current_b(page: Page, product_id: int, size: str = ONE_SIZE) -> int | None:
     """구매 페이지를 바로 열어 '즉시 판매가' B 만 읽는다. 구매 페이지가 안 뜨고 다른 곳으로 가면(옵션 상품 등) None.
 
-    구매 페이지에 와 있는데 '즉시 판매가' 가 안 그려지면 사이트가 응답을 안 준 것이다 - 입찰 중인 상품은 내 입찰이 있어 즉시 판매가가
-    항상 있고, 상품 페이지를 거쳐도 같은 구매 페이지에서 똑같이 막힌다 (2026-09-05 실측: 그 경로가 도움이 된 적 없이 30~40초만 더 씀).
-    그래서 SkipProduct 로 바로 판단 불가.
+    구매 페이지에 와 있는데 '즉시 판매가' 가 안 그려지면 NoPriceB - 상품 페이지를 거쳐도 같은 구매 페이지에서 똑같이 막히므로
+    (2026-09-05 실측: 그 경로가 도움이 된 적 없이 30~40초만 더 씀) 돌지 않고 바로 알린다. 부르는 쪽([재입찰])이 입찰을 지운다.
+    구매 페이지 이동이 15초 안에 안 끝나거나 끊기면(net::ERR_ABORTED) 1.5초 뒤 한 번 더 열고, 그래도 안 되면 SkipProduct(판단 불가).
     """
-    page.goto(buy_page_url(product_id, size), wait_until="domcontentloaded")
+    url = buy_page_url(product_id, size)
+    for attempt in range(2):
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+            break
+        except (PlaywrightTimeout, PlaywrightError) as e:
+            if attempt:
+                raise product_mod.SkipProduct(f"구매 페이지를 열지 못함 (두 번 시도): {str(e).splitlines()[0]}") from e
+            log.info("구매 페이지 이동이 안 끝남 (%s) - 1.5초 뒤 다시 엶", str(e).splitlines()[0])
+            page.wait_for_timeout(1500)
     # 고정 대기 대신 '즉시 판매가 N원' 이 실제로 그려질 때까지만 기다린다 (상품 페이지로 돌려보내지면 안 그려져 타임아웃)
     try:
         page.wait_for_function(_PRICE_B_RENDERED_JS, timeout=8000)
@@ -110,7 +123,7 @@ def read_current_b(page: Page, product_id: int, size: str = ONE_SIZE) -> int | N
         if _on_login_page(page):
             raise LoginLost(f"구매 페이지가 로그인 화면으로 넘어감: {page.url}") from None
         if urlparse(page.url).path.startswith(f"/buy/{product_id}"):
-            raise product_mod.SkipProduct("구매 페이지가 떴는데 '즉시 판매가' 가 그려지지 않음 (사이트가 응답을 안 줌?)") from None
+            raise product_mod.NoPriceB("구매 페이지가 떴는데 '즉시 판매가' 가 없음") from None
         log.info("구매 페이지가 다른 곳으로 넘어감 (지금 주소 %s)", page.url)
         return None
     # 로그인 화면의 returnUrl 에도 /buy/{id} 가 들어가므로 경로로 본다
@@ -204,8 +217,47 @@ def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, diagnose
 
 
 def is_site_trouble(r: ProductResult) -> bool:
-    """사이트가 응답을 안 줘서 판단하지 못한 결과인지 (판단 불가 · 오류). 연달아 나면 쉬어야 한다."""
-    return r.status == "오류" or (r.status == "확인필요" and r.detail.startswith("판단 불가"))
+    """사이트가 응답을 안 줘서 생겼을 수 있는 결과인지 (판단 불가 · 오류 · 즉시 판매가 없음). 연달아 나면 쉬어야 한다."""
+    return (r.status == "오류"
+            or (r.status == "확인필요" and r.detail.startswith("판단 불가"))
+            or r.detail.removeprefix("dry-run: ").startswith(NO_B_PREFIX))
+
+
+def _delete_bid_and_report(page: Page, bid: OpenBid, settings: Settings, r: ProductResult, why: str) -> None:
+    """입찰을 지우고 (dry-run 이면 취소대상으로만) 결과를 r 에 채운다. 기준 미달 · 즉시 판매가 없음 두 경로가 같이 쓴다."""
+    if settings.dry_run:
+        r.status, r.detail = "취소대상", f"dry-run: {why}"
+        return
+    try:
+        delete_bid(page, bid, settings)
+    except CancelAborted as e:
+        r.status, r.detail = "확인필요", f"{why} - 그런데 지우지 못함 (안전장치: {e})"
+        return
+    except CancelUncertain as e:
+        r.status, r.detail = "확인필요", f"{why} - {e}, 마이페이지에서 확인"
+        return
+    remove_bid(bid.product_id, bid.size_value)
+    r.status, r.detail = "입찰취소", f"{why} -> 입찰 #{bid.bid_id} 지움"
+
+
+def _cancel_no_b(page: Page, bid: OpenBid, settings: Settings, r: ProductResult, why: str, diagnose: bool) -> None:
+    """즉시 판매가가 없는 입찰을 지운다 (사용자 결정: 즉시 판매가가 없으면 그냥 입찰 취소).
+
+    지우기 전에 상세 API 로 살아 있는 입찰인지 본다 - 체결·만료·이미 지운 입찰이면 즉시 판매가가 없는 게 당연하니 건너뜀.
+    """
+    log.info("%s - 입찰 #%d 을 지움 (지금 주소 %s)", why, bid.bid_id, page.url)
+    if diagnose:
+        dump(page, f"rebid{bid.bid_id}_no_b")
+    head = f"{NO_B_PREFIX} ({why}, 내 희망가 {bid.price:,}원)"
+    if not settings.dry_run:
+        data = read_bid_info(page, bid)
+        status = (data or {}).get("status")
+        if status and status != "live":
+            # 사이트 문제가 아니라 입찰이 끝난 것 - 사유 머리에 NO_B_PREFIX 를 두지 않아 '연달아 난 수' 에 들어가지 않게
+            r.status, r.detail = "건너뜀", (f"입찰 상태가 '{(data or {}).get('status_display') or status}' 라 "
+                                          f"살아 있는 입찰이 아님 (그래서 {head})")
+            return
+    _delete_bid_and_report(page, bid, settings, r, head)
 
 
 def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: ProductResult, diagnose: bool) -> None:
@@ -240,20 +292,8 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
         reason = pipeline.evaluate(page, bid.product_url, r, settings, stop_early=False, price_limit=False,
                                    option=bid.eval_option)
         if reason:
-            why = f"밀렸는데 기준 미달이라 올릴 수 없음: {reason} (내 {bid.price:,}원, 지금 B {r.price_b:,}원)"
-            if settings.dry_run:
-                r.status, r.detail = "취소대상", f"dry-run: {why}"
-                return
-            try:
-                delete_bid(page, bid, settings)
-            except CancelAborted as e:
-                r.status, r.detail = "확인필요", f"{why} - 그런데 지우지 못함 (안전장치: {e})"
-                return
-            except CancelUncertain as e:
-                r.status, r.detail = "확인필요", f"{why} - {e}, 마이페이지에서 확인"
-                return
-            remove_bid(bid.product_id, bid.size_value)
-            r.status, r.detail = "입찰취소", f"{why} -> 입찰 #{bid.bid_id} 지움"
+            _delete_bid_and_report(page, bid, settings, r,
+                                   f"밀렸는데 기준 미달이라 올릴 수 없음: {reason} (내 {bid.price:,}원, 지금 B {r.price_b:,}원)")
             return
         if settings.rules.over_limit(r.price_a):
             # 상한은 새로 입찰할 때만 쓰는 규칙 - 기준은 충족하니 지우지 않고, 새 입찰 규칙상 올리지도 않는다
@@ -279,6 +319,10 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
         bid.price = new_price
         r.status, r.detail = "변경완료", f"{old_price:,}원 → {new_price:,}원 / {settings.bid_days}일 / 창고보관"
         return
+    except product_mod.NoPriceB as e:
+        if _on_login_page(page):
+            raise LoginLost(f"구매 페이지 확인 중 로그인 화면으로 넘어감: {page.url}") from e
+        _cancel_no_b(page, bid, settings, r, str(e), diagnose)
     except product_mod.SkipProduct as e:
         if _on_login_page(page):
             raise LoginLost(f"상품 페이지 확인 중 로그인 화면으로 넘어감: {page.url}") from e
@@ -287,6 +331,8 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
         if diagnose:
             dump(page, f"rebid{bid.bid_id}_skip")
         r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: {e}"
+    except LoginLost:
+        raise   # rebid_one 이 다시 로그인하고 한 번 더 본다 (아래 Exception 에 삼켜져 '오류' 로 끝나던 문제, 2026-09-05)
     except bid_mod.StoppedBeforeSubmit as e:
         r.status, r.detail = "중단", str(e)
     except bid_mod.BidAborted as e:

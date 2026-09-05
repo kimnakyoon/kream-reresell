@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlparse
 from playwright.sync_api import Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeout
 
 from .dates import parse_trade_date
+from .debug import dump
 from .store import ONE_SIZE
 
 log = logging.getLogger(__name__)
@@ -33,6 +34,10 @@ ALL_OPTIONS_LABEL = "모든 옵션"
 
 class SkipProduct(Exception):
     """이 상품은 건너뛴다 (사유를 메시지로)."""
+
+
+class NoPriceB(SkipProduct):
+    """구매 페이지는 떴는데 '즉시 판매가'(B) 가 없다. [재입찰]은 이 경우 입찰을 지운다."""
 
 
 @dataclass
@@ -435,7 +440,12 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None =
     except PlaywrightTimeout as e:
         raise SkipProduct("'즉시 구매 / 구매 입찰' 버튼이 없음") from e
     go.click()
-    page.wait_for_url(re.compile(rf"/buy/{product_id}"), timeout=15_000)
+    _pass_model_number_check(page, product_id)
+    try:
+        page.wait_for_url(re.compile(rf"/buy/{product_id}"), timeout=15_000)
+    except PlaywrightTimeout as e:
+        dump(page, f"{product_id}_no_buy_page")
+        raise SkipProduct(f"'즉시 구매 / 구매 입찰' 을 눌렀는데 구매 페이지로 넘어가지 않음 (지금 주소 {page.url})") from e
     try:
         page.get_by_text("즉시 판매가", exact=True).first.wait_for(state="visible", timeout=10_000)
     except PlaywrightTimeout as e:
@@ -447,6 +457,39 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None =
         if not re.search(rf"(^|\n)\s*{re.escape(option)}\s*(\n|$)", body):
             raise SkipProduct(f"구매 페이지의 옵션 표기가 '{option}' 이 아님 (주소 {page.url})")
     return price_a
+
+
+MODEL_CHECK_BUTTON = "확인 후 계속"
+
+
+def _pass_model_number_check(page: Page, product_id: int) -> None:
+    """'즉시 구매 / 구매 입찰' 을 누른 뒤 뜨는 "모델번호를 확인하셨나요?" 확인창을 [확인 후 계속] 으로 넘긴다.
+
+    같은 디자인의 다른 모델번호 상품이 있는 상품(의류 등, 2026-09-05 바람막이 실측)에서만 뜬다. 확인창이 뜨면 구매 페이지로
+    넘어가지 않고 멈춰 있으므로, 구매 페이지로 넘어가거나 확인창이 뜰 때까지 기다렸다가 확인창이면 버튼을 누른다.
+    """
+    try:
+        page.wait_for_function(_BUY_PAGE_OR_MODEL_CHECK_JS, arg=[product_id, MODEL_CHECK_BUTTON], timeout=8000)
+    except PlaywrightTimeout:
+        return  # 둘 다 아니면 뒤의 wait_for_url 이 판단한다
+    if urlparse(page.url).path.startswith(f"/buy/{product_id}"):
+        return
+    button = page.get_by_role("button", name=MODEL_CHECK_BUTTON, exact=True).first
+    try:
+        button.wait_for(state="visible", timeout=3000)
+        button.click()
+        log.info("'모델번호를 확인하셨나요?' 확인창 - [%s] 누름", MODEL_CHECK_BUTTON)
+    except PlaywrightTimeout:
+        log.debug("모델번호 확인창 버튼을 찾았는데 누르지 못함")
+
+
+# 구매 페이지로 넘어갔거나, "모델번호를 확인하셨나요?" 확인창의 [확인 후 계속] 버튼이 보이는지
+_BUY_PAGE_OR_MODEL_CHECK_JS = r"""
+([pid, label]) => {
+  if (location.pathname.startsWith('/buy/' + pid)) return true;
+  return [...document.querySelectorAll('button')].some(b => b.innerText.trim() === label && b.offsetParent !== null);
+}
+"""
 
 
 MODAL_SELECTOR = ".bottom-sheet__layer--open.layer-option-picker"
@@ -499,7 +542,7 @@ def read_price_b(page: Page) -> int:
     text = page.locator("body").inner_text()
     m = re.search(r"즉시 판매가\s*([\d,]+)\s*원", text)
     if not m:
-        raise SkipProduct("즉시 판매가(B)를 읽지 못함 (구매 입찰 없음?)")
+        raise NoPriceB("즉시 판매가(B)를 읽지 못함 (구매 입찰 없음?)")
     price_b = int(m.group(1).replace(",", ""))
     log.info("B(즉시 판매가) = %s원", f"{price_b:,}")
     return price_b

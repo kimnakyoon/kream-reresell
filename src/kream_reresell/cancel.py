@@ -19,6 +19,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from urllib.parse import urlparse
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PlaywrightTimeout
 
@@ -96,10 +97,17 @@ def list_open_bids(page: Page) -> list[OpenBid]:
     except PlaywrightTimeout:
         pass
     page.wait_for_timeout(800)
-    if "tab=bidding" not in page.url:
-        raise CancelAborted(f"구매 입찰 탭이 열리지 않음: {page.url}")
+    # 로그인이 풀리면 /login?returnUrl=/my/buying?tab=bidding 으로 가는데 주소에 tab=bidding 이 그대로 들어 있어
+    # 0건으로 읽히던 문제 (2026-09-05) - 경로로 본다
+    parsed = urlparse(page.url)
+    if parsed.path.startswith("/login") or parsed.path.rstrip("/") != "/my/buying" or "tab=bidding" not in parsed.query:
+        raise CancelAborted(f"구매 입찰 탭이 열리지 않음 (로그인이 풀렸거나 다른 곳으로 넘어감): {page.url}")
 
     expected = page.evaluate(_BIDDING_COUNT_JS)
+    if expected is None and not page.locator('a[href*="/my/buying/"]').count() \
+            and not page.get_by_text("구매 입찰 내역이 없습니다").count():
+        # 탭 머리의 건수도, 항목도, '없습니다' 안내도 없다 - 목록이 그려지지 않은 것 (사이트가 응답을 안 줌?)
+        raise CancelAborted(f"구매 입찰 목록이 그려지지 않음 (건수 표시 없음): {page.url}")
     rows: list[dict] = []
     prev = -1
     stale = 0
