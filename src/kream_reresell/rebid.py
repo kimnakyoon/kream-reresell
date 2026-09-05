@@ -39,7 +39,7 @@ from .cancel import (CancelAborted, CancelUncertain, OpenBid, delete_bid, ensure
 from .config import Settings
 from .debug import dump
 from .report import ProductResult
-from .store import BidRecord, append_run_log, load_bids, remove_bid, save_bid
+from .store import BidRecord, append_run_log, load_bid_products, load_bids, remove_bid, save_bid, save_bid_products
 
 log = logging.getLogger(__name__)
 
@@ -74,17 +74,20 @@ _BODY_CONTAINS_JS = "(needle) => document.body.innerText.replace(/\\s+/g, '').in
 def read_current_b(page: Page, product_id: int) -> int | None:
     """구매 페이지를 바로 열어 '즉시 판매가' B 만 읽는다. 구매 페이지가 안 뜨면(옵션 상품 등) None."""
     page.goto(buy_page_url(product_id), wait_until="domcontentloaded")
+    # 고정 대기 대신 '즉시 판매가 N원' 이 실제로 그려질 때까지만 기다린다 (상품 페이지로 돌려보내지면 안 그려져 타임아웃)
     try:
-        page.get_by_text("즉시 판매가", exact=True).first.wait_for(state="visible", timeout=8000)
+        page.wait_for_function(_PRICE_B_RENDERED_JS, timeout=8000)
     except PlaywrightTimeout:
         return None
     if f"/buy/{product_id}" not in page.url:
         return None
-    page.wait_for_timeout(300)
     try:
         return product_mod.read_price_b(page)
     except product_mod.SkipProduct:
         return None
+
+
+_PRICE_B_RENDERED_JS = "() => /즉시 판매가\\s*[\\d,]+\\s*원/.test(document.body.innerText)"
 
 
 # ---------------------------------------------------------------- 변경
@@ -126,9 +129,11 @@ def _record(bid: OpenBid, r: ProductResult, new_price: int, settings: Settings, 
 
 # ---------------------------------------------------------------- 입찰 하나
 
-def rebid_one(context: BrowserContext, bid: OpenBid, settings: Settings, cycle: int) -> ProductResult:
-    """입찰 하나를 새 탭에서 본다: 밀렸는지 → 처음 입찰 기준으로 다시 판정 → [입찰 변경하기] 로 희망가를 B 로."""
-    page: Page = context.new_page()
+def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int) -> ProductResult:
+    """입찰 하나를 본다: 밀렸는지 → 처음 입찰 기준으로 다시 판정 → [입찰 변경하기] 로 희망가를 B 로 (또는 기준 미달이면 지움).
+
+    page 는 실행 내내 같은 탭을 다시 쓴다 (입찰마다 탭을 열고 닫는 시간을 아낀다. 단계마다 goto 로 시작하므로 앞 입찰의 화면이 남지 않는다).
+    """
     old_price = bid.price
     r = ProductResult(rank=bid.order, product_id=bid.product_id or 0, name=bid.name, url=bid.url,
                       category=f"{cycle}회차", bid_price=bid.price)
@@ -139,7 +144,6 @@ def rebid_one(context: BrowserContext, bid: OpenBid, settings: Settings, cycle: 
             if status and status != "live":
                 r.status, r.detail = "건너뜀", f"입찰 상태가 '{(data or {}).get('status_display') or status}' - 살아 있는 입찰이 아님"
                 return r
-            page.wait_for_timeout(500)
         r.product_id, r.url, r.bid_price = bid.product_id, bid.product_url, bid.price
         if not bid.price:
             raise bid_mod.BidAborted("내 희망가를 읽지 못함")
@@ -226,10 +230,6 @@ def rebid_one(context: BrowserContext, bid: OpenBid, settings: Settings, cycle: 
             "price_a": r.price_a or "", "price_b": r.price_b or "",
             "status": r.status, "detail": r.detail,
         })
-        try:
-            page.close()
-        except Exception:  # noqa: BLE001
-            pass
 
 
 # ---------------------------------------------------------------- 사이클 반복
@@ -267,7 +267,9 @@ def run(context: BrowserContext, page: Page, settings: Settings,
     stop = should_stop or (lambda: False)
     status = on_status or (lambda _t: None)
     results: list[ProductResult] = []
-    pid_cache: dict[int, int] = {}   # 입찰번호 -> 상품 ID (이번 실행 동안. 프로그램이 넣지 않은 입찰도 상세는 한 번만 연다)
+    # 입찰번호 -> 상품 ID. 파일(data/bid_products.json)에 남겨 두어 프로그램이 넣지 않은 입찰도 상세는 처음 한 번만 연다
+    pid_cache = load_bid_products()
+    tab: Page = context.new_page()   # 입찰마다 탭을 열고 닫지 않고 실행 내내 이 탭을 다시 쓴다
     cycle = 0
     list_failures = 0
     while not stop():
@@ -289,7 +291,12 @@ def run(context: BrowserContext, page: Page, settings: Settings,
         known = load_bids()
         for b in bids:
             b.product_id = pid_cache.get(b.bid_id) or match_known_bid(b, known)
-        log.info("===== 재입찰 %d회차: 구매 입찰 %d건 =====", cycle, len(bids))
+        # 목록에서 사라진 입찰(체결·만료·지움)은 캐시에서 뺀다
+        live_ids = {b.bid_id for b in bids}
+        for stale in [k for k in pid_cache if k not in live_ids]:
+            del pid_cache[stale]
+        log.info("===== 재입찰 %d회차: 구매 입찰 %d건 (상세를 열어야 하는 입찰 %d건) =====",
+                 cycle, len(bids), sum(1 for b in bids if not b.product_id))
 
         cycle_results: list[ProductResult] = []
         error_streak = 0
@@ -298,9 +305,12 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                 log.info("사용자 요청으로 중지 - 남은 입찰 %d건은 보지 않음", len(bids) - len(cycle_results))
                 break
             status(f"재입찰 {cycle}회차: {bid.order}/{len(bids)} {bid.name[:24]}")
-            r = rebid_one(context, bid, settings, cycle)
-            if bid.product_id:
+            if tab.is_closed():
+                tab = context.new_page()
+            r = rebid_one(tab, bid, settings, cycle)
+            if bid.product_id and pid_cache.get(bid.bid_id) != bid.product_id:
                 pid_cache[bid.bid_id] = bid.product_id
+                save_bid_products(pid_cache)
             cycle_results.append(r)
             results.append(r)
             if on_result:
@@ -335,4 +345,8 @@ def run(context: BrowserContext, page: Page, settings: Settings,
         status(f"재입찰 {cycle}회차 끝({int(elapsed)}초): {summary} - {int(wait)}초 쉬고 {next_at:%H:%M} 에 다음 사이클 "
                f"(시작 간격 {settings.rebid_interval_min:g}분)")
         _sleep(stop, wait)
+    try:
+        tab.close()
+    except Exception:  # noqa: BLE001
+        pass
     return results

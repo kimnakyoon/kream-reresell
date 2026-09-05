@@ -70,3 +70,23 @@ def remove_bid(product_id: int) -> bool:
         encoding="utf-8",
     )
     return True
+
+
+# ---------------------------------------------------------------- 입찰번호 -> 상품 ID (재입찰용 캐시)
+# 마이페이지 구매 입찰 목록에는 상품 ID 가 없어 상세를 열어야 한다 (1~2초). 한 번 읽은 것은 여기 남겨 다음 실행에도 다시 열지 않는다.
+BID_PRODUCTS_PATH = DATA_DIR / "bid_products.json"
+
+
+def load_bid_products() -> dict[int, int]:
+    if not BID_PRODUCTS_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(BID_PRODUCTS_PATH.read_text(encoding="utf-8"))
+        return {int(k): int(v) for k, v in raw.items()}
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+def save_bid_products(mapping: dict[int, int]) -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    BID_PRODUCTS_PATH.write_text(json.dumps({str(k): v for k, v in mapping.items()}, indent=1), encoding="utf-8")
