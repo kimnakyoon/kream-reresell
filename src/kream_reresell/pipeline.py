@@ -21,6 +21,7 @@ from .config import Settings
 from .debug import dump
 from .ranking import RankedProduct
 from .report import ProductResult
+from . import pacing
 from .sitewait import TROUBLE_STREAK, wait_until_site_back
 from .store import ONE_SIZE, BidRecord, append_run_log, save_bid
 
@@ -57,6 +58,7 @@ def evaluate(page: Page, url: str, r: ProductResult, settings: Settings, stop_ea
     if settings.inspect:
         dump(page, f"{r.product_id}_0_product")
 
+    pacing.before_sales_request()
     stats = product_mod.read_sales_stats(page, settings.lookback_days, settings.min_fast_sales, option)
     r.fast_sales, r.total_sales = stats.fast_in_window, stats.total_in_window
     sales_reason = _sales_reason(stats, settings)
@@ -99,7 +101,8 @@ def _judge_prices(page: Page, r: ProductResult, settings: Settings, price_limit:
 
 
 def process_product(context: BrowserContext, item: RankedProduct, settings: Settings,
-                    open_bids: "OpenBids | None" = None) -> list[ProductResult]:
+                    open_bids: "OpenBids | None" = None, should_stop: Callable[[], bool] | None = None,
+                    on_status: Callable[[str], None] | None = None) -> list[ProductResult]:
     """상품 하나를 새 탭에서 처리한다. ONE SIZE 상품은 결과 한 줄, 옵션 상품은 옵션마다 한 줄.
 
     기준에 맞으면 입찰을 시도하고, 시도 중 안전장치에 걸리거나 화면이 예상과 다르면 그 상품(옵션)은 건너뛰고 다음으로 간다.
@@ -120,6 +123,7 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
             r.name = product_mod.open_product(page, item.url) or r.name
             if settings.inspect:
                 dump(page, f"{pid}_0_product")
+            pacing.before_sales_request(should_stop, on_status=on_status)
             product_mod.open_sales_panel(page)
             options = product_mod.list_options(page)
         except product_mod.SkipProduct as e:
@@ -149,7 +153,13 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
 
         # 옵션 상품: 먼저 패널에서 옵션마다 거래량을 센다 (페이지 이동 없음). 기준을 넘는 옵션만 뒤에서 A/B 를 읽는다
         stats_by_option: dict[str, product_mod.SalesStats | str] = {}
-        for label in options:
+        for n, label in enumerate(options):
+            if n:
+                pacing.pause(pacing.OPTION_PAUSE_SEC, should_stop)   # 옵션을 바꿀 때마다 sales 요청이 나간다 - 사람 속도로
+            if should_stop and should_stop():
+                stats_by_option[label] = "중지 요청"
+                continue
+            pacing.before_sales_request(should_stop, on_status=on_status)
             try:
                 product_mod.select_option(page, label)
                 stats_by_option[label] = product_mod.count_sales(page, settings.lookback_days, settings.min_fast_sales, label)
@@ -220,6 +230,7 @@ def _judge_and_bid(page: Page, r: ProductResult, stats: product_mod.SalesStats, 
             return
         if not product_mod.on_product_page(page, r.product_id):
             product_mod.open_product(page, item.url)
+        pacing.before_sales_request()
         reason = _judge_prices(page, r, settings, price_limit=True, option=option, sales_reason=sales_reason)
         if reason and not settings.force:
             r.status, r.detail = "건너뜀", reason
@@ -311,8 +322,10 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
             if on_result:
                 on_result(results[-1])
             continue
+        if done > 1:
+            pacing.pause(pacing.PRODUCT_PAUSE_SEC, stop)   # 상품 사이 간격 (사이트 스로틀 대응)
         status(f"[{item.category}] {item.rank}위 {item.name[:24]} 확인 중 ({done}/{len(items)})")
-        product_results = process_product(context, item, settings, open_bids)
+        product_results = process_product(context, item, settings, open_bids, stop, status)
         for r in product_results:
             results.append(r)
             if on_result:

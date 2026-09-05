@@ -15,7 +15,7 @@ from playwright.sync_api import sync_playwright
 
 from datetime import datetime
 
-from . import auth, cancel, history, history_report, pipeline, ranking, rebid, report
+from . import auth, cancel, history, history_report, pacing, pipeline, ranking, rebid, report
 from .browser import real_chrome_context
 from .config import Settings
 from .history import HistoryResult
@@ -42,7 +42,7 @@ def run_history_job(settings: Settings, year: int, month: int,
                     should_stop: Callable[[], bool] | None = None) -> HistoryJobResult:
     """[내역]: 보관 판매 거래일시가 year-month 인 판매를 구매 내역과 짝지어 바탕화면에 엑셀로 저장한다."""
     log.info("판매 내역 정리: %d년 %d월 (보관 판매 거래일시 기준)", year, month)
-    with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images,
+    with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images, trim_api=settings.trim_api,
                                                         show_chrome=settings.show_chrome) as context:
         page = context.pages[0] if context.pages else context.new_page()
         auth.ensure_logged_in(page, settings)
@@ -94,7 +94,7 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
     log.info("%s | %s", mode, settings_line)
 
     results: list[ProductResult] = []
-    with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images,
+    with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images, trim_api=settings.trim_api,
                                                         show_chrome=settings.show_chrome) as context:
         page = context.pages[0] if context.pages else context.new_page()
         auth.ensure_logged_in(page, settings)
@@ -137,6 +137,7 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
                  r.status, r.detail)
     path = report.write_report(results, settings_line, mode)
     log.info("엑셀 보고서: %s", path)
+    log.info("사이트 스로틀 대상 API 요청 %d건 보냄 (10분 예산 %d건)", pacing.BUDGET.total, pacing.BUDGET.limit)
     return JobResult(results=results, report_path=path, mode=mode)
 
 
@@ -155,7 +156,7 @@ def run_cancel_job(settings: Settings,
     settings_line = describe_cancel_settings(settings)
     log.info("%s | %s", mode, settings_line)
 
-    with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images,
+    with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images, trim_api=settings.trim_api,
                                                         show_chrome=settings.show_chrome) as context:
         page = context.pages[0] if context.pages else context.new_page()
         auth.ensure_logged_in(page, settings)
@@ -214,7 +215,7 @@ def run_rebid_job(settings: Settings,
         path = _write_rebid_report(results, settings_line, mode, path)
 
     try:
-        with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images,
+        with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images, trim_api=settings.trim_api,
                                                             show_chrome=settings.show_chrome) as context:
             page = context.pages[0] if context.pages else context.new_page()
             auth.ensure_logged_in(page, settings)

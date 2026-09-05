@@ -8,6 +8,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from . import pacing
 from .rules import BidRules
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -53,6 +54,10 @@ class Settings:
     rebid_interval_min: float = field(default_factory=lambda: _float("REBID_INTERVAL_MIN", 5))
     # 이미지/동영상/폰트를 받지 않아 페이지를 빨리 띄운다. 화면 확인이 필요하면 .env 에 BLOCK_IMAGES=0
     block_images: bool = field(default_factory=lambda: _bool("BLOCK_IMAGES", True))
+    # 사이트 스로틀(IP 단위) 대응 - pacing 참고. 10분 창 안에 상품 API(sales 등) 요청을 이만큼까지만 보내고 넘으면 쉰다.
+    # 0 이면 예산을 안 센다. TRIM_API=0 이면 안 보는 asks·bids·chart 요청도 그대로 보낸다 (점검용)
+    api_budget_per_10min: int = field(default_factory=lambda: _int("API_BUDGET_PER_10MIN", 120))
+    trim_api: bool = field(default_factory=lambda: _bool("TRIM_API", True))
     # 크롬 창을 화면에 보이게 둘지. 기본은 화면 밖으로 치워 두고 GUI 상태창으로만 진행을 본다.
     # 직접 로그인이 필요하면 자동으로 불러온다. 화면을 보며 점검하려면 .env 에 SHOW_CHROME=1 또는 --show-chrome
     show_chrome: bool = field(default_factory=lambda: _bool("SHOW_CHROME", False))
@@ -65,6 +70,7 @@ class Settings:
     options: tuple[str, ...] = ()  # 옵션(사이즈) 상품에서 이 옵션들만 본다 (점검용, 화면 표기: W240 / M ...). 비우면 전부
 
     def validate(self) -> None:
+        pacing.configure(self.api_budget_per_10min)
         if self.stop_before_submit:
             self.show_chrome = True  # 마지막 버튼 직전에 멈추는 점검은 사람이 화면을 보는 게 목적
         if self.bid_days not in BID_DAY_CHOICES:

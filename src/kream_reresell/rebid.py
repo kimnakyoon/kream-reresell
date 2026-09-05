@@ -53,6 +53,7 @@ from .cancel import (CancelAborted, CancelUncertain, OpenBid, apply_known, delet
 from .config import Settings
 from .debug import dump
 from .report import ProductResult
+from . import pacing
 from .sitewait import PROBE_SEC, TROUBLE_STREAK, sleep_with_stop, wait_until_site_back
 from .store import (ONE_SIZE, BidRecord, append_run_log, load_bid_products, load_bids, remove_bid, save_bid,
                     save_bid_products)
@@ -285,6 +286,7 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
             raise bid_mod.BidAborted(f"옵션 '{bid.option}' 의 size 값을 알지 못함 (상세 API 에 product_option 없음?)")
         log.info("[%d회차 %d번째] %s - 내 희망가 %s원 (%s)", cycle, bid.order, bid.label, f"{bid.price:,}", bid.product_url)
 
+        pacing.before_sales_request()
         current_b = read_current_b(page, bid.product_id, bid.size_value)
         if current_b is not None:
             r.price_b = current_b

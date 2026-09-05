@@ -23,9 +23,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from playwright.sync_api import BrowserContext, Playwright
 
+from . import pacing
 from .config import ROOT
 
 log = logging.getLogger(__name__)
@@ -89,6 +91,39 @@ def _abort_heavy(route) -> None:
 
 def block_heavy_resources(context: BrowserContext) -> None:
     context.route("**/*", _abort_heavy)
+
+
+# ---------------------------------------------------------------- 사이트 스로틀 대응 (pacing 참고)
+
+def _on_api_request(request) -> None:
+    if request.url.startswith(pacing.API_ORIGIN):
+        path = urlparse(request.url).path
+        if not (_trimming and pacing.TRIMMABLE_PATH_RE.match(path)):
+            pacing.BUDGET.note(path)
+
+
+_trimming = False
+
+
+def _fulfill_trimmable(route) -> None:
+    """프로그램이 안 보는 asks·bids·chart 요청은 서버에 보내지 않고 빈 목록으로 채운다 (스로틀 대상 호출을 1/4 로).
+    abort 하면 사이트가 오류 표시로 바꿔 버리므로 200 으로 채운다 (실측). 나머지는 그대로."""
+    url = route.request.url
+    if url.startswith(pacing.API_ORIGIN) and pacing.TRIMMABLE_PATH_RE.match(urlparse(url).path):
+        route.fulfill(status=200, content_type="application/json", body=pacing.TRIM_BODY,
+                      headers={"access-control-allow-origin": "https://kream.co.kr",
+                               "access-control-allow-credentials": "true"})
+    else:
+        route.continue_()
+
+
+def watch_api_requests(context: BrowserContext, trim: bool = True) -> None:
+    """스로틀 대상 API 요청을 세고(pacing.BUDGET), trim 이면 안 보는 요청을 막는다."""
+    global _trimming
+    _trimming = trim
+    if trim:
+        context.route(f"{pacing.API_ORIGIN}/**", _fulfill_trimmable)
+    context.on("request", _on_api_request)   # 채워 준 요청도 request 이벤트는 오므로 서버에 간 것만 센다
 
 
 # ---------------------------------------------------------------- 크롬 창 위치 (Windows 전용)
@@ -196,12 +231,13 @@ def window_shown():
 @contextlib.contextmanager
 def real_chrome_context(playwright: Playwright, window_size: str = "1400,1000",
                         profile_dir: Path | None = None, block_images: bool = True,
-                        show_chrome: bool = False):
+                        show_chrome: bool = False, trim_api: bool = True):
     """크롬을 직접 실행해 CDP 로 붙은 BrowserContext (with 문으로 쓴다).
 
     headless 는 봇 탐지 점수가 바닥이라 쓰지 않는다. 창은 항상 만들되, show_chrome 이 False 면
     처음부터 화면 밖에 그린다 (작업표시줄에만 남음). 실행 중 show_window()/hide_window() 로 바꿀 수 있다.
     block_images 가 True 면 이미지/동영상/폰트를 받지 않는다 (화면에 그림은 안 보이지만 동작은 같다).
+    trim_api 가 True 면 프로그램이 안 보는 상품 API(asks·bids·chart) 요청을 막는다 (사이트 스로틀 대응, pacing 참고).
     """
     global _active_window
     profile = (profile_dir or PROFILE_DIR).resolve()  # 상대경로를 주면 크롬이 조용히 종료한다
@@ -238,6 +274,7 @@ def real_chrome_context(playwright: Playwright, window_size: str = "1400,1000",
         context.set_default_timeout(15_000)
         if block_images:
             block_heavy_resources(context)
+        watch_api_requests(context, trim=trim_api)
         yield context
     finally:
         _active_window = None
