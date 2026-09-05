@@ -8,6 +8,8 @@
   python scripts/run.py --list-categories                 # 상품군 이름 목록
   python scripts/run.py --product 385408 --force --stop-before-submit --inspect
                                                             # 특정 상품으로 화면 점검
+  python scripts/run.py --product 618712 --option W240 --dry-run
+                                                            # 옵션(사이즈) 상품에서 W240 만 판단
 """
 
 from __future__ import annotations
@@ -49,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--list-categories", action="store_true", help="상품군 이름 목록을 보여주고 끝")
     p.add_argument("--limit", type=int, help="상품군마다 볼 상품 수 (기본: .env MAX_PRODUCTS)")
     p.add_argument("--product", type=int, nargs="*", help="랭킹 대신 이 상품 ID 만 처리")
+    p.add_argument("--option", nargs="*", default=[],
+                   help="옵션(사이즈) 상품에서 이 옵션들만 본다 (화면 표기 그대로: W240 M ...). 점검용, 비우면 옵션 전부")
     p.add_argument("--dry-run", action="store_true", help="판단만 하고 입찰 폼은 건드리지 않음")
     p.add_argument("--stop-before-submit", action="store_true", help="마지막 '입찰하기' 직전에 멈춤")
     p.add_argument("--force", action="store_true", help="거래량/마진 조건 무시 (점검용)")
@@ -70,7 +74,7 @@ def main() -> int:
         print(f"모르는 상품군: {', '.join(unknown)} (랭킹 칩을 눌러 찾아봅니다. 목록: --list-categories)")
     setup_logging()
     settings = Settings(dry_run=args.dry_run, stop_before_submit=args.stop_before_submit,
-                        force=args.force, inspect=args.inspect)
+                        force=args.force, inspect=args.inspect, options=tuple(args.option))
     if args.show_chrome:
         settings.show_chrome = True
     if args.limit:

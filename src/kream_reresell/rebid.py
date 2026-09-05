@@ -2,13 +2,14 @@
 
 흐름 (2026-09-04 실측):
   1. /my/buying?tab=bidding 목록을 읽는다 (cancel.list_open_bids). 상품 ID 는 bids.json 기록 → 이번 실행의 캐시 →
-     상세 API 응답(api/m/bids/{입찰번호}) 순으로 알아낸다.
-  2. 빠른 확인: /buy/{상품ID}?size=ONE+SIZE 를 바로 열면 구매 페이지가 뜨고 '즉시 판매가'(B = 지금 가장 높은 구매 입찰가) 가
+     상세 API 응답(api/m/bids/{입찰번호}) 순으로 알아낸다. 옵션(사이즈) 상품은 구매 페이지 주소의 size 값(product_option.key,
+     화면 표기 W240 이 아니라 240) 도 같이 알아야 해서, 그 값을 모르면 상세를 연다. 판정은 그 옵션의 거래량·가격으로 한다.
+  2. 빠른 확인: /buy/{상품ID}?size=ONE+SIZE (옵션 상품은 size=옵션 값, 예 240) 를 바로 열면 구매 페이지가 뜨고 '즉시 판매가'(B = 지금 가장 높은 구매 입찰가) 가
      보인다 (2초쯤). B 가 내 희망가 이하이면 아직 밀리지 않은 것 - 그대로 둔다 (순위유지). 상품 페이지는 열지 않는다.
   3. B 가 내 희망가보다 높으면(누가 더 비싸게 입찰함) 상품 페이지를 다시 열어 처음 입찰할 때와 똑같이 판정한다
      (pipeline.evaluate: 최근 30일 빠른배송 건수, 최신 A·B, A−B > A×구간별 마진율, 상품 금액 상한).
   4. 조건이 맞으면 입찰 상세의 [입찰 변경하기] 버튼이 여는 것과 같은 주소
-     /buy/{상품ID}?size=ONE+SIZE&bid={입찰번호}&from=changeBidding&type=bid&price={기존 희망가}
+     /buy/{상품ID}?size={옵션 값}&bid={입찰번호}&from=changeBidding&type=bid&price={기존 희망가}
      로 가서 처음 입찰과 같은 화면을 채운다: 희망가 = 최신 B, 마감기한, 구매 입찰 계속 → 창고보관 → 포인트 최대 사용
      → 입찰하기 → 동의 3항목 → 입찰하기 (bid.fill_bid_form / choose_warehouse_and_points / submit_bid 그대로).
   5. 목록 끝까지 가면 한 사이클. 중지할 때까지 사이클을 반복하되, 사이클 시작 간격(설정, 기본 5분)을 지키고
@@ -36,19 +37,20 @@ import re
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PlaywrightTimeout
 
 from . import auth, pipeline
 from . import bid as bid_mod
 from . import product as product_mod
-from .cancel import (CancelAborted, CancelUncertain, OpenBid, delete_bid, ensure_product_id, list_open_bids,
-                     match_known_bid)
+from .cancel import (CancelAborted, CancelUncertain, OpenBid, apply_known, delete_bid, ensure_product_id,
+                     list_open_bids, match_known_bid)
 from .config import Settings
 from .debug import dump
 from .report import ProductResult
-from .store import BidRecord, append_run_log, load_bid_products, load_bids, remove_bid, save_bid, save_bid_products
+from .store import (ONE_SIZE, BidRecord, append_run_log, load_bid_products, load_bids, remove_bid, save_bid,
+                    save_bid_products)
 
 log = logging.getLogger(__name__)
 
@@ -69,14 +71,17 @@ def _on_login_page(page: Page) -> bool:
     return urlparse(page.url).path.startswith("/login")
 
 
-def buy_page_url(product_id: int) -> str:
-    """구매 페이지 직접 주소. size 없이 /buy/{id} 만 열면 상품 페이지로 돌려보낸다 (2026-09-04 실측)."""
-    return f"https://kream.co.kr/buy/{product_id}?size=ONE+SIZE"
+def buy_page_url(product_id: int, size: str = ONE_SIZE) -> str:
+    """구매 페이지 직접 주소. size 없이 /buy/{id} 만 열면 상품 페이지로 돌려보낸다 (2026-09-04 실측).
+
+    size 는 옵션의 값 (ONE SIZE / 240 ...) - 화면 표기(W240)가 아니라 상세 API 의 product_option.key (2026-09-05 실측).
+    """
+    return f"https://kream.co.kr/buy/{product_id}?size={quote_plus(size or ONE_SIZE)}"
 
 
 def change_bid_url(bid: OpenBid) -> str:
     """입찰 상세의 [입찰 변경하기] 버튼이 여는 주소 (2026-09-04 실측)."""
-    return (f"https://kream.co.kr/buy/{bid.product_id}?size=ONE+SIZE&bid={bid.bid_id}"
+    return (f"{buy_page_url(bid.product_id, bid.size_value)}&bid={bid.bid_id}"
             f"&from=changeBidding&type=bid&price={bid.price or ''}")
 
 
@@ -90,14 +95,14 @@ _BODY_CONTAINS_JS = "(needle) => document.body.innerText.replace(/\\s+/g, '').in
 
 # ---------------------------------------------------------------- 빠른 확인
 
-def read_current_b(page: Page, product_id: int) -> int | None:
+def read_current_b(page: Page, product_id: int, size: str = ONE_SIZE) -> int | None:
     """구매 페이지를 바로 열어 '즉시 판매가' B 만 읽는다. 구매 페이지가 안 뜨고 다른 곳으로 가면(옵션 상품 등) None.
 
     구매 페이지에 와 있는데 '즉시 판매가' 가 안 그려지면 사이트가 응답을 안 준 것이다 - 입찰 중인 상품은 내 입찰이 있어 즉시 판매가가
     항상 있고, 상품 페이지를 거쳐도 같은 구매 페이지에서 똑같이 막힌다 (2026-09-05 실측: 그 경로가 도움이 된 적 없이 30~40초만 더 씀).
     그래서 SkipProduct 로 바로 판단 불가.
     """
-    page.goto(buy_page_url(product_id), wait_until="domcontentloaded")
+    page.goto(buy_page_url(product_id, size), wait_until="domcontentloaded")
     # 고정 대기 대신 '즉시 판매가 N원' 이 실제로 그려질 때까지만 기다린다 (상품 페이지로 돌려보내지면 안 그려져 타임아웃)
     try:
         page.wait_for_function(_PRICE_B_RENDERED_JS, timeout=8000)
@@ -132,9 +137,13 @@ def change_bid(page: Page, bid: OpenBid, new_price: int, settings: Settings) -> 
         raise bid_mod.BidAborted("입찰 변경 화면이 뜨지 않음") from e
     if f"bid={bid.bid_id}" not in page.url or "changeBidding" not in page.url:
         raise bid_mod.BidAborted(f"입찰 변경 화면 주소가 예상과 다름: {page.url}")
-    if "구매 입찰하기" not in page.locator("body").inner_text():
+    body = page.locator("body").inner_text()
+    if "구매 입찰하기" not in body:
         dump(page, f"rebid{bid.bid_id}_not_bid_page")
         raise bid_mod.BidAborted("'구매 입찰하기' 화면이 아님")
+    if not bid.is_one_size and not re.search(rf"(^|\n)\s*{re.escape(bid.option)}\s*(\n|$)", body):
+        dump(page, f"rebid{bid.bid_id}_option_mismatch")
+        raise bid_mod.BidAborted(f"변경 화면의 옵션 표기가 '{bid.option}' 이 아님")
     # 상품명은 '즉시 판매가' 글자보다 조금 늦게 그려진다 (2026-09-04 실측) - 나타날 때까지 기다렸다가 대조한다
     if bid.name:
         try:
@@ -154,6 +163,7 @@ def _record(bid: OpenBid, r: ProductResult, new_price: int, settings: Settings, 
         product_id=bid.product_id, name=bid.name or r.name, price=new_price, bid_days=settings.bid_days,
         placed_at=datetime.now().isoformat(timespec="seconds") + note,
         fast_sales_30d=r.fast_sales or 0, price_a=r.price_a or 0, price_b=r.price_b or 0,
+        option=bid.option or ONE_SIZE, size=bid.size_value or ONE_SIZE,
     ))
 
 
@@ -166,7 +176,7 @@ def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, diagnose
     로그인이 풀린 것이 보이면 다시 로그인하고 한 번 더 본다. diagnose 가 True 면 판단 불가로 끝날 때 화면 스냅샷을 남긴다.
     """
     r = ProductResult(rank=bid.order, product_id=bid.product_id or 0, name=bid.name, url=bid.url,
-                      category=f"{cycle}회차", bid_price=bid.price)
+                      category=f"{cycle}회차", bid_price=bid.price, option="" if bid.is_one_size else bid.option)
     try:
         try:
             _rebid_one(page, bid, settings, cycle, r, diagnose)
@@ -185,7 +195,7 @@ def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, diagnose
         r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log.info("[%d회차 %d번째] 결과: %s - %s", cycle, bid.order, r.status, r.detail)
         append_run_log({
-            "category": r.category, "rank": r.rank, "product_id": r.product_id, "name": r.name,
+            "category": r.category, "rank": r.rank, "product_id": r.product_id, "name": r.name, "option": r.option,
             "fast_sales": r.fast_sales if r.fast_sales is not None else "",
             "price_a": r.price_a or "", "price_b": r.price_b or "",
             "status": r.status, "detail": r.detail,
@@ -201,18 +211,20 @@ def is_site_trouble(r: ProductResult) -> bool:
 def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: ProductResult, diagnose: bool) -> None:
     old_price = bid.price
     try:
-        if not bid.product_id:
+        if bid.needs_detail:
             data = ensure_product_id(page, bid)
             status = (data or {}).get("status")
             if status and status != "live":
                 r.status, r.detail = "건너뜀", f"입찰 상태가 '{(data or {}).get('status_display') or status}' - 살아 있는 입찰이 아님"
                 return
-        r.product_id, r.url, r.bid_price = bid.product_id, bid.product_url, bid.price
+        r.product_id, r.url, r.bid_price, r.size = bid.product_id, bid.product_url, bid.price, bid.size_value
         if not bid.price:
             raise bid_mod.BidAborted("내 희망가를 읽지 못함")
-        log.info("[%d회차 %d번째] %s - 내 희망가 %s원 (%s)", cycle, bid.order, bid.name, f"{bid.price:,}", bid.product_url)
+        if not bid.size_value:
+            raise bid_mod.BidAborted(f"옵션 '{bid.option}' 의 size 값을 알지 못함 (상세 API 에 product_option 없음?)")
+        log.info("[%d회차 %d번째] %s - 내 희망가 %s원 (%s)", cycle, bid.order, bid.label, f"{bid.price:,}", bid.product_url)
 
-        current_b = read_current_b(page, bid.product_id)
+        current_b = read_current_b(page, bid.product_id, bid.size_value)
         if current_b is not None:
             r.price_b = current_b
             if current_b <= bid.price:
@@ -225,7 +237,8 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
 
         # 처음 입찰할 때와 같은 기준 (거래량 · 최신 A · 최신 B · 마진 · 상품 금액 상한). 거래량이 모자라도 A/B 는 읽어 보고서에 남긴다
         # 거래량 · 마진 기준은 상한 없이 판정한다. 못 미치면 올릴 수 없으니 지운다 ([입찰취소] 와 같은 기준·방식)
-        reason = pipeline.evaluate(page, bid.product_url, r, settings, stop_early=False, price_limit=False)
+        reason = pipeline.evaluate(page, bid.product_url, r, settings, stop_early=False, price_limit=False,
+                                   option=bid.eval_option)
         if reason:
             why = f"밀렸는데 기준 미달이라 올릴 수 없음: {reason} (내 {bid.price:,}원, 지금 B {r.price_b:,}원)"
             if settings.dry_run:
@@ -239,7 +252,7 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
             except CancelUncertain as e:
                 r.status, r.detail = "확인필요", f"{why} - {e}, 마이페이지에서 확인"
                 return
-            remove_bid(bid.product_id)
+            remove_bid(bid.product_id, bid.size_value)
             r.status, r.detail = "입찰취소", f"{why} -> 입찰 #{bid.bid_id} 지움"
             return
         if settings.rules.over_limit(r.price_a):
@@ -306,7 +319,7 @@ def _wait_for_site(page: Page, probe: OpenBid | None, should_stop: Callable[[], 
         if probe is None or not probe.product_id:
             continue
         try:
-            b = read_current_b(page, probe.product_id)
+            b = read_current_b(page, probe.product_id, probe.size_value or ONE_SIZE)
         except Exception as e:  # noqa: BLE001
             log.info("아직 응답 없음 (%s)", str(e).splitlines()[0])
             continue
@@ -371,13 +384,17 @@ def run(context: BrowserContext, page: Page, settings: Settings,
 
         known = load_bids()
         for b in bids:
-            b.product_id = pid_cache.get(b.bid_id) or match_known_bid(b, known)
+            cached = pid_cache.get(b.bid_id)
+            if cached:
+                b.product_id, b.size = cached["product_id"], cached.get("size") or ""
+            if b.needs_detail:
+                apply_known(b, match_known_bid(b, known))
         # 목록에서 사라진 입찰(체결·만료·지움)은 캐시에서 뺀다
         live_ids = {b.bid_id for b in bids}
         for stale in [k for k in pid_cache if k not in live_ids]:
             del pid_cache[stale]
         log.info("===== 재입찰 %d회차: 구매 입찰 %d건 (상세를 열어야 하는 입찰 %d건) =====",
-                 cycle, len(bids), sum(1 for b in bids if not b.product_id))
+                 cycle, len(bids), sum(1 for b in bids if b.needs_detail))
 
         cycle_results: list[ProductResult] = []
         trouble_streak = 0     # 판단 불가·오류가 연달아 난 수
@@ -392,9 +409,11 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                 tab = context.new_page()
             # 스냅샷은 연달아 난 처음 몇 건만 남긴다 (사이트가 안 줄 때 수십 장 쌓이지 않게)
             r = rebid_one(tab, bid, settings, cycle, diagnose=trouble_streak < TROUBLE_STREAK)
-            if bid.product_id and pid_cache.get(bid.bid_id) != bid.product_id:
-                pid_cache[bid.bid_id] = bid.product_id
-                save_bid_products(pid_cache)
+            if bid.product_id and bid.size_value:
+                entry = {"product_id": bid.product_id, "size": bid.size_value, "option": bid.option or ONE_SIZE}
+                if pid_cache.get(bid.bid_id) != entry:
+                    pid_cache[bid.bid_id] = entry
+                    save_bid_products(pid_cache)
             cycle_results.append(r)
             results.append(r)
             if on_result:

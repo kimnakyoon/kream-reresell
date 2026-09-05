@@ -13,7 +13,7 @@ log = logging.getLogger(__name__)
 RANKING_URL = "https://kream.co.kr/?tab=home_ranking_v2"
 
 # 랭킹 탭의 상품군 칩 순서 그대로 (2026-09-04 실측). 값은 URL 의 category_filter.
-# 신발류(신발/러닝화/부츠)도 포함한다 - 다만 사이즈 옵션이 있는 상품은 상품 단계에서 건너뛴다.
+# 신발류(신발/러닝화/부츠)·의류도 포함한다 - 사이즈 옵션이 있는 상품은 옵션마다 따로 판정한다 (pipeline).
 CATEGORY_IDS: dict[str, int] = {
     "신발": 12,
     "바람막이": 49,

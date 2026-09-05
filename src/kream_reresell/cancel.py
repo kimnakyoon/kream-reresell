@@ -28,7 +28,7 @@ from .bid import StoppedBeforeSubmit
 from .config import Settings
 from .debug import dump
 from .report import ProductResult
-from .store import BidRecord, append_run_log, load_bids, remove_bid
+from .store import ONE_SIZE, BidRecord, append_run_log, load_bids, remove_bid
 
 log = logging.getLogger(__name__)
 
@@ -50,15 +50,39 @@ class OpenBid:
     bid_id: int
     url: str                   # /my/buying/{bid_id}
     name: str
-    option: str = ""
+    option: str = ""           # 목록의 옵션 표기 (ONE SIZE / W240 / M ...)
     price: int | None = None   # 구매 희망가
     deadline: str = ""         # 목록의 마감일 (26/09/05)
     product_id: int | None = None
     expires_at: str = ""
+    size: str = ""             # 구매 페이지 주소의 size 값 (ONE SIZE / 240 ...). 상세 API 의 product_option.key
 
     @property
     def product_url(self) -> str:
         return f"https://kream.co.kr/products/{self.product_id}"
+
+    @property
+    def is_one_size(self) -> bool:
+        return not self.option or self.option == ONE_SIZE
+
+    @property
+    def eval_option(self) -> str | None:
+        """pipeline.evaluate 에 넘길 옵션 (ONE SIZE 면 None)."""
+        return None if self.is_one_size else self.option
+
+    @property
+    def size_value(self) -> str:
+        """구매 페이지 주소에 쓸 size 값. ONE SIZE 상품은 늘 'ONE SIZE', 옵션 상품은 상세에서 읽기 전엔 빈 문자열."""
+        return self.size or (ONE_SIZE if self.is_one_size else "")
+
+    @property
+    def needs_detail(self) -> bool:
+        """상품 ID 나 (옵션 상품의) size 값을 몰라 상세를 열어야 하는지."""
+        return not self.product_id or not self.size_value
+
+    @property
+    def label(self) -> str:
+        return f"{self.name} [{self.option}]" if not self.is_one_size else self.name
 
 
 # ---------------------------------------------------------------- 목록
@@ -160,7 +184,24 @@ def read_bid_info(page: Page, bid: OpenBid) -> dict | None:
     if data.get("price"):
         bid.price = int(float(data["price"]))
     bid.expires_at = str(data.get("expires_at") or "")
+    # 옵션: product_option.key 가 구매 페이지 주소의 size 값, name_display 가 화면 표기 (2026-09-05 실측: ONE SIZE 는 둘 다 'ONE SIZE')
+    po = data.get("product_option") or {}
+    bid.size = str(po.get("key") or data.get("option") or "").strip()
+    shown = str(po.get("name_display") or po.get("name") or data.get("option") or "").strip()
+    if shown:
+        bid.option = shown
+    if not bid.size and bid.is_one_size:
+        bid.size = ONE_SIZE
     return data
+
+
+def apply_known(bid: OpenBid, rec: BidRecord | None) -> bool:
+    """bids.json 기록으로 상품 ID·size 를 채운다."""
+    if rec is None:
+        return False
+    bid.product_id = rec.product_id
+    bid.size = rec.size or (ONE_SIZE if bid.is_one_size else "")
+    return True
 
 
 def ensure_product_id(page: Page, bid: OpenBid) -> dict | None:
@@ -169,16 +210,19 @@ def ensure_product_id(page: Page, bid: OpenBid) -> dict | None:
     if data is None:
         page.wait_for_load_state("domcontentloaded")
         bid.product_id = _product_id_via_button(page, bid)
+        if bid.is_one_size:
+            bid.size = ONE_SIZE
     return data
 
 
-def match_known_bid(bid: OpenBid, known: dict[int, BidRecord]) -> int | None:
-    """이 프로그램이 넣은 입찰(bids.json)과 상품명·희망가가 같으면 그 상품 ID (상세를 열지 않아도 됨)."""
+def match_known_bid(bid: OpenBid, known: dict[str, BidRecord]) -> BidRecord | None:
+    """이 프로그램이 넣은 입찰(bids.json)과 상품명·옵션·희망가가 같으면 그 기록 (상세를 열지 않아도 상품 ID·size 를 안다)."""
     if not bid.price:
         return None
-    for pid, rec in known.items():
-        if rec.name == bid.name and rec.price == bid.price:
-            return pid
+    opt = bid.option or ONE_SIZE
+    for rec in known.values():
+        if rec.name == bid.name and rec.price == bid.price and (rec.option or ONE_SIZE) == opt:
+            return rec
     return None
 
 
@@ -192,10 +236,15 @@ def open_bid_detail(page: Page, bid: OpenBid) -> None:
             raise CancelAborted(f"입찰 상태가 '{data.get('status_display') or status}' - 살아 있는 입찰이 아님")
     else:
         bid.product_id = _product_id_via_button(page, bid)
+        if bid.is_one_size:
+            bid.size = ONE_SIZE
 
     if not page.get_by_role("link", name=re.compile("입찰 지우기")).count():
         raise CancelAborted("상세 화면에 '입찰 지우기' 가 없음 - 이미 지워졌거나 체결된 입찰")
-    log.info("입찰 #%d: 상품 %s, 희망가 %s원, 마감 %s", bid.bid_id, bid.product_id,
+    if not bid.size_value:
+        raise CancelAborted(f"옵션 '{bid.option}' 의 size 값을 상세에서 읽지 못함")
+    log.info("입찰 #%d: 상품 %s%s, 희망가 %s원, 마감 %s", bid.bid_id, bid.product_id,
+             f" [{bid.option} / size={bid.size}]" if not bid.is_one_size else "",
              f"{bid.price:,}" if bid.price else "?", bid.expires_at or bid.deadline)
 
 
@@ -273,18 +322,20 @@ def review_bid(context: BrowserContext, bid: OpenBid, settings: Settings) -> Pro
     """입찰 하나를 새 탭에서 다시 판정하고, 조건 미달이면 지운다."""
     page: Page = context.new_page()
     r = ProductResult(rank=bid.order, product_id=bid.product_id or 0, name=bid.name, url=bid.url,
-                      category="구매입찰", bid_price=bid.price)
+                      category="구매입찰", bid_price=bid.price, option="" if bid.is_one_size else bid.option)
     try:
-        if bid.product_id:
-            log.info("입찰 #%d: 상품 %d (bids.json 기록과 일치, 상세 생략), 희망가 %s원, 마감 %s",
-                     bid.bid_id, bid.product_id, f"{bid.price:,}" if bid.price else "?", bid.deadline)
+        if not bid.needs_detail:
+            log.info("입찰 #%d: 상품 %d%s (bids.json 기록과 일치, 상세 생략), 희망가 %s원, 마감 %s",
+                     bid.bid_id, bid.product_id, f" [{bid.option}]" if not bid.is_one_size else "",
+                     f"{bid.price:,}" if bid.price else "?", bid.deadline)
         else:
             open_bid_detail(page, bid)
-        r.product_id, r.url, r.bid_price = bid.product_id or 0, bid.product_url, bid.price
-        log.info("[입찰 %d번째] %s (%s)", bid.order, bid.name, bid.product_url)
+        r.product_id, r.url, r.bid_price, r.size = bid.product_id or 0, bid.product_url, bid.price, bid.size_value
+        log.info("[입찰 %d번째] %s (%s)", bid.order, bid.label, bid.product_url)
         # 거래량이 모자라도 A/B 까지 읽어 보고서에 남긴다 (지운 이유를 나중에 볼 수 있게)
         # 상품 금액 상한은 새로 입찰할 때만 쓰는 규칙이라 이미 넣은 입찰에는 적용하지 않는다
-        reason = pipeline.evaluate(page, bid.product_url, r, settings, stop_early=False, price_limit=False)
+        reason = pipeline.evaluate(page, bid.product_url, r, settings, stop_early=False, price_limit=False,
+                                   option=bid.eval_option)
         when = f"마감 {bid.deadline or bid.expires_at[:10]}"
         if reason is None:
             r.status, r.detail = "입찰유지", f"조건 충족 ({when})"
@@ -294,7 +345,7 @@ def review_bid(context: BrowserContext, bid: OpenBid, settings: Settings) -> Pro
             return r
         delete_bid(page, bid, settings)
         if bid.product_id:
-            remove_bid(bid.product_id)
+            remove_bid(bid.product_id, bid.size_value)
         r.status, r.detail = "입찰취소", f"{reason} -> 입찰 #{bid.bid_id} 지움"
         return r
     except product_mod.SkipProduct as e:
@@ -318,7 +369,7 @@ def review_bid(context: BrowserContext, bid: OpenBid, settings: Settings) -> Pro
         r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log.info("[입찰 %d번째] 결과: %s - %s", bid.order, r.status, r.detail)
         append_run_log({
-            "category": r.category, "rank": r.rank, "product_id": r.product_id, "name": r.name,
+            "category": r.category, "rank": r.rank, "product_id": r.product_id, "name": r.name, "option": r.option,
             "fast_sales": r.fast_sales if r.fast_sales is not None else "",
             "price_a": r.price_a or "", "price_b": r.price_b or "",
             "status": r.status, "detail": r.detail,
@@ -336,7 +387,7 @@ def run(context: BrowserContext, page: Page, settings: Settings,
     bids = list_open_bids(page)
     known = load_bids()
     for bid in bids:
-        bid.product_id = match_known_bid(bid, known)
+        apply_known(bid, match_known_bid(bid, known))
     results: list[ProductResult] = []
     deleted: dict[int, ProductResult] = {}
     for bid in bids:
@@ -366,21 +417,29 @@ def run(context: BrowserContext, page: Page, settings: Settings,
 
 @dataclass
 class OpenBids:
-    """마이페이지에 지금 살아 있는 구매 입찰. 입찰할 때 이미 입찰 중인 상품을 건너뛰는 유일한 기준."""
-    by_product: dict[int, OpenBid] = field(default_factory=dict)   # 상품 ID 를 알아낸 입찰
-    unread: list[OpenBid] = field(default_factory=list)            # 상품 ID 를 못 읽은 입찰 (상품명으로만 대조)
+    """마이페이지에 지금 살아 있는 구매 입찰. 입찰할 때 이미 입찰 중인 상품(옵션)을 건너뛰는 유일한 기준."""
+    by_product: dict[int, dict[str, OpenBid]] = field(default_factory=dict)   # 상품 ID 를 알아낸 입찰: 상품 ID -> 옵션 표기 -> 입찰
+    unread: list[OpenBid] = field(default_factory=list)                       # 상품 ID 를 못 읽은 입찰 (상품명으로만 대조)
 
     def __contains__(self, product_id: int) -> bool:
         return product_id in self.by_product
 
     def __len__(self) -> int:
-        return len(self.by_product) + len(self.unread)
+        return sum(len(v) for v in self.by_product.values()) + len(self.unread)
 
-    def by_name(self, name: str) -> OpenBid | None:
-        """상품 ID 를 못 읽은 입찰 중 상품명(마이페이지 표기 = 상품 페이지 제목)이 같은 것."""
+    def add(self, bid: OpenBid) -> None:
+        if bid.product_id:
+            self.by_product.setdefault(bid.product_id, {}).setdefault(bid.option or ONE_SIZE, bid)
+
+    def find(self, product_id: int, option: str = ONE_SIZE) -> OpenBid | None:
+        """이 상품의 이 옵션(ONE SIZE 상품은 ONE SIZE)에 살아 있는 입찰."""
+        return self.by_product.get(product_id, {}).get(option or ONE_SIZE)
+
+    def by_name(self, name: str, option: str = ONE_SIZE) -> OpenBid | None:
+        """상품 ID 를 못 읽은 입찰 중 상품명(마이페이지 표기 = 상품 페이지 제목)과 옵션이 같은 것."""
         name = name.strip()
         for b in self.unread:
-            if b.name.strip() == name:
+            if b.name.strip() == name and (b.option or ONE_SIZE) == (option or ONE_SIZE):
                 return b
         return None
 
@@ -393,15 +452,15 @@ def open_bid_products(context: BrowserContext, page: Page) -> OpenBids:
     끝내 못 읽은 입찰은 unread 에 남겨 상품명으로 대조한다.
     """
     bids = list_open_bids(page)
-    out: dict[int, OpenBid] = {}
+    out = OpenBids()
     if not bids:
-        return OpenBids()
+        return out
     known = load_bids()
     unknown: list[OpenBid] = []
     for bid in bids:
-        bid.product_id = match_known_bid(bid, known)
+        apply_known(bid, match_known_bid(bid, known))
         if bid.product_id:
-            out.setdefault(bid.product_id, bid)
+            out.add(bid)
         else:
             unknown.append(bid)
     if unknown:
@@ -413,16 +472,17 @@ def open_bid_products(context: BrowserContext, page: Page) -> OpenBids:
                     ensure_product_id(tab, bid)
                 except Exception as e:  # noqa: BLE001
                     log.warning("입찰 #%d 상세를 읽지 못함: %s", bid.bid_id, e)
-                if bid.product_id:
-                    out.setdefault(bid.product_id, bid)
+                out.add(bid)
         finally:
             try:
                 tab.close()
             except Exception:  # noqa: BLE001
                 pass
-    log.info("마이페이지에 입찰 중인 상품 %d개: %s", len(out), ", ".join(str(pid) for pid in out) or "-")
-    unread = [b for b in bids if not b.product_id]
-    if unread:
+    log.info("마이페이지에 입찰 중인 상품 %d개: %s", len(out.by_product),
+             ", ".join(f"{pid}({'/'.join(opts)})" if list(opts) != [ONE_SIZE] else str(pid)
+                       for pid, opts in out.by_product.items()) or "-")
+    out.unread = [b for b in bids if not b.product_id]
+    if out.unread:
         log.warning("상품 ID 를 못 읽은 입찰 %d건 (#%s) - 그 상품은 상품명으로만 대조해 건너뜀",
-                    len(unread), ", #".join(str(b.bid_id) for b in unread))
-    return OpenBids(by_product=out, unread=unread)
+                    len(out.unread), ", #".join(str(b.bid_id) for b in out.unread))
+    return out

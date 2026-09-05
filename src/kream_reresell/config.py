@@ -62,6 +62,7 @@ class Settings:
     stop_before_submit: bool = False  # 입찰 화면까지 채우되 마지막 "입찰하기"는 누르지 않는다
     force: bool = False            # 거래량/마진 조건을 무시하고 진행 (점검용)
     inspect: bool = False          # 화면마다 접근성 스냅샷을 dumps/ 에 남긴다
+    options: tuple[str, ...] = ()  # 옵션(사이즈) 상품에서 이 옵션들만 본다 (점검용, 화면 표기: W240 / M ...). 비우면 전부
 
     def validate(self) -> None:
         if self.stop_before_submit:

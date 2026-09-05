@@ -38,6 +38,8 @@ class ProductResult:
     name: str
     url: str
     category: str = ""          # 랭킹 상품군 (가방, 신발 ...)
+    option: str = ""            # 옵션(사이즈) 화면 표기 (W240, M ...). ONE SIZE 상품은 비움
+    size: str = ""              # 구매 페이지 주소의 size 값 (240). 입찰 기록(bids.json)에 남긴다
     status: str = ""            # 입찰완료 / 입찰대상(dry-run) / 건너뜀 / 중단 / 오류 / 확인필요
     detail: str = ""            # 사유
     fast_sales: int | None = None      # 기간 내 빠른배송 체결 수
@@ -63,7 +65,7 @@ class ProductResult:
 
 
 COLUMNS = [
-    ("상품군", 10), ("순위", 6), ("상품명", 46), ("상품ID", 10), ("판정", 12), ("사유 / 결과", 46),
+    ("상품군", 10), ("순위", 6), ("상품명", 46), ("옵션", 9), ("상품ID", 10), ("판정", 12), ("사유 / 결과", 46),
     ("30일 빠른배송", 13), ("30일 전체", 10), ("A 빠른배송가", 14), ("B 즉시판매가", 14),
     ("A−B", 11), ("마진율", 9), ("기준마진", 9), ("입찰가", 12), ("입찰기한", 9), ("처리시각", 20), ("링크", 40),
 ]
@@ -108,7 +110,7 @@ def write_report(results: list[ProductResult], settings_line: str, mode: str,
     ws["A1"] = f"KREAM 리리셀 {kind} 결과 - {mode}"
     ws["A1"].font = Font(bold=True, size=14)
     ws["A2"] = settings_line
-    ws["A3"] = f"실행 시각: {datetime.now():%Y-%m-%d %H:%M}  |  상품 {len(results)}개"
+    ws["A3"] = f"실행 시각: {datetime.now():%Y-%m-%d %H:%M}  |  {len(results)}줄 (옵션이 있는 상품은 옵션마다 한 줄)"
     ws["A4"] = LEGENDS.get(kind, BID_LEGEND)
     ws["A4"].font = Font(color="666666", size=9)
 
@@ -125,7 +127,7 @@ def write_report(results: list[ProductResult], settings_line: str, mode: str,
 
     for i, r in enumerate(results, start=header_row + 1):
         values = [
-            r.category, r.rank, r.name, r.product_id, r.status, r.detail,
+            r.category, r.rank, r.name, r.option or None, r.product_id, r.status, r.detail,
             r.fast_sales, r.total_sales, r.price_a, r.price_b,
             r.margin, r.margin_rate, r.margin_min, r.bid_price,
             f"{r.bid_days}일" if r.bid_days else None, r.time, r.url,

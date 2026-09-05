@@ -129,7 +129,8 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
 
     log.info("==== 결과 ====")
     for r in results:
-        log.info("[%s] %2d위 %-40s %s - %s", r.category, r.rank, r.name[:40], r.status, r.detail)
+        log.info("[%s] %2d위 %-40s %s%s - %s", r.category, r.rank, r.name[:40], f"[{r.option}] " if r.option else "",
+                 r.status, r.detail)
     path = report.write_report(results, settings_line, mode)
     log.info("엑셀 보고서: %s", path)
     return JobResult(results=results, report_path=path, mode=mode)

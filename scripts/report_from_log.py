@@ -46,7 +46,7 @@ def main() -> int:
                   "abort": "중단", "error": "오류", "uncertain": "확인필요"}.get(status, status)
         pid = _int(row["product_id"]) or 0
         r = report.ProductResult(
-            rank=_int(row["rank"]) or 0, product_id=pid, name=row["name"],
+            rank=_int(row["rank"]) or 0, product_id=pid, name=row["name"], option=row.get("option", "") or "",
             url=f"https://kream.co.kr/products/{pid}", category=row.get("category", ""),
             status=status, detail=detail,
             fast_sales=_int(row.get("fast_sales", "")), price_a=_int(row.get("price_a", "")),

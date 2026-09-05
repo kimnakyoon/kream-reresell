@@ -101,7 +101,7 @@ class App:
         sel.pack(fill="x", padx=6, pady=(0, 4))
         tk.Button(sel, text="전체 선택", command=lambda: self._set_all_categories(True)).pack(side="left")
         tk.Button(sel, text="전체 해제", command=lambda: self._set_all_categories(False)).pack(side="left", padx=(6, 0))
-        tk.Label(sel, text="※ 신발/러닝화/부츠도 고를 수 있지만, 사이즈 옵션이 있는 상품은 건너뜁니다",
+        tk.Label(sel, text="※ 신발·의류처럼 사이즈 옵션이 있는 상품은 옵션마다 따로 판정해 입찰합니다 (보고서에 옵션마다 한 줄)",
                  fg="#888").pack(side="left", padx=(12, 0))
 
         row1 = tk.Frame(frame)
