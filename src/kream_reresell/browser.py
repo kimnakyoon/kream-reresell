@@ -96,6 +96,7 @@ def block_heavy_resources(context: BrowserContext) -> None:
 # ---------------------------------------------------------------- 사이트 스로틀 대응 (pacing 참고)
 
 _trimming = False
+_trim_sales = False   # sales_trimmed() 안에서만 True - 상품 페이지가 여는 sales 요청도 빈 응답으로 채운다
 _CORS_HEADERS = {"access-control-allow-origin": "https://kream.co.kr", "access-control-allow-credentials": "true"}
 
 
@@ -110,12 +111,30 @@ def _api_route(route) -> None:
     """
     request = route.request
     path = urlparse(request.url).path
-    if _trimming and pacing.TRIMMABLE_PATH_RE.match(path):
+    if _trimming and (pacing.TRIMMABLE_PATH_RE.match(path) or (_trim_sales and pacing.THROTTLED_PATH_RE.match(path))):
         route.fulfill(status=200, content_type="application/json", body=pacing.TRIM_BODY, headers=_CORS_HEADERS)
         return
     if request.method == "GET" and pacing.THROTTLED_PATH_RE.match(path):
         pacing.BUDGET.note(path)
     route.continue_()
+
+
+@contextlib.contextmanager
+def sales_trimmed():
+    """이 안에서 여는 상품 페이지의 sales 요청(스로틀 대상)도 서버에 보내지 않고 빈 응답으로 채운다.
+
+    체결 내역을 보지 않고 구매하기 모달의 A 와 구매 페이지의 B 만 읽을 때 쓴다 ([재입찰]의 밀리지 않은 입찰 확인) -
+    상품 페이지를 열면 sales 가 2건 나가는데 (pacing 참고) 그걸 0건으로 만든다. 본문의 체결 거래 표는 빈 표로 그려지지만
+    구매하기 모달·구매 페이지는 sales 를 쓰지 않아 A·B 는 그대로 읽힌다 (2026-09-06 실측). 체결 내역이 필요하면
+    이 밖에서 상품 페이지를 다시 열어야 한다 (패널을 열 때 sales 를 다시 요청하지만 안전하게 새로 연다).
+    trim 이 꺼져 있으면(watch_api_requests(trim=False)) 아무것도 하지 않는다.
+    """
+    global _trim_sales
+    _trim_sales = True
+    try:
+        yield
+    finally:
+        _trim_sales = False
 
 
 def watch_api_requests(context: BrowserContext, trim: bool = True) -> None:

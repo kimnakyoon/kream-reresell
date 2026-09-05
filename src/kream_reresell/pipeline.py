@@ -54,6 +54,14 @@ def evaluate(page: Page, url: str, r: ProductResult, settings: Settings, stop_ea
     price_limit 가 True 면 A 가 상품 금액 상한을 넘는 상품은 B 를 읽지 않고 바로 돌아온다 (입찰 전용 규칙).
     option 을 주면 (옵션 상품) 그 옵션의 거래량·가격으로 판정한다. 조건을 다 봤으면 page 는 구매 페이지(/buy/{id}) 에 있다.
     """
+    sales_reason = check_sales(page, url, r, settings, option)
+    if sales_reason and stop_early:
+        return sales_reason
+    return judge_prices(page, r, settings, price_limit, option, sales_reason)
+
+
+def check_sales(page: Page, url: str, r: ProductResult, settings: Settings, option: str | None = None) -> str | None:
+    """상품 페이지를 열어 거래량을 읽어 r 에 채우고 거래량 기준을 판정한다. 미달이면 사유. 끝나면 page 는 상품 페이지에 있다."""
     r.name = product_mod.open_product(page, url) or r.name
     if settings.inspect:
         dump(page, f"{r.product_id}_0_product")
@@ -61,10 +69,7 @@ def evaluate(page: Page, url: str, r: ProductResult, settings: Settings, stop_ea
     pacing.before_sales_request()
     stats = product_mod.read_sales_stats(page, settings.lookback_days, settings.min_fast_sales, option)
     r.fast_sales, r.total_sales = stats.fast_in_window, stats.total_in_window
-    sales_reason = _sales_reason(stats, settings)
-    if sales_reason and stop_early:
-        return sales_reason
-    return _judge_prices(page, r, settings, price_limit, option, sales_reason)
+    return _sales_reason(stats, settings)
 
 
 def _sales_reason(stats: product_mod.SalesStats, settings: Settings) -> str | None:
@@ -73,9 +78,13 @@ def _sales_reason(stats: product_mod.SalesStats, settings: Settings) -> str | No
     return None
 
 
-def _judge_prices(page: Page, r: ProductResult, settings: Settings, price_limit: bool,
-                  option: str | None, sales_reason: str | None) -> str | None:
-    """상품 페이지에 있는 상태에서 A (모달) → 구매 페이지 → B 를 읽고 마진을 판정한다. 미달이면 사유."""
+def judge_prices(page: Page, r: ProductResult, settings: Settings, price_limit: bool = True,
+                 option: str | None = None, sales_reason: str | None = None) -> str | None:
+    """상품 페이지에 있는 상태에서 A (모달) → 구매 페이지 → B 를 읽고 마진을 판정한다. 미달이면 사유.
+
+    sales_reason 은 앞서 본 거래량 미달 사유 - 있으면 A·B 를 읽어 r 에 채운 뒤 그 사유를 돌려준다 (보고서에 A/B 를 남기려고).
+    [재입찰]은 밀리지 않은 입찰의 A 변동을 볼 때 거래량 없이 이것만 부른다 (browser.sales_trimmed 안에서).
+    """
     pid = r.product_id
     r.price_a = product_mod.read_price_a_and_go_to_buy(page, pid, option)
     r.size = product_mod.size_from_url(page.url) or (ONE_SIZE if not option else "")
@@ -243,7 +252,7 @@ def _judge_and_bid(page: Page, r: ProductResult, stats: product_mod.SalesStats, 
         if not product_mod.on_product_page(page, r.product_id):
             product_mod.open_product(page, item.url)
         pacing.before_sales_request()
-        reason = _judge_prices(page, r, settings, price_limit=True, option=option, sales_reason=sales_reason)
+        reason = judge_prices(page, r, settings, price_limit=True, option=option, sales_reason=sales_reason)
         if reason and not settings.force:
             r.status, r.detail = "건너뜀", reason
             return

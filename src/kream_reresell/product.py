@@ -646,6 +646,10 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None =
                                " return !!m && m.innerText.includes('빠른배송') && m.innerText.includes('일반배송'); }",
                                timeout=4000)
     except PlaywrightTimeout:
+        text = modal.inner_text()
+        if "일반배송" in text and "빠른배송" not in text:
+            # 일반배송만 있다 - 지금 빠른배송 판매자가 없는 것 (2026-09-06 실측, 마뗑킴 카드 월렛) → A 를 정할 수 없어 판단 불가
+            raise SkipProduct(f"'{want}' 에 지금 빠른배송 판매자가 없어 A(빠른배송 가격)를 읽을 수 없음") from None
         raise SkipProduct(f"'{want}' 을 골랐는데 배송 방법(빠른배송/일반배송)이 그려지지 않음") from None
     page.wait_for_timeout(300)
 
@@ -671,7 +675,10 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None =
     try:
         page.get_by_text("즉시 판매가", exact=True).first.wait_for(state="visible", timeout=10_000)
     except PlaywrightTimeout as e:
-        raise SkipProduct("구매 페이지가 뜨지 않음 ('즉시 판매가' 없음)") from e
+        if urlparse(page.url).path.startswith(f"/buy/{product_id}"):
+            # 구매 페이지에는 왔는데 즉시 판매가가 없다 (구매 입찰이 하나도 없음) - [재입찰]은 이 경우 입찰을 지운다
+            raise NoPriceB("구매 페이지가 떴는데 '즉시 판매가' 가 없음") from e
+        raise SkipProduct(f"구매 페이지가 뜨지 않음 ('즉시 판매가' 없음, 지금 주소 {page.url})") from e
     page.wait_for_timeout(300)
     if option:
         # 구매 페이지 상단의 옵션 표기가 고른 것과 같은지 (다른 사이즈에 입찰하지 않도록)

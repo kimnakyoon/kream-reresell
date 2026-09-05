@@ -4,10 +4,14 @@
   1. /my/buying?tab=bidding 목록을 읽는다 (cancel.list_open_bids). 상품 ID 는 bids.json 기록 → 이번 실행의 캐시 →
      상세 API 응답(api/m/bids/{입찰번호}) 순으로 알아낸다. 옵션(사이즈) 상품은 구매 페이지 주소의 size 값(product_option.key,
      화면 표기 W240 이 아니라 240) 도 같이 알아야 해서, 그 값을 모르면 상세를 연다. 판정은 그 옵션의 거래량·가격으로 한다.
-  2. 빠른 확인: /buy/{상품ID}?size=ONE+SIZE (옵션 상품은 size=옵션 값, 예 240) 를 바로 열면 구매 페이지가 뜨고 '즉시 판매가'(B = 지금 가장 높은 구매 입찰가) 가
-     보인다 (2초쯤). B 가 내 희망가 이하이면 아직 밀리지 않은 것 - 그대로 둔다 (순위유지). 상품 페이지는 열지 않는다.
-  3. B 가 내 희망가보다 높으면(누가 더 비싸게 입찰함) 상품 페이지를 다시 열어 처음 입찰할 때와 똑같이 판정한다
-     (pipeline.evaluate: 최근 30일 빠른배송 건수, 최신 A·B, A−B > A×구간별 마진율, 상품 금액 상한).
+  2. 상품 페이지 → 구매하기 모달에서 최신 A(빠른배송 가격) → 구매 페이지(/buy/{상품ID}?size=옵션 값)에서 최신 B(즉시 판매가 = 지금
+     가장 높은 구매 입찰가)를 읽어 마진(A−B > A×구간별 마진율)을 판정한다 (pipeline.judge_prices, 7초쯤). 밀리지 않은 입찰도 A 가 내려가
+     마진이 기준 아래로 떨어졌을 수 있어 매번 본다 (사용자 결정 2026-09-06: A 변동도 항상 확인). 이때 거래량은 보지 않으므로 상품 페이지가
+     여는 sales 요청을 빈 응답으로 채워(browser.sales_trimmed) 스로틀 대상 요청은 0건이다.
+     B 가 내 희망가 이하이면 밀리지 않은 것: 마진이 기준을 충족하면 그대로 둔다 (순위유지, 사유에 A·마진을 남김), 기준 미달이면 지운다 (아래와 같은 방식).
+     (구매 페이지만 먼저 열어 B 를 보던 빠른 확인은 2026-09-06 에 뺐다 - 어차피 같은 구매 페이지를 A 읽으러 다시 열게 되어 2초 낭비.)
+  3. B 가 내 희망가보다 높으면(누가 더 비싸게 입찰함) 밀린 것: 마진이 기준 미달이면 지우고, 충족하면 상품 페이지를 다시 열어 (이번엔 sales 를 받아)
+     최근 30일 빠른배송 건수까지 처음 입찰할 때와 똑같이 판정한다 (pipeline.check_sales). 거래량 미달이면 지운다.
   4. 조건이 맞으면 입찰 상세의 [입찰 변경하기] 버튼이 여는 것과 같은 주소
      /buy/{상품ID}?size={옵션 값}&bid={입찰번호}&from=changeBidding&type=bid&price={기존 희망가}
      로 가서 처음 입찰과 같은 화면을 채운다: 희망가 = 최신 B, 마감기한, 구매 입찰 계속 → 창고보관 → 포인트 최대 사용
@@ -27,7 +31,7 @@
 구매 페이지가 로그인 화면으로 넘어가면(로그인이 풀림) 다시 로그인하고 그 입찰을 한 번 더 본다. 목록 페이지가 로그인 화면으로
 넘어가도 (로그인 화면 주소에도 returnUrl 로 tab=bidding 이 들어가 0건으로 읽히던 문제, 2026-09-05) 다시 로그인하고 목록을 다시 읽는다.
 
-밀렸는데 기준(거래량 · 마진)에 못 미쳐 올릴 수 없는 입찰은 [입찰취소] 와 같은 방식으로 지운다
+밀렸는데 기준(거래량 · 마진)에 못 미쳐 올릴 수 없는 입찰과, 밀리지 않았어도 마진(최신 A·B)이 기준에 못 미치는 입찰은 [입찰취소] 와 같은 방식으로 지운다
 (상세의 '입찰 지우기' → 확인창 → DELETE 204 확인, cancel.delete_bid). 판단할 수 없는 경우(상품 페이지 오류 등)는 지우지 않는다.
 밀렸고 기준도 충족하는데 [입찰 변경하기] 화면이 예상과 달라(상품명·옵션 불일치, 창고보관 확인 안 됨 등) 못 올린 입찰은
 변경 화면을 다시 열어 한 번 더 시도하고(CHANGE_ATTEMPTS - 화면이 늦게 그려져 생기는 일시적 불일치가 대부분), 그래도 못 올리면
@@ -49,7 +53,7 @@ from urllib.parse import quote_plus, urlparse
 
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeout
 
-from . import auth, pipeline
+from . import auth, browser, pipeline
 from . import bid as bid_mod
 from . import product as product_mod
 from .cancel import (CancelAborted, CancelUncertain, OpenBid, apply_known, delete_bid, ensure_product_id,
@@ -118,8 +122,9 @@ CHANGE_PAGE_MATCH_TIMEOUT_MS = 12_000   # 상품명·옵션이 그려지길 기�
 def read_current_b(page: Page, product_id: int, size: str = ONE_SIZE) -> int | None:
     """구매 페이지를 바로 열어 '즉시 판매가' B 만 읽는다. 구매 페이지가 안 뜨고 다른 곳으로 가면(옵션 상품 등) None.
 
-    구매 페이지에 와 있는데 '즉시 판매가' 가 안 그려지면 NoPriceB - 상품 페이지를 거쳐도 같은 구매 페이지에서 똑같이 막히므로
-    (2026-09-05 실측: 그 경로가 도움이 된 적 없이 30~40초만 더 씀) 돌지 않고 바로 알린다. 부르는 쪽([재입찰])이 입찰을 지운다.
+    사이트가 응답을 안 줄 때 다시 주는지 보는 확인(_wait_for_site)에 쓴다. 입찰마다 하던 빠른 확인은 2026-09-06 에 뺐다 -
+    A 도 매번 읽게 되어 어차피 같은 구매 페이지를 다시 열기 때문 (지금은 product.read_price_a_and_go_to_buy 가 같은 구매 페이지에서 B 를 읽는다).
+    구매 페이지에 와 있는데 '즉시 판매가' 가 안 그려지면 NoPriceB.
     구매 페이지 이동이 15초 안에 안 끝나거나 끊기면(net::ERR_ABORTED) 1.5초 뒤 한 번 더 열고, 그래도 안 되면 SkipProduct(판단 불가).
     """
     url = buy_page_url(product_id, size)
@@ -188,6 +193,19 @@ def change_bid(page: Page, bid: OpenBid, new_price: int, settings: Settings) -> 
     bid_mod.fill_bid_form(page, new_price, settings.bid_days, settings, bid.product_id)
     bid_mod.choose_warehouse_and_points(page, settings, bid.product_id)
     bid_mod.submit_bid(page, new_price, settings, bid.product_id)
+
+
+def _won(price: int | None) -> str:
+    return f"{price:,}원" if price else "?"
+
+
+def _margin_note(r: ProductResult) -> str:
+    """순위유지 사유에 붙일 A·마진 요약 (예: 'A 35,000원, 마진 22.9% > 기준 10%')."""
+    rate = r.margin_rate
+    if rate is None:
+        return f"A {_won(r.price_a)}"
+    base = f"기준 {r.margin_min * 100:g}%" if r.margin_min is not None else "기준 없음"
+    return f"A {_won(r.price_a)}, 마진 {rate * 100:.1f}% > {base}"
 
 
 def _record(bid: OpenBid, r: ProductResult, new_price: int, settings: Settings, note: str = "") -> None:
@@ -304,25 +322,30 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
             raise bid_mod.BidAborted(f"옵션 '{bid.option}' 의 size 값을 알지 못함 (상세 API 에 product_option 없음?)")
         log.info("[%d회차 %d번째] %s - 내 희망가 %s원 (%s)", cycle, bid.order, bid.label, f"{bid.price:,}", bid.product_url)
 
-        pacing.before_sales_request()
-        current_b = read_current_b(page, bid.product_id, bid.size_value)
-        if current_b is not None:
-            r.price_b = current_b
-            if current_b <= bid.price:
-                r.status, r.detail = "순위유지", (f"즉시 판매가 {current_b:,}원 {'=' if current_b == bid.price else '<'} "
-                                              f"내 희망가 {bid.price:,}원 - 밀리지 않음")
-                return
-            log.info("밀림: 즉시 판매가 %s원 > 내 희망가 %s원 - 상품 페이지에서 다시 판정", f"{current_b:,}", f"{bid.price:,}")
+        # 상품 페이지 → 구매하기 모달에서 최신 A → 구매 페이지에서 최신 B 를 읽고 마진을 판정한다 (처음 입찰과 같은 기준, 상한 제외).
+        # 밀리지 않은 입찰도 A 가 내려가 마진이 기준 아래로 떨어졌을 수 있어 매번 본다 (사용자 결정 2026-09-06).
+        # 거래량은 밀린 입찰만 보므로 여기서는 상품 페이지의 sales 요청을 빈 응답으로 채워 스로틀 대상 요청을 내지 않는다
+        # (구매 페이지를 먼저 여는 빠른 확인은 뺐다 - 어차피 A 를 읽으러 같은 구매 페이지를 다시 열게 되어 2초쯤 낭비였다)
+        with browser.sales_trimmed():
+            r.name = product_mod.open_product(page, bid.product_url) or r.name
+            reason = pipeline.judge_prices(page, r, settings, price_limit=False, option=bid.eval_option)
+        pushed = r.price_b > bid.price
+        if pushed:
+            log.info("밀림: 즉시 판매가 %s원 > 내 희망가 %s원", f"{r.price_b:,}", f"{bid.price:,}")
+            if reason is None:
+                # 올리려면 거래량 기준도 봐야 한다 - 상품 페이지를 다시 열어 (이번엔 sales 를 받아) 체결 내역을 센다
+                reason = pipeline.check_sales(page, bid.product_url, r, settings, bid.eval_option)
         else:
-            log.info("구매 페이지가 바로 열리지 않아 상품 페이지부터 확인")
-
-        # 처음 입찰할 때와 같은 기준 (거래량 · 최신 A · 최신 B · 마진 · 상품 금액 상한). 거래량이 모자라도 A/B 는 읽어 보고서에 남긴다
-        # 거래량 · 마진 기준은 상한 없이 판정한다. 못 미치면 올릴 수 없으니 지운다 ([입찰취소] 와 같은 기준·방식)
-        reason = pipeline.evaluate(page, bid.product_url, r, settings, stop_early=False, price_limit=False,
-                                   option=bid.eval_option)
+            log.info("밀리지 않음: 즉시 판매가 %s원 <= 내 희망가 %s원", f"{r.price_b:,}", f"{bid.price:,}")
         if reason:
+            # 기준 미달이면 밀렸든 아니든 둘 수 없으니 지운다 ([입찰취소] 와 같은 기준·방식). 판단 불가(예외)는 지우지 않는다
+            head = "밀렸는데 기준 미달이라 올릴 수 없음" if pushed else "밀리진 않았지만 기준 미달이라 둘 수 없음"
             _delete_bid_and_report(page, bid, settings, r,
-                                   f"밀렸는데 기준 미달이라 올릴 수 없음: {reason} (내 {bid.price:,}원, 지금 B {r.price_b:,}원)")
+                                   f"{head}: {reason} (내 {bid.price:,}원, 지금 A {_won(r.price_a)}, B {_won(r.price_b)})")
+            return
+        if not pushed:
+            r.status, r.detail = "순위유지", (f"즉시 판매가 {r.price_b:,}원 {'=' if r.price_b == bid.price else '<'} "
+                                          f"내 희망가 {bid.price:,}원 - 밀리지 않음, {_margin_note(r)}")
             return
         if settings.rules.over_limit(r.price_a):
             # 상한은 새로 입찰할 때만 쓰는 규칙 - 기준은 충족하니 지우지 않고, 새 입찰 규칙상 올리지도 않는다
@@ -330,9 +353,6 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
                                            f"올리지 않음 (기준은 충족해 지우지도 않음, 내 {bid.price:,}원, 지금 B {r.price_b:,}원)")
             return
         new_price = r.price_b
-        if new_price <= bid.price:
-            r.status, r.detail = "순위유지", f"다시 읽은 즉시 판매가 {new_price:,}원이 내 희망가 {bid.price:,}원 이하 - 밀리지 않음"
-            return
         r.bid_price, r.bid_days = new_price, settings.bid_days
         if settings.dry_run:
             r.status, r.detail = "변경대상", f"dry-run: {bid.price:,}원 → {new_price:,}원 ({settings.bid_days}일) 으로 올릴 조건 충족"
