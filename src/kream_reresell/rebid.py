@@ -12,7 +12,7 @@
      /buy/{상품ID}?size={옵션 값}&bid={입찰번호}&from=changeBidding&type=bid&price={기존 희망가}
      로 가서 처음 입찰과 같은 화면을 채운다: 희망가 = 최신 B, 마감기한, 구매 입찰 계속 → 창고보관 → 포인트 최대 사용
      → 입찰하기 → 동의 3항목 → 입찰하기 (bid.fill_bid_form / choose_warehouse_and_points / submit_bid 그대로).
-  5. 목록 끝까지 가면 한 사이클. 중지할 때까지 사이클을 반복하되, 사이클 시작 간격(설정, 기본 5분)을 지키고
+  5. 목록 끝까지 가면 한 사이클. 정한 횟수(max_cycles, GUI '재입찰 횟수' 칸 / --cycles) 만큼 또는 중지할 때까지 사이클을 반복하되, 사이클 시작 간격(설정, 기본 5분)을 지키고
      입찰 사이에도 2~4초 무작위로 쉰다 (봇 탐지 대비).
 
 즉시 판매가가 없을 때: 구매 페이지에 와 있는데 '즉시 판매가' 가 안 그려지면 (사용자 결정, 2026-09-05) 그 입찰을 지운다
@@ -477,7 +477,11 @@ def run(context: BrowserContext, page: Page, settings: Settings,
         log.info("===== 재입찰 %d회차 끝 (%d초): %s =====", cycle, int(elapsed), summary)
         if on_cycle:
             on_cycle(cycle, cycle_results)
-        if stop() or (max_cycles is not None and cycle >= max_cycles):
+        if stop():
+            break
+        if max_cycles is not None and cycle >= max_cycles:
+            log.info("설정한 %d회를 모두 돌아 재입찰을 마침", max_cycles)
+            status(f"재입찰 {cycle}회차 끝({int(elapsed)}초): {summary} - 설정한 {max_cycles}회를 모두 돌아 마침")
             break
 
         wait = max(settings.rebid_interval_min * 60 - elapsed, MIN_CYCLE_GAP_SEC)

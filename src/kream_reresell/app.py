@@ -175,7 +175,8 @@ def describe_rebid_settings(settings: Settings) -> str:
             f"상품 페이지에서 처음 입찰 때와 같은 기준으로 다시 판정 (최근 {settings.lookback_days}일 빠른배송 "
             f"{settings.min_fast_sales}건 이상, {settings.rules.describe()}) 하고, 충족하면 [입찰 변경하기] 로 희망가를 "
             f"최신 B 로 올림 (마감 {settings.bid_days}일, 창고보관). 기준 미달이면 입찰을 지움 (상한만 넘는 것은 그대로 둠). "
-            f"사이클 간격 {settings.rebid_interval_min:g}분")
+            f"사이클 간격 {settings.rebid_interval_min:g}분, "
+            f"{'중지할 때까지 반복' if not settings.rebid_cycles else f'{settings.rebid_cycles}회 돌고 끝'}")
 
 
 def _write_rebid_report(results: list[ProductResult], settings_line: str, mode: str, path: Path) -> Path:
@@ -193,11 +194,17 @@ def run_rebid_job(settings: Settings,
                   on_result: Callable[[ProductResult], None] | None = None,
                   on_status: Callable[[str], None] | None = None,
                   max_cycles: int | None = None) -> JobResult:
-    """[재입찰]: 구매 입찰 목록을 반복해서 돌며 밀린 입찰의 희망가를 올린다. 중지할 때까지 (또는 max_cycles 만큼) 돈다.
+    """[재입찰]: 구매 입찰 목록을 반복해서 돌며 밀린 입찰의 희망가를 올린다.
 
+    max_cycles: 이만큼 돌고 끝. None 이면 settings.rebid_cycles (GUI '재입찰 횟수' 칸 / .env REBID_CYCLES) 를 쓰고,
+    그것도 0 이면 중지할 때까지 돈다.
     보고서는 사이클이 끝날 때마다 같은 파일에 덮어써서, 중간에 프로그램이 죽어도 그때까지의 결과가 남는다.
     """
     settings.validate()
+    if max_cycles is None:
+        max_cycles = settings.rebid_cycles or None
+    else:
+        settings.rebid_cycles = max_cycles
     mode = describe_mode(settings, "재입찰")
     settings_line = describe_rebid_settings(settings)
     log.info("%s | %s", mode, settings_line)

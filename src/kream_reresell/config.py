@@ -52,6 +52,8 @@ class Settings:
     max_products: int = field(default_factory=lambda: _int("MAX_PRODUCTS", 30))
     # [재입찰] 사이클 시작 간격(분). 구매 입찰 목록을 한 바퀴 돈 뒤 다음 바퀴를 이 간격으로 시작한다 (봇 탐지 대비, 1분 이상)
     rebid_interval_min: float = field(default_factory=lambda: _float("REBID_INTERVAL_MIN", 5))
+    # [재입찰] 몇 사이클 돌고 끝낼지 (GUI "재입찰 횟수" 칸의 기본값). 0 이면 [중지]/Ctrl+C 까지 계속
+    rebid_cycles: int = field(default_factory=lambda: _int("REBID_CYCLES", 1))
     # 이미지/동영상/폰트를 받지 않아 페이지를 빨리 띄운다. 화면 확인이 필요하면 .env 에 BLOCK_IMAGES=0
     block_images: bool = field(default_factory=lambda: _bool("BLOCK_IMAGES", True))
     # 사이트 스로틀(IP 단위) 대응 - pacing 참고. 10분 창 안에 상품 API(sales 등) 요청을 이만큼까지만 보내고 넘으면 쉰다.
@@ -79,4 +81,6 @@ class Settings:
             raise ValueError(f"MIN_MARGIN_RATE 는 0 이상 1 미만이어야 합니다: {self.min_margin_rate}")
         if self.rebid_interval_min < 1:
             raise ValueError(f"재입찰 사이클 간격은 1분 이상이어야 합니다 (사이트 차단 방지): {self.rebid_interval_min}")
+        if self.rebid_cycles < 0:
+            raise ValueError(f"재입찰 횟수는 0(계속) 또는 1 이상이어야 합니다: {self.rebid_cycles}")
         self.rules.validate()
