@@ -16,8 +16,10 @@
 
 사이트가 응답을 안 줄 때 (2026-09-05 실측): 상품 페이지 자체는 뜨는데 구매 페이지의 '즉시 판매가' 와 체결 내역 패널의 행처럼
 API 로 채우는 부분만 비는 시간대가 있었다 (한 번 시작하면 계속 두드리는 동안 20분 넘게 이어졌고, 7분쯤 쉬면 풀렸다).
-그래서 판단 불가(확인필요)·오류가 연달아 TROUBLE_STREAK 건 나오면 10분 쉬고 로그인 상태를 확인한 뒤 이어서 보고,
-같은 사이클에서 또 그러면 사이클을 끊고 다음 사이클 전에 10분 더 쉰다. 판단 불가로 끝난 입찰은 화면 스냅샷을 dumps/ 에 남긴다.
+구매 페이지에 와 있는데 '즉시 판매가' 가 안 그려지면 상품 페이지를 다시 돌지 않고 바로 판단 불가로 끝낸다 (그 경로가 도움이 된 적 없이
+30~40초만 더 썼다). 판단 불가(확인필요)·오류가 연달아 TROUBLE_STREAK 건 나오면 최대 10분 쉬되 2분마다 구매 페이지를 한 번 열어 보고
+풀렸으면 로그인 상태를 확인한 뒤 바로 이어서 본다. 같은 사이클에서 또 그러면 사이클을 끊고 다음 사이클 전에 10분 더 쉰다.
+판단 불가로 끝난 입찰은 화면 스냅샷을 dumps/ 에 남긴다.
 구매 페이지가 로그인 화면으로 넘어가면(로그인이 풀림) 다시 로그인하고 그 입찰을 한 번 더 본다.
 
 밀렸는데 기준(거래량 · 마진)에 못 미쳐 올릴 수 없는 입찰은 [입찰취소] 와 같은 방식으로 지운다
@@ -53,8 +55,9 @@ log = logging.getLogger(__name__)
 ITEM_PAUSE_SEC = (2.0, 4.0)      # 입찰 하나를 보고 다음으로 가기 전 무작위로 쉬는 시간
 MIN_CYCLE_GAP_SEC = 30           # 사이클이 간격보다 오래 걸렸어도 다음 사이클 전에 최소 이만큼은 쉰다
 TROUBLE_STREAK = 3               # 판단 불가(확인필요)·오류가 연달아 이만큼 나면 사이트가 응답을 안 주는 것으로 보고
-TROUBLE_PAUSE_SEC = 600          # 10분 쉬고 로그인 상태를 확인한 뒤 이어서 본다. 같은 사이클에서 또 그러면 사이클을 끊고
+TROUBLE_PAUSE_SEC = 600          # 최대 10분 쉬고 로그인 상태를 확인한 뒤 이어서 본다. 같은 사이클에서 또 그러면 사이클을 끊고
                                  # 다음 사이클 전에 10분 더 쉰다 (계속 두드리면 풀리지 않는다 - 2026-09-05 실측)
+TROUBLE_PROBE_SEC = 120          # 쉬는 동안 이만큼마다 한 번 구매 페이지를 열어 보고, '즉시 판매가' 가 그려지면 바로 이어서 본다
 MAX_LIST_FAILURES = 3            # 목록을 연달아 이만큼 못 읽으면 멈춘다
 
 
@@ -88,7 +91,12 @@ _BODY_CONTAINS_JS = "(needle) => document.body.innerText.replace(/\\s+/g, '').in
 # ---------------------------------------------------------------- 빠른 확인
 
 def read_current_b(page: Page, product_id: int) -> int | None:
-    """구매 페이지를 바로 열어 '즉시 판매가' B 만 읽는다. 구매 페이지가 안 뜨면(옵션 상품 등) None."""
+    """구매 페이지를 바로 열어 '즉시 판매가' B 만 읽는다. 구매 페이지가 안 뜨고 다른 곳으로 가면(옵션 상품 등) None.
+
+    구매 페이지에 와 있는데 '즉시 판매가' 가 안 그려지면 사이트가 응답을 안 준 것이다 - 입찰 중인 상품은 내 입찰이 있어 즉시 판매가가
+    항상 있고, 상품 페이지를 거쳐도 같은 구매 페이지에서 똑같이 막힌다 (2026-09-05 실측: 그 경로가 도움이 된 적 없이 30~40초만 더 씀).
+    그래서 SkipProduct 로 바로 판단 불가.
+    """
     page.goto(buy_page_url(product_id), wait_until="domcontentloaded")
     # 고정 대기 대신 '즉시 판매가 N원' 이 실제로 그려질 때까지만 기다린다 (상품 페이지로 돌려보내지면 안 그려져 타임아웃)
     try:
@@ -96,7 +104,9 @@ def read_current_b(page: Page, product_id: int) -> int | None:
     except PlaywrightTimeout:
         if _on_login_page(page):
             raise LoginLost(f"구매 페이지가 로그인 화면으로 넘어감: {page.url}") from None
-        log.info("구매 페이지에 '즉시 판매가' 가 안 그려짐 (지금 주소 %s)", page.url)
+        if urlparse(page.url).path.startswith(f"/buy/{product_id}"):
+            raise product_mod.SkipProduct("구매 페이지가 떴는데 '즉시 판매가' 가 그려지지 않음 (사이트가 응답을 안 줌?)") from None
+        log.info("구매 페이지가 다른 곳으로 넘어감 (지금 주소 %s)", page.url)
         return None
     # 로그인 화면의 returnUrl 에도 /buy/{id} 가 들어가므로 경로로 본다
     if not urlparse(page.url).path.startswith(f"/buy/{product_id}"):
@@ -211,7 +221,7 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
                 return
             log.info("밀림: 즉시 판매가 %s원 > 내 희망가 %s원 - 상품 페이지에서 다시 판정", f"{current_b:,}", f"{bid.price:,}")
         else:
-            log.info("구매 페이지를 바로 열지 못해 상품 페이지부터 확인")
+            log.info("구매 페이지가 바로 열리지 않아 상품 페이지부터 확인")
 
         # 처음 입찰할 때와 같은 기준 (거래량 · 최신 A · 최신 B · 마진 · 상품 금액 상한). 거래량이 모자라도 A/B 는 읽어 보고서에 남긴다
         # 거래량 · 마진 기준은 상한 없이 판정한다. 못 미치면 올릴 수 없으니 지운다 ([입찰취소] 와 같은 기준·방식)
@@ -278,6 +288,32 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
 
 
 # ---------------------------------------------------------------- 사이클 반복
+
+def _wait_for_site(page: Page, probe: OpenBid | None, should_stop: Callable[[], bool],
+                   on_status: Callable[[str], None]) -> bool:
+    """사이트가 응답을 안 줄 때 최대 TROUBLE_PAUSE_SEC 쉰다. TROUBLE_PROBE_SEC 마다 마지막에 막힌 입찰의 구매 페이지를
+    한 번 열어 보고 '즉시 판매가' 가 그려지면 바로 돌아온다 (True). 끝까지 안 풀리면 False."""
+    deadline = time.monotonic() + TROUBLE_PAUSE_SEC
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        step = min(TROUBLE_PROBE_SEC, remaining)
+        on_status(f"사이트 응답 없음 - {int(remaining) // 60}분 {int(remaining) % 60}초 더 쉼 ({int(step)}초 뒤 확인)")
+        _sleep(should_stop, step)
+        if should_stop():
+            return False
+        if probe is None or not probe.product_id:
+            continue
+        try:
+            b = read_current_b(page, probe.product_id)
+        except Exception as e:  # noqa: BLE001
+            log.info("아직 응답 없음 (%s)", str(e).splitlines()[0])
+            continue
+        if b is not None:
+            log.info("사이트가 다시 응답함 (즉시 판매가 %s원) - 이어서 봄", f"{b:,}")
+            return True
+
 
 def _sleep(should_stop: Callable[[], bool], seconds: float) -> None:
     """중지 요청을 1초마다 보며 쉰다."""
@@ -372,11 +408,9 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                     break
                 paused = True
                 trouble_streak = 0
-                log.warning("판단 불가·오류가 %d건 연달아 남 - 사이트가 응답을 안 주는 듯해 %d분 쉬고 로그인 상태를 확인한 뒤 이어서 봄",
-                            TROUBLE_STREAK, TROUBLE_PAUSE_SEC // 60)
-                status(f"재입찰 {cycle}회차: 판단 불가가 {TROUBLE_STREAK}건 연달아 나서 {TROUBLE_PAUSE_SEC // 60}분 쉬는 중 "
-                       f"({bid.order}/{len(bids)} 까지 봄)")
-                _sleep(stop, TROUBLE_PAUSE_SEC)
+                log.warning("판단 불가·오류가 %d건 연달아 남 - 사이트가 응답을 안 주는 듯해 최대 %d분 쉬며 %d분마다 확인, "
+                            "풀리면 로그인 상태를 확인한 뒤 이어서 봄", TROUBLE_STREAK, TROUBLE_PAUSE_SEC // 60, TROUBLE_PROBE_SEC // 60)
+                _wait_for_site(tab, bid, stop, lambda t: status(f"재입찰 {cycle}회차 ({bid.order}/{len(bids)} 까지 봄): {t}"))
                 if stop():
                     break
                 try:
