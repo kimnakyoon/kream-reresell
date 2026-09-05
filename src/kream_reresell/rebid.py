@@ -328,7 +328,11 @@ def run(context: BrowserContext, page: Page, settings: Settings,
         if error_streak >= ERROR_STREAK_BACKOFF:
             wait += ERROR_BACKOFF_SEC
         next_at = datetime.now() + timedelta(seconds=wait)
-        log.info("다음 사이클은 %s 에 시작 (%d초 뒤, 사이클 간격 %g분)", next_at.strftime("%H:%M:%S"), int(wait), settings.rebid_interval_min)
-        status(f"재입찰 {cycle}회차 끝: {summary} - 다음 사이클 {next_at:%H:%M}")
+        # 간격은 '사이클 시작 시각 사이의 간격' - 이번 사이클이 오래 걸렸으면 그만큼 덜 쉰다 (최소 MIN_CYCLE_GAP_SEC)
+        log.info("이번 사이클 %d초 걸림. 사이클 시작 간격 %g분(%d초)이라 %d초 쉬고 %s 에 다음 사이클 시작",
+                 int(elapsed), settings.rebid_interval_min, int(settings.rebid_interval_min * 60), int(wait),
+                 next_at.strftime("%H:%M:%S"))
+        status(f"재입찰 {cycle}회차 끝({int(elapsed)}초): {summary} - {int(wait)}초 쉬고 {next_at:%H:%M} 에 다음 사이클 "
+               f"(시작 간격 {settings.rebid_interval_min:g}분)")
         _sleep(stop, wait)
     return results
