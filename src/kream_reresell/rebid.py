@@ -29,8 +29,10 @@
 
 밀렸는데 기준(거래량 · 마진)에 못 미쳐 올릴 수 없는 입찰은 [입찰취소] 와 같은 방식으로 지운다
 (상세의 '입찰 지우기' → 확인창 → DELETE 204 확인, cancel.delete_bid). 판단할 수 없는 경우(상품 페이지 오류 등)는 지우지 않는다.
-밀렸고 기준도 충족하는데 [입찰 변경하기] 화면이 예상과 달라(상품명·옵션 불일치, 창고보관 확인 안 됨 등) 못 올린 입찰도
+밀렸고 기준도 충족하는데 [입찰 변경하기] 화면이 예상과 달라(상품명·옵션 불일치, 창고보관 확인 안 됨 등) 못 올린 입찰은
+변경 화면을 다시 열어 한 번 더 시도하고(CHANGE_ATTEMPTS - 화면이 늦게 그려져 생기는 일시적 불일치가 대부분), 그래도 못 올리면
 같은 방식으로 지운다 (사용자 결정 2026-09-06 - 밀린 채 두지 않음). 마지막 '입찰하기' 를 누른 뒤 결과가 불확실한 건은 지우지 않고 확인필요.
+사이클이 끝날 때마다 그 사이클에 나간 스로틀 대상 API 요청 수를 로그에 남긴다 (pacing.BUDGET).
 상품 금액 상한은 새로 입찰할 때만 쓰는 규칙이라 ([입찰취소] 와 같음) 기준은 충족하는데 A 가 상한을 넘기만 하는 입찰은
 올리지도 지우지도 않고 그대로 둔다 (변경안함).
 """
@@ -64,6 +66,8 @@ log = logging.getLogger(__name__)
 
 ITEM_PAUSE_SEC = (2.0, 4.0)      # 입찰 하나를 보고 다음으로 가기 전 무작위로 쉬는 시간
 MIN_CYCLE_GAP_SEC = 30           # 사이클이 간격보다 오래 걸렸어도 다음 사이클 전에 최소 이만큼은 쉰다
+CHANGE_ATTEMPTS = 2              # [입찰 변경하기] 화면이 예상과 다르면 다시 열어 이만큼까지 시도하고, 그래도 안 되면 지운다
+CHANGE_RETRY_PAUSE_SEC = (2.0, 4.0)
 # 판단 불가(확인필요)·오류·즉시 판매가 없음이 연달아 TROUBLE_STREAK 건 나면 사이트가 응답을 안 주는 것으로 보고 멈춘다.
 # PROBE_SEC 마다 마지막에 막힌 입찰의 구매 페이지를 한 번 열어 보고 '즉시 판매가' 가 그려지면 이어서 본다 (sitewait 공용).
 MAX_LIST_FAILURES = 3            # 목록을 연달아 이만큼 못 읽으면 멈춘다
@@ -99,6 +103,14 @@ def _squash(text: str) -> str:
 
 # 본문(공백 제거)에 주어진 글자가 있는지 - 상품명 대조용
 _BODY_CONTAINS_JS = "(needle) => document.body.innerText.replace(/\\s+/g, '').includes(needle)"
+# 상품명(공백 제거해 포함)과 옵션(한 줄이 정확히 그 표기)이 둘 다 그려졌는지 - 변경 화면 대조용. 빈 값은 보지 않는다
+_NAME_AND_OPTION_JS = """({name, option}) => {
+  const text = document.body.innerText;
+  const nameOk = !name || text.replace(/\\s+/g, '').includes(name);
+  const optionOk = !option || text.split('\\n').some(line => line.trim() === option);
+  return nameOk && optionOk;
+}"""
+CHANGE_PAGE_MATCH_TIMEOUT_MS = 12_000   # 상품명·옵션이 그려지길 기다리는 최대 시간 (느린 시간대 대비)
 
 
 # ---------------------------------------------------------------- 빠른 확인
@@ -158,16 +170,20 @@ def change_bid(page: Page, bid: OpenBid, new_price: int, settings: Settings) -> 
     if "구매 입찰하기" not in body:
         dump(page, f"rebid{bid.bid_id}_not_bid_page")
         raise bid_mod.BidAborted("'구매 입찰하기' 화면이 아님")
-    if not bid.is_one_size and not re.search(rf"(^|\n)\s*{re.escape(bid.option)}\s*(\n|$)", body):
-        dump(page, f"rebid{bid.bid_id}_option_mismatch")
-        raise bid_mod.BidAborted(f"변경 화면의 옵션 표기가 '{bid.option}' 이 아님")
-    # 상품명은 '즉시 판매가' 글자보다 조금 늦게 그려진다 (2026-09-04 실측) - 나타날 때까지 기다렸다가 대조한다
-    if bid.name:
+    # 상품명·옵션은 '즉시 판매가' 글자보다 늦게 그려진다 (2026-09-04 실측). 2026-09-05~06 에 상품명(5초 안에 안 그려짐)과
+    # 옵션(즉시 판매가 직후 한 번 읽은 본문에 아직 없음)을 '다름' 으로 오판해 멀쩡한 입찰 3건이 변경못함이 됐다 (스냅샷에는
+    # 둘 다 정확히 있었음) - 둘 다 나타날 때까지 넉넉히 기다린 뒤 대조한다
+    expected = {"name": _squash(bid.name) if bid.name else "", "option": "" if bid.is_one_size else bid.option}
+    if expected["name"] or expected["option"]:
         try:
-            page.wait_for_function(_BODY_CONTAINS_JS, arg=_squash(bid.name), timeout=5000)
+            page.wait_for_function(_NAME_AND_OPTION_JS, arg=expected, timeout=CHANGE_PAGE_MATCH_TIMEOUT_MS)
         except PlaywrightTimeout as e:
-            dump(page, f"rebid{bid.bid_id}_name_mismatch")
-            raise bid_mod.BidAborted(f"변경 화면의 상품명이 '{bid.name}' 과 다름") from e
+            name_ok = not expected["name"] or page.evaluate(_BODY_CONTAINS_JS, expected["name"])
+            if not name_ok:
+                dump(page, f"rebid{bid.bid_id}_name_mismatch")
+                raise bid_mod.BidAborted(f"변경 화면의 상품명이 '{bid.name}' 과 다름") from e
+            dump(page, f"rebid{bid.bid_id}_option_mismatch")
+            raise bid_mod.BidAborted(f"변경 화면의 옵션 표기가 '{bid.option}' 이 아님") from e
     page.wait_for_timeout(300)
     bid_mod.fill_bid_form(page, new_price, settings.bid_days, settings, bid.product_id)
     bid_mod.choose_warehouse_and_points(page, settings, bid.product_id)
@@ -322,19 +338,28 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
             r.status, r.detail = "변경대상", f"dry-run: {bid.price:,}원 → {new_price:,}원 ({settings.bid_days}일) 으로 올릴 조건 충족"
             return
 
-        try:
-            change_bid(page, bid, new_price, settings)
-        except bid_mod.BidUncertain as e:
-            _record(bid, r, new_price, settings, note=" (확인 필요)")
-            r.status, r.detail = "확인필요", f"{e} - 마이페이지에서 희망가 확인 (다음 사이클에 목록으로 다시 확인)"
-            return
-        except bid_mod.BidAborted as e:
-            # 밀렸고 기준도 충족하는데 변경 화면이 예상과 달라 못 올림 - 밀린 채 둘 수 없으니 지운다 (사용자 결정 2026-09-06).
-            # 마지막 '입찰하기' 는 누르지 않은 상태라 (눌렀으면 BidUncertain) 희망가는 그대로이고 지워도 안전하다
-            log.warning("[%d번째] 입찰 변경 못 함: %s - 입찰을 지움", bid.order, e)
-            _delete_bid_and_report(page, bid, settings, r,
-                                   f"밀렸는데 입찰 변경 못 함: {e} (내 {bid.price:,}원, 지금 B {new_price:,}원)")
-            return
+        for attempt in range(CHANGE_ATTEMPTS):
+            try:
+                change_bid(page, bid, new_price, settings)
+                break
+            except bid_mod.BidUncertain as e:
+                _record(bid, r, new_price, settings, note=" (확인 필요)")
+                r.status, r.detail = "확인필요", f"{e} - 마이페이지에서 희망가 확인 (다음 사이클에 목록으로 다시 확인)"
+                return
+            except bid_mod.BidAborted as e:
+                # 마지막 '입찰하기' 는 누르지 않은 상태 (눌렀으면 BidUncertain) - 희망가는 그대로다.
+                # 화면이 늦게 그려져 생기는 일시적 불일치가 대부분이라 변경 화면을 한 번 다시 열어 본다
+                if attempt + 1 < CHANGE_ATTEMPTS:
+                    log.warning("[%d번째] 입찰 변경 못 함: %s - %d초 뒤 변경 화면을 다시 열어 한 번 더 시도",
+                                bid.order, e, int(CHANGE_RETRY_PAUSE_SEC[1]))
+                    pacing.pause(CHANGE_RETRY_PAUSE_SEC)
+                    continue
+                # 다시 열어도 못 올림 - 밀렸고 기준도 충족하는 입찰을 밀린 채 둘 수 없으니 지운다 (사용자 결정 2026-09-06)
+                log.warning("[%d번째] 입찰 변경 못 함 (%d번 시도): %s - 입찰을 지움", bid.order, CHANGE_ATTEMPTS, e)
+                _delete_bid_and_report(page, bid, settings, r,
+                                       f"밀렸는데 {CHANGE_ATTEMPTS}번 시도해도 입찰 변경 못 함: {e} "
+                                       f"(내 {bid.price:,}원, 지금 B {new_price:,}원)")
+                return
         _record(bid, r, new_price, settings)
         bid.price = new_price
         r.status, r.detail = "변경완료", f"{old_price:,}원 → {new_price:,}원 / {settings.bid_days}일 / 창고보관"
@@ -417,6 +442,7 @@ def run(context: BrowserContext, page: Page, settings: Settings,
     while not stop():
         cycle += 1
         started = time.monotonic()
+        api_calls_before = pacing.BUDGET.total
         status(f"재입찰 {cycle}회차: 구매 입찰 목록 읽는 중...")
         try:
             bids = _list_bids(page, settings)
@@ -484,7 +510,9 @@ def run(context: BrowserContext, page: Page, settings: Settings,
             counts[r.status] = counts.get(r.status, 0) + 1
         summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "처리한 입찰 없음"
         elapsed = time.monotonic() - started
-        log.info("===== 재입찰 %d회차 끝 (%d초): %s =====", cycle, int(elapsed), summary)
+        api_calls = pacing.BUDGET.total - api_calls_before
+        log.info("===== 재입찰 %d회차 끝 (%d초): %s | 스로틀 대상 API 요청 %d건 (지금 10분 창 %d/%d건) =====",
+                 cycle, int(elapsed), summary, api_calls, pacing.BUDGET.used(), pacing.BUDGET.limit)
         if on_cycle:
             on_cycle(cycle, cycle_results)
         if stop():
