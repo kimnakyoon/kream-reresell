@@ -435,7 +435,7 @@ class App:
                         "상품 페이지에서 처음 입찰 때와 같은 기준으로 다시 판정하고\n"
                         f"(최근 {self.base.lookback_days}일 빠른배송 {self.base.min_fast_sales}건 이상, {rules.describe()}),\n"
                         f"충족하면 [입찰 변경하기] 로 희망가를 최신 즉시 판매가로 올립니다 (마감 {self.base.bid_days}일, 창고보관).\n"
-                        "기준에 못 미쳐 올릴 수 없는 입찰은 실제로 지웁니다 (되돌릴 수 없음).\n\n"
+                        "기준에 못 미쳐 올릴 수 없는 입찰과, 밀렸는데 변경 화면이 예상과 달라 못 올린 입찰은 실제로 지웁니다 (되돌릴 수 없음).\n\n"
                         f"{repeat}합니다 (횟수는 설정의 '재입찰 횟수' 칸, 도는 중에도 [중지] 로 멈출 수 있음).\n\n진행할까요?"):
             return
         settings = self._make_settings(dry, rules)

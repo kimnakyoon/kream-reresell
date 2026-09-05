@@ -29,6 +29,8 @@
 
 밀렸는데 기준(거래량 · 마진)에 못 미쳐 올릴 수 없는 입찰은 [입찰취소] 와 같은 방식으로 지운다
 (상세의 '입찰 지우기' → 확인창 → DELETE 204 확인, cancel.delete_bid). 판단할 수 없는 경우(상품 페이지 오류 등)는 지우지 않는다.
+밀렸고 기준도 충족하는데 [입찰 변경하기] 화면이 예상과 달라(상품명·옵션 불일치, 창고보관 확인 안 됨 등) 못 올린 입찰도
+같은 방식으로 지운다 (사용자 결정 2026-09-06 - 밀린 채 두지 않음). 마지막 '입찰하기' 를 누른 뒤 결과가 불확실한 건은 지우지 않고 확인필요.
 상품 금액 상한은 새로 입찰할 때만 쓰는 규칙이라 ([입찰취소] 와 같음) 기준은 충족하는데 A 가 상한을 넘기만 하는 입찰은
 올리지도 지우지도 않고 그대로 둔다 (변경안함).
 """
@@ -326,6 +328,13 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
             _record(bid, r, new_price, settings, note=" (확인 필요)")
             r.status, r.detail = "확인필요", f"{e} - 마이페이지에서 희망가 확인 (다음 사이클에 목록으로 다시 확인)"
             return
+        except bid_mod.BidAborted as e:
+            # 밀렸고 기준도 충족하는데 변경 화면이 예상과 달라 못 올림 - 밀린 채 둘 수 없으니 지운다 (사용자 결정 2026-09-06).
+            # 마지막 '입찰하기' 는 누르지 않은 상태라 (눌렀으면 BidUncertain) 희망가는 그대로이고 지워도 안전하다
+            log.warning("[%d번째] 입찰 변경 못 함: %s - 입찰을 지움", bid.order, e)
+            _delete_bid_and_report(page, bid, settings, r,
+                                   f"밀렸는데 입찰 변경 못 함: {e} (내 {bid.price:,}원, 지금 B {new_price:,}원)")
+            return
         _record(bid, r, new_price, settings)
         bid.price = new_price
         r.status, r.detail = "변경완료", f"{old_price:,}원 → {new_price:,}원 / {settings.bid_days}일 / 창고보관"
@@ -347,6 +356,7 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
     except bid_mod.StoppedBeforeSubmit as e:
         r.status, r.detail = "중단", str(e)
     except bid_mod.BidAborted as e:
+        # 변경 화면까지 가기 전(희망가·옵션 size 값을 못 읽음) - 밀렸는지도 모르는 상태라 지우지 않고 남긴다
         log.warning("[%d번째] 입찰 변경 못 함: %s", bid.order, e)
         r.status, r.detail = "변경못함", f"입찰 변경 못 함: {e}"
     except CancelAborted as e:
