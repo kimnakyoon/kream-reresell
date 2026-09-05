@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeout
 
 from .dates import parse_trade_date
 
@@ -30,7 +30,15 @@ class SalesStats:
 
 
 def open_product(page: Page, url: str) -> str:
-    page.goto(url, wait_until="domcontentloaded")
+    try:
+        page.goto(url, wait_until="domcontentloaded")
+    except PlaywrightTimeout:
+        raise
+    except PlaywrightError as e:
+        # 이동 중 끊김 (net::ERR_ABORTED, 2026-09-05 재입찰 중 실측) - 잠깐 뒤 한 번 더
+        log.info("상품 페이지 이동이 끊김 (%s) - 1.5초 뒤 다시 엶", str(e).splitlines()[0])
+        page.wait_for_timeout(1500)
+        page.goto(url, wait_until="domcontentloaded")
     try:
         page.get_by_role("button", name="구매하기", exact=True).first.wait_for(state="visible", timeout=15_000)
     except PlaywrightTimeout as e:
@@ -55,9 +63,11 @@ def read_sales_stats(page: Page, lookback_days: int, need: int) -> SalesStats:
     # 매번 타임아웃만 채우므로 바로 누른다. 하이드레이션 전이라 클릭이 안 먹으면 아래 재시도가 받아 준다.
     more = page.get_by_role("button", name="거래 내역 더보기").first
     for attempt in range(3):
+        if "/products/" not in page.url:
+            raise SkipProduct(f"'거래 내역 더보기' 를 누르자 다른 페이지로 넘어감: {page.url}")
         try:
-            more.scroll_into_view_if_needed()
-            more.click()
+            more.scroll_into_view_if_needed(timeout=3000)
+            more.click(timeout=3000)
             # 패널 루트 클래스는 숨겨진 모바일 복제본에도 붙어 있어 locator 의 visible 판정을 쓸 수 없다
             page.wait_for_function(_SALES_PANEL_VISIBLE_JS, timeout=4000)
             break
@@ -66,11 +76,14 @@ def read_sales_stats(page: Page, lookback_days: int, need: int) -> SalesStats:
             page.wait_for_timeout(700)
     else:
         raise SkipProduct("'거래 내역 더보기' 패널이 열리지 않음")
-    # 패널이 뜬 뒤 행이 그려질 때까지만 기다린다 (실측 0.3초쯤). 행이 없는 패널이면 3초 뒤 그대로 진행해 0건으로 센다.
+    # 패널이 뜬 뒤 행이 그려질 때까지만 기다린다 (실측 0.3초쯤). 본문에 '체결 거래' 표가 있는 상품이니 행이 있어야 한다 -
+    # 3초가 지나도 비어 있으면 사이트가 내역을 안 준 것 (2026-09-05 실측: 0행이 나온 시간대에 구매 페이지도 안 그려짐).
+    # 0건으로 세면 [재입찰]이 기준 미달로 입찰을 지워 버리므로 판단 불가로 넘긴다.
     try:
         page.wait_for_function(f"() => ({_SALES_ROWS_JS})().length > 0", timeout=3000)
     except PlaywrightTimeout:
-        pass
+        _close_sales_panel(page)
+        raise SkipProduct("체결 내역 패널에 행이 없음 (내역을 불러오지 못함?)") from None
 
     cutoff = datetime.now() - timedelta(days=lookback_days)
     fast = total = 0
