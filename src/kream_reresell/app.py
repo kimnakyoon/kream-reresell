@@ -174,7 +174,8 @@ def describe_rebid_settings(settings: Settings) -> str:
     return (f"재입찰 기준: 마이페이지 > 구매 내역 > 구매 입찰 순서대로, 즉시 판매가(B) 가 내 희망가보다 높은(밀린) 입찰만 "
             f"상품 페이지에서 처음 입찰 때와 같은 기준으로 다시 판정 (최근 {settings.lookback_days}일 빠른배송 "
             f"{settings.min_fast_sales}건 이상, {settings.rules.describe()}) 하고, 충족하면 [입찰 변경하기] 로 희망가를 "
-            f"최신 B 로 올림 (마감 {settings.bid_days}일, 창고보관). 기준 미달이면 입찰을 지움 (상한만 넘는 것은 그대로 둠). "
+            f"최신 B 로 올림 (마감 {settings.bid_days}일, 창고보관). 기준 미달이거나 빠른배송(판매자)이 없으면 입찰을 지움 "
+            f"(상한만 넘는 것은 그대로 둠). "
             f"사이클 간격 {settings.rebid_interval_min:g}분, "
             f"{'중지할 때까지 반복' if not settings.rebid_cycles else f'{settings.rebid_cycles}회 돌고 끝'}")
 

@@ -41,6 +41,13 @@ class NoPriceB(SkipProduct):
     """구매 페이지는 떴는데 '즉시 판매가'(B) 가 없다. [재입찰]은 이 경우 입찰을 지운다."""
 
 
+class NoFastDelivery(SkipProduct):
+    """구매하기 모달은 떴는데 빠른배송이 없거나(일반배송만 그려짐) 빠른배송 가격이 없다 = 지금 빠른배송 판매자가 없어 A 를 정할 수 없다.
+
+    [재입찰]은 이 경우 입찰을 지운다 (사용자 결정 2026-09-06). [입찰]·[입찰취소]는 SkipProduct 와 같이 건너뜀·확인필요.
+    """
+
+
 class SalesNotLoaded(SkipProduct):
     """체결 내역 패널이 열렸는데 사이트가 내역을 내려주지 않았다 (오류 표시 또는 끝까지 빈 채).
 
@@ -649,13 +656,14 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None =
         text = modal.inner_text()
         if "일반배송" in text and "빠른배송" not in text:
             # 일반배송만 있다 - 지금 빠른배송 판매자가 없는 것 (2026-09-06 실측, 마뗑킴 카드 월렛) → A 를 정할 수 없어 판단 불가
-            raise SkipProduct(f"'{want}' 에 지금 빠른배송 판매자가 없어 A(빠른배송 가격)를 읽을 수 없음") from None
+            raise NoFastDelivery(f"'{want}' 에 빠른배송이 없음 (일반배송만 그려짐 - 지금 빠른배송 판매자 없음)") from None
         raise SkipProduct(f"'{want}' 을 골랐는데 배송 방법(빠른배송/일반배송)이 그려지지 않음") from None
     page.wait_for_timeout(300)
 
     price_a = _parse_fast_price(modal.inner_text())
     if price_a is None:
-        raise SkipProduct("빠른배송 가격을 읽지 못함 (빠른배송 판매자 없음?)")
+        # 빠른배송 줄은 있는데 가격이 없다 - 지금 빠른배송 판매자가 없는 것
+        raise NoFastDelivery(f"'{want}' 에 빠른배송 가격이 없음 (지금 빠른배송 판매자 없음)")
     log.info("A(빠른배송 가격)%s = %s원", f" [{option}]" if option else "", f"{price_a:,}")
 
     modal.get_by_text("일반배송", exact=False).first.click()

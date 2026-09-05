@@ -24,6 +24,9 @@
 사이트가 응답을 안 주는 시간대라 즉시 판매가도 안 보이는 것이니 지우지 않고 판단 불가 (사용자 결정 2026-09-05, 멀쩡한 입찰이
 지워지던 문제); (2) 상세 API 로 살아 있는 입찰인지 - 이미 체결·삭제된 입찰이면 건너뜀. 지우지 못하면 확인필요.
 지운 상품은 bids.json 에서도 빼서 [입찰]이 조건이 맞으면 다시 넣을 수 있게 한다.
+빠른배송이 없을 때: 구매하기 모달에서 옵션을 골랐는데 일반배송만 그려지거나 빠른배송 가격이 없으면 (= 지금 빠른배송 판매자가 없음,
+product.NoFastDelivery) 그 입찰도 지운다 (사용자 결정 2026-09-06 - 빠른배송으로 팔 수 없는 상품의 입찰은 둘 이유가 없음). 모달이
+그려진 뒤 본 것이라 사이트 문제와는 다르므로 체결 내역·입찰 상태 확인 없이 바로 지우고 (delete_bid 의 희망가 대조만), '연달아 난 수' 에도 넣지 않는다.
 사이트가 응답을 안 주는 시간대(2026-09-05 실측: API 로 채우는 부분만 비는 상태가 계속 두드리는 동안 20분 넘게 이어졌고, 7분쯤 쉬면
 풀렸다)에도 같은 일이 생기므로, 이렇게 지운 건도 판단 불가·오류와 함께 '연달아 난 수' 에 넣는다: 연달아 TROUBLE_STREAK 건 나오면
 멈춘 채 5분마다 구매 페이지를 한 번 열어 보고, '즉시 판매가' 가 다시 그려지면 로그인 상태를 확인한 뒤 이어서 본다 (사용자 결정
@@ -77,6 +80,7 @@ CHANGE_RETRY_PAUSE_SEC = (2.0, 4.0)
 MAX_LIST_FAILURES = 3            # 목록을 연달아 이만큼 못 읽으면 멈춘다
 ERROR_BACKOFF_SEC = 120          # 목록을 못 읽었을 때 다시 시도하기 전에 쉬는 시간
 NO_B_PREFIX = "즉시 판매가 없음"   # 즉시 판매가가 없어 지운(또는 지우려 한) 결과의 사유 머리 - 연달아 난 수를 셀 때 쓴다
+NO_FAST_PREFIX = "빠른배송 없음"    # 빠른배송(판매자)이 없어 지운 결과의 사유 머리 - 모달을 보고 판정한 것이라 연달아 난 수에는 넣지 않는다
 
 
 class LoginLost(Exception):
@@ -306,6 +310,18 @@ def _cancel_no_b(page: Page, bid: OpenBid, settings: Settings, r: ProductResult,
     _delete_bid_and_report(page, bid, settings, r, head)
 
 
+def _cancel_no_fast(page: Page, bid: OpenBid, settings: Settings, r: ProductResult, why: str, diagnose: bool) -> None:
+    """빠른배송이 없거나 빠른배송 판매자가 없는 상품의 입찰을 지운다 (사용자 결정 2026-09-06: 빠른배송으로 팔 수 없으면 둘 이유가 없음).
+
+    구매하기 모달이 그려진 뒤 배송 방법을 보고 판정한 것이라 (사이트가 응답을 안 줘서 비는 경우와 다름) 체결 내역 확인 없이 바로 지운다.
+    입찰 상태 확인도 하지 않는다 - 입찰이 체결·만료됐다고 모달의 배송 방법이 달라지지 않고, delete_bid 가 상세의 희망가를 대조한다.
+    """
+    log.info("%s (지금 주소 %s) - 입찰 #%d 을 지움", why, page.url, bid.bid_id)
+    if diagnose:
+        dump(page, f"rebid{bid.bid_id}_no_fast")
+    _delete_bid_and_report(page, bid, settings, r, f"{NO_FAST_PREFIX} ({why}, 내 희망가 {bid.price:,}원)")
+
+
 def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: ProductResult, diagnose: bool) -> None:
     old_price = bid.price
     try:
@@ -388,6 +404,10 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
         if _on_login_page(page):
             raise LoginLost(f"구매 페이지 확인 중 로그인 화면으로 넘어감: {page.url}") from e
         _cancel_no_b(page, bid, settings, r, str(e), diagnose)
+    except product_mod.NoFastDelivery as e:
+        if _on_login_page(page):
+            raise LoginLost(f"상품 페이지 확인 중 로그인 화면으로 넘어감: {page.url}") from e
+        _cancel_no_fast(page, bid, settings, r, str(e), diagnose)
     except product_mod.SkipProduct as e:
         if _on_login_page(page):
             raise LoginLost(f"상품 페이지 확인 중 로그인 화면으로 넘어감: {page.url}") from e
