@@ -1,4 +1,4 @@
-"""KREAM 자동입찰 - 더블클릭으로 실행하는 창 (송장 자동화 GUI 와 같은 방식).
+"""KREAM 리리셀 - 더블클릭으로 실행하는 창 (송장 자동화 GUI 와 같은 방식).
 
 [입찰] 을 누르면 랭킹 → 상품 → 입찰까지 자동으로 진행한다. 크롬은 화면 밖에서 돌아가고
 (작업표시줄에만 남음) 진행 상황은 이 창에만 표시된다. [크롬 창 보기] 를 켜면 실행 중에도 불러올 수 있다.
@@ -68,7 +68,7 @@ def _place_right_center(root: tk.Tk) -> None:
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        root.title("KREAM 자동입찰")
+        root.title("KREAM 리리셀")
         _place_right_center(root)
         root.minsize(560, 620)
 
