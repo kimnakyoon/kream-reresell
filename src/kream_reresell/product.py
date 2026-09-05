@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlparse
@@ -88,6 +89,11 @@ def read_sales_stats(page: Page, lookback_days: int, need: int, option: str | No
     """
     open_sales_panel(page)
     if option:
+        # 모든 옵션 표의 첫 페이지(패널을 열 때 이미 와 있음)에서 정해지면 옵션을 고르지 않는다 (sales 요청 1건 절약)
+        pre, _pages = count_sales_by_option(page, lookback_days, need, [option], before_page=_no_more_pages)
+        if option in pre:
+            close_sales_panel(page)
+            return pre[option]
         select_option(page, option)
     stats = count_sales(page, lookback_days, need, option)
     close_sales_panel(page)
@@ -148,6 +154,7 @@ def sales_available(page: Page, url: str) -> tuple[bool, str]:
 
 SALES_LOAD_TIMEOUT_MS = 10_000   # 패널을 연 뒤 표(행 · 빈 표 · 오류 표시)가 그려지길 기다리는 최대 시간. 오류 표시는 5초쯤 뒤 뜬다
 OPTION_LOAD_TIMEOUT_MS = 6_000   # 옵션을 고른 뒤 그 옵션의 표가 그려지길 기다리는 최대 시간 (정상이면 즉시)
+EMPTY_TABLE_GRACE_MS = 6_000     # 거래가 있는 상품인데 모든 옵션 표가 빈 채로 열렸을 때 행이 오길 더 기다리는 시간 (정상이면 0.5초쯤)
 
 
 def _await_sales_table(page: Page, timeout_ms: int, option: str | None = None) -> None:
@@ -166,6 +173,20 @@ def _await_sales_table(page: Page, timeout_ms: int, option: str | None = None) -
         state = _wait_sales_state(page, timeout_ms)
     if state == "rows":
         return
+    if state.startswith("empty") and option is None:
+        # 상품 페이지 머리의 '거래 N' 이 0 이 아닌데 모든 옵션 표가 비었다. 패널은 열리자마자 '체결된 거래가 아직 없습니다' 로
+        # 그려지고 0.5초쯤 뒤에 sales 응답이 와서 행이 채워지므로(2026-09-05 실측) 행이 올 때까지 조금 더 기다리고, 그래도 비면
+        # 사이트가 내역을 안 준 것 (스로틀) - 0건으로 세면 옵션 전부 '0건 < 15건' 이 되고 [재입찰]은 입찰을 지운다
+        trades = page.evaluate(_TRADE_COUNT_JS)
+        if trades:
+            state = _wait_sales_state(page, EMPTY_TABLE_GRACE_MS, want_rows=True)
+            if state != "rows":
+                try:
+                    close_sales_panel(page)
+                except SkipProduct:
+                    pass
+                raise SalesNotLoaded(f"체결 내역을 불러오지 못함 (거래 {trades:,}건인 상품인데 표가 빈 채)")
+            return
     if state.startswith("empty"):
         log.info("%s: 행 없음 (%s)", subject, state.partition(":")[2].strip() or "빈 표")
         return
@@ -185,13 +206,15 @@ def _await_sales_table(page: Page, timeout_ms: int, option: str | None = None) -
     raise SalesNotLoaded(f"{subject}을 불러오지 못함 (표가 {timeout_ms // 1000}초 지나도 빈 채)")
 
 
-def _wait_sales_state(page: Page, timeout_ms: int, option: str | None = None) -> str:
+def _wait_sales_state(page: Page, timeout_ms: int, option: str | None = None, want_rows: bool = False) -> str:
     """패널의 체결 표 상태가 정해질 때까지 기다린다: 'rows' (행 있음) / 'empty:…' (표는 그려졌는데 행 없음) / 'error'
-    (불러오기 오류 표시) / 'closed' (패널 없음). 시간 안에 정해지지 않으면 그때 상태 ('loading', 옵션이면 'stale' 도)."""
+    (불러오기 오류 표시) / 'closed' (패널 없음). 시간 안에 정해지지 않으면 그때 상태 ('loading', 옵션이면 'stale' 도).
+    want_rows 면 빈 표도 아직 정해지지 않은 것으로 보고 행·오류·닫힘까지 기다린다."""
     js = _OPTION_STATE_JS if option else _SALES_PANEL_STATE_JS
+    pending = "s === 'loading' || s === 'stale'" + (" || s.startsWith('empty')" if want_rows else "")
     try:
         handle = page.wait_for_function(
-            f"(label) => {{ const s = ({js})(label); return (s === 'loading' || s === 'stale') ? false : s; }}",
+            f"(label) => {{ const s = ({js})(label); return ({pending}) ? false : s; }}",
             arg=option, timeout=timeout_ms)
         return str(handle.json_value())
     except PlaywrightTimeout:
@@ -290,6 +313,90 @@ def count_sales(page: Page, lookback_days: int, need: int, option: str | None = 
     log.info("체결 내역%s: %d행 읽음, %d일 내 빠른배송 %d건 / 전체 %d건%s", f" [{option}]" if option else "",
              stats.rows_read, lookback_days, fast, total, "" if reached_end else " (기간 끝까지 못 봄)")
     return stats
+
+
+def count_sales_by_option(page: Page, lookback_days: int, need: int, options: list[str],
+                          before_page: Callable[[], None] | None = None) -> tuple[dict[str, SalesStats], int]:
+    """열려 있는 패널의 '모든 옵션' 표에서 옵션마다 기간 내 빠른배송 수를 센다 - 옵션을 하나씩 고르기 전에 먼저 부른다.
+
+    사이트 스로틀 대응(pacing): 옵션을 하나 고르면 sales 요청이 1건 나가는데, 모든 옵션 표의 첫 페이지는 패널을 열 때 이미
+    와 있어 공짜다. 거기서 need 를 채운 옵션은 정해지고, 표가 기간 끝(또는 표 끝)까지 가면 모든 옵션이 정확히 정해진다.
+    더 넘기는 페이지(50행 = sales 요청 1건)는 지금까지 본 거래 속도로 기간 끝까지 몇 페이지가 더 필요한지 어림해,
+    그 수가 아직 안 정해진 옵션 수(= 하나씩 고를 때 드는 요청 수) 이하일 때만 넘긴다. 그래서 요청 수가 하나씩 고르는 것보다
+    많아지지 않는다. before_page 는 페이지를 더 넘기기 직전에 부른다 (간격·예산). _StopPaging 을 내면 더 넘기지 않는다.
+
+    반환: (정해진 옵션 → SalesStats, 읽은 페이지 수). 안 정해진 옵션은 select_option + count_sales 로 본다.
+    """
+    cutoff = datetime.now() - timedelta(days=lookback_days)
+    pages = 1
+    prev_count = -1
+    stale = 0
+    resolved: dict[str, SalesStats] = {}
+    rows: list[dict] = []
+    while True:
+        rows = page.evaluate(_SALES_ROWS_JS)
+        fast = dict.fromkeys(options, 0)
+        total = dict.fromkeys(options, 0)
+        reached_end = False
+        oldest: datetime | None = None
+        for r in rows:
+            when = parse_trade_date(r["date"])
+            if when is None:
+                continue
+            if when < cutoff:
+                reached_end = True
+                break
+            oldest = when if oldest is None or when < oldest else oldest
+            o = r.get("option") or ""
+            if o not in fast:
+                continue   # 표기가 옵션 목록과 다르면 세지 않는다 (그 옵션은 하나씩 고르는 쪽으로)
+            total[o] += 1
+            if r["fast"]:
+                fast[o] += 1
+        exhausted = len(rows) == 0 or len(rows) % SALES_PAGE_SIZE != 0   # 마지막 페이지가 꽉 차지 않았다 = 표가 끝났다
+        done = reached_end or exhausted
+        for o in options:
+            if done or fast[o] >= need:
+                resolved[o] = SalesStats(fast[o], total[o], len(rows), done)
+        unresolved = [o for o in options if o not in resolved]
+        if done or not unresolved or len(rows) >= MAX_SALES_ROWS:
+            break
+        # 기간 끝까지 몇 페이지가 더 필요한지 어림 (지금까지 본 행이 며칠치인지로)
+        span_days = max((datetime.now() - oldest).total_seconds() / 86400, 0.05) if oldest else 0.05
+        pages_total = -(-int(len(rows) / span_days * lookback_days) // SALES_PAGE_SIZE)
+        more = max(pages_total - pages, 1)
+        if more > len(unresolved):
+            log.info("모든 옵션 표 %d페이지: 기간 끝까지 %d페이지쯤 더 필요해 안 정해진 옵션 %d개는 하나씩 봄",
+                     pages, more, len(unresolved))
+            break
+        if len(rows) == prev_count:
+            stale += 1
+            if stale >= 3:
+                break
+        else:
+            stale = 0
+        prev_count = len(rows)
+        if before_page:
+            try:
+                before_page()
+            except _StopPaging:
+                break
+        page.evaluate(_SCROLL_SALES_JS)
+        page.wait_for_timeout(700)
+        if len(page.evaluate(_SALES_ROWS_JS)) > len(rows):
+            pages += 1
+    if resolved:
+        log.info("모든 옵션 표 %d페이지(%d행)에서 %d/%d 옵션 정해짐: %s", pages, len(rows), len(resolved), len(options),
+                 ", ".join(f"{o} {s.fast_in_window}건" for o, s in resolved.items()))
+    return resolved, pages
+
+
+class _StopPaging(Exception):
+    """count_sales_by_option 의 before_page 가 내면 페이지를 더 넘기지 않는다."""
+
+
+def _no_more_pages() -> None:
+    raise _StopPaging
 
 
 def close_sales_panel(page: Page) -> None:
@@ -477,6 +584,14 @@ _SCROLL_SALES_JS = r"""
   }
   window.scrollBy(0, 400);
   return true;
+}
+"""
+
+# 상품 페이지 머리의 누적 거래 수 ('거래 2,984 ▲33,000원' - 2026-09-05 실측). 없으면 0
+_TRADE_COUNT_JS = r"""
+() => {
+  const m = document.body.innerText.match(/거래\s+([\d,]+)/);
+  return m ? parseInt(m[1].replace(/,/g, ''), 10) : 0;
 }
 """
 

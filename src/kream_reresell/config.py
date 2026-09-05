@@ -56,7 +56,7 @@ class Settings:
     block_images: bool = field(default_factory=lambda: _bool("BLOCK_IMAGES", True))
     # 사이트 스로틀(IP 단위) 대응 - pacing 참고. 10분 창 안에 상품 API(sales 등) 요청을 이만큼까지만 보내고 넘으면 쉰다.
     # 0 이면 예산을 안 센다. TRIM_API=0 이면 안 보는 asks·bids·chart 요청도 그대로 보낸다 (점검용)
-    api_budget_per_10min: int = field(default_factory=lambda: _int("API_BUDGET_PER_10MIN", 120))
+    api_budget_per_10min: int = field(default_factory=lambda: _int("API_BUDGET_PER_10MIN", 60))
     trim_api: bool = field(default_factory=lambda: _bool("TRIM_API", True))
     # 크롬 창을 화면에 보이게 둘지. 기본은 화면 밖으로 치워 두고 GUI 상태창으로만 진행을 본다.
     # 직접 로그인이 필요하면 자동으로 불러온다. 화면을 보며 점검하려면 .env 에 SHOW_CHROME=1 또는 --show-chrome

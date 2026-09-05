@@ -15,7 +15,7 @@ from collections.abc import Callable
 log = logging.getLogger(__name__)
 
 TROUBLE_STREAK = 3     # 판단 불가(내역을 못 불러옴)·오류가 연달아 이만큼 나면 사이트가 응답을 안 주는 것으로 본다
-PROBE_SEC = 120        # 멈춘 동안 이만큼마다 한 번 확인한다 (더 자주 두드리면 풀리지 않는다)
+PROBE_SEC = 300        # 멈춘 동안 이만큼마다 한 번 확인한다 (더 자주 두드리면 풀리지 않는다 - 2분마다 두드리던 날은 20분 넘게 걸렸다)
 
 
 def sleep_with_stop(should_stop: Callable[[], bool], seconds: float) -> None:

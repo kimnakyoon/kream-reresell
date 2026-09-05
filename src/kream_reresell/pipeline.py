@@ -153,9 +153,21 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
 
         # 옵션 상품: 먼저 패널에서 옵션마다 거래량을 센다 (페이지 이동 없음). 기준을 넘는 옵션만 뒤에서 A/B 를 읽는다
         stats_by_option: dict[str, product_mod.SalesStats | str] = {}
-        for n, label in enumerate(options):
-            if n:
-                pacing.pause(pacing.OPTION_PAUSE_SEC, should_stop)   # 옵션을 바꿀 때마다 sales 요청이 나간다 - 사람 속도로
+
+        def before_page() -> None:   # 모든 옵션 표를 한 페이지 더 넘기기 전 (sales 요청 1건) - 옵션을 고를 때와 같은 간격·예산
+            pacing.pause(pacing.PAGE_PAUSE_SEC, should_stop)
+            pacing.before_sales_request(should_stop, on_status=on_status)
+
+        try:
+            pre, _pages = product_mod.count_sales_by_option(page, settings.lookback_days, settings.min_fast_sales, options,
+                                                            before_page=before_page)
+            stats_by_option.update(pre)
+        except product_mod.SkipProduct as e:
+            log.info("모든 옵션 표를 읽지 못함 (%s) - 옵션을 하나씩 봄", e)
+        for label in options:
+            if label in stats_by_option:
+                continue
+            pacing.pause(pacing.OPTION_PAUSE_SEC, should_stop)   # 옵션을 바꿀 때마다 sales 요청이 나간다 - 사람 속도로
             if should_stop and should_stop():
                 stats_by_option[label] = "중지 요청"
                 continue
@@ -296,7 +308,7 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
     `data/bids.json` 은 건너뛰기 기준이 아니라 목록의 입찰을 상품 ID 로 잇는 기록으로만 쓴다.
 
     사이트가 체결 내역을 안 주는 시간대: 상품이 연달아 TROUBLE_STREAK 개 판단 불가·오류로 끝나면 (옵션 상품은 모든 옵션이)
-    더 열지 않고 멈춘 채 2분마다 확인, 다시 주면 로그인 상태를 확인하고 그 상품들부터 다시 본다 (앞서 남긴 판단 불가 결과는
+    더 열지 않고 멈춘 채 5분마다 확인, 다시 주면 로그인 상태를 확인하고 그 상품들부터 다시 본다 (앞서 남긴 판단 불가 결과는
     바꿔 넣는다). 사용자가 중지할 때까지 기다린다.
     page: 로그인 확인용 메인 탭 (없으면 확인만 건너뜀). on_status: GUI 상태 한 줄.
     """
@@ -337,7 +349,7 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
         if len(trouble_streak) < TROUBLE_STREAK:
             continue
 
-        log.warning("판단 불가·오류가 %d개 상품 연달아 남 - 사이트가 체결 내역을 안 주는 듯해 멈춤. 2분마다 확인하고 "
+        log.warning("판단 불가·오류가 %d개 상품 연달아 남 - 사이트가 체결 내역을 안 주는 듯해 멈춤. 5분마다 확인하고 "
                     "다시 주면 이 %d개부터 이어서 봄", len(trouble_streak), len(trouble_streak))
         probe_item = trouble_streak[-1]
         if not wait_until_site_back(lambda: _site_gives_sales(context, probe_item), stop, status):

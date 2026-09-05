@@ -95,35 +95,34 @@ def block_heavy_resources(context: BrowserContext) -> None:
 
 # ---------------------------------------------------------------- 사이트 스로틀 대응 (pacing 참고)
 
-def _on_api_request(request) -> None:
-    if request.url.startswith(pacing.API_ORIGIN):
-        path = urlparse(request.url).path
-        if not (_trimming and pacing.TRIMMABLE_PATH_RE.match(path)):
-            pacing.BUDGET.note(path)
-
-
 _trimming = False
+_CORS_HEADERS = {"access-control-allow-origin": "https://kream.co.kr", "access-control-allow-credentials": "true"}
 
 
-def _fulfill_trimmable(route) -> None:
-    """프로그램이 안 보는 asks·bids·chart 요청은 서버에 보내지 않고 빈 목록으로 채운다 (스로틀 대상 호출을 1/4 로).
-    abort 하면 사이트가 오류 표시로 바꿔 버리므로 200 으로 채운다 (실측). 나머지는 그대로."""
-    url = route.request.url
-    if url.startswith(pacing.API_ORIGIN) and pacing.TRIMMABLE_PATH_RE.match(urlparse(url).path):
-        route.fulfill(status=200, content_type="application/json", body=pacing.TRIM_BODY,
-                      headers={"access-control-allow-origin": "https://kream.co.kr",
-                               "access-control-allow-credentials": "true"})
-    else:
-        route.continue_()
+def _api_route(route) -> None:
+    """api.kream.co.kr 요청 하나를 처리한다 (스로틀 대응, pacing 참고):
+      - asks·bids·chart (프로그램이 안 봄): 서버에 보내지 않고 빈 목록(200)으로 채운다. abort 하면 사이트가 오류 표시로 바꾼다 (실측)
+      - sales 등 스로틀 대상: 세고 그대로 보낸다
+      - 나머지: 그대로
+
+    같은 sales 요청을 캐시해 돌려주는 것은 하지 않는다 - 응답 핸들러에서 response.body() 를 읽거나 route.fetch() 로 받으면
+    페이지가 그 응답을 못 받아 표가 빈 채로 그려진다 (2026-09-05 실측, 옵션 전부 0건으로 세어질 뻔함).
+    """
+    request = route.request
+    path = urlparse(request.url).path
+    if _trimming and pacing.TRIMMABLE_PATH_RE.match(path):
+        route.fulfill(status=200, content_type="application/json", body=pacing.TRIM_BODY, headers=_CORS_HEADERS)
+        return
+    if request.method == "GET" and pacing.THROTTLED_PATH_RE.match(path):
+        pacing.BUDGET.note(path)
+    route.continue_()
 
 
 def watch_api_requests(context: BrowserContext, trim: bool = True) -> None:
-    """스로틀 대상 API 요청을 세고(pacing.BUDGET), trim 이면 안 보는 요청을 막는다."""
+    """api.kream.co.kr 요청을 route 로 받아 스로틀 대상을 세고(pacing.BUDGET), trim 이면 안 보는 요청을 빈 응답으로 채운다."""
     global _trimming
     _trimming = trim
-    if trim:
-        context.route(f"{pacing.API_ORIGIN}/**", _fulfill_trimmable)
-    context.on("request", _on_api_request)   # 채워 준 요청도 request 이벤트는 오므로 서버에 간 것만 센다
+    context.route(f"{pacing.API_ORIGIN}/**", _api_route)
 
 
 # ---------------------------------------------------------------- 크롬 창 위치 (Windows 전용)
