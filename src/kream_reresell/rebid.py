@@ -15,13 +15,15 @@
   5. 목록 끝까지 가면 한 사이클. 중지할 때까지 사이클을 반복하되, 사이클 시작 간격(설정, 기본 5분)을 지키고
      입찰 사이에도 2~4초 무작위로 쉰다 (봇 탐지 대비).
 
-즉시 판매가가 없을 때: 구매 페이지에 와 있는데 '즉시 판매가' 가 안 그려지면 (사용자 결정, 2026-09-05) 상품 페이지를 돌지 않고
-바로 그 입찰을 지운다 (입찰취소, 방식은 기준 미달 때와 같다. 지우기 전에 상세 API 로 살아 있는 입찰인지 보고, 이미 체결·삭제된
-입찰이면 건너뜀). 지우지 못하면 확인필요. 지운 상품은 bids.json 에서도 빼서 [입찰]이 조건이 맞으면 다시 넣을 수 있게 한다.
+즉시 판매가가 없을 때: 구매 페이지에 와 있는데 '즉시 판매가' 가 안 그려지면 (사용자 결정, 2026-09-05) 그 입찰을 지운다
+(입찰취소, 방식은 기준 미달 때와 같다). 단 지우기 전에 두 가지를 본다: (1) 상품 페이지의 체결 내역 패널이 그려지는지 - 안 그려지면
+사이트가 응답을 안 주는 시간대라 즉시 판매가도 안 보이는 것이니 지우지 않고 판단 불가 (사용자 결정 2026-09-05, 멀쩡한 입찰이
+지워지던 문제); (2) 상세 API 로 살아 있는 입찰인지 - 이미 체결·삭제된 입찰이면 건너뜀. 지우지 못하면 확인필요.
+지운 상품은 bids.json 에서도 빼서 [입찰]이 조건이 맞으면 다시 넣을 수 있게 한다.
 사이트가 응답을 안 주는 시간대(2026-09-05 실측: API 로 채우는 부분만 비는 상태가 계속 두드리는 동안 20분 넘게 이어졌고, 7분쯤 쉬면
 풀렸다)에도 같은 일이 생기므로, 이렇게 지운 건도 판단 불가·오류와 함께 '연달아 난 수' 에 넣는다: 연달아 TROUBLE_STREAK 건 나오면
-최대 10분 쉬되 2분마다 구매 페이지를 한 번 열어 보고 풀렸으면 로그인 상태를 확인한 뒤 바로 이어서 본다. 같은 사이클에서 또 그러면
-사이클을 끊고 다음 사이클 전에 10분 더 쉰다. 판단 불가·즉시 판매가 없음으로 끝난 입찰은 화면 스냅샷을 dumps/ 에 남긴다.
+멈춘 채 2분마다 구매 페이지를 한 번 열어 보고, '즉시 판매가' 가 다시 그려지면 로그인 상태를 확인한 뒤 이어서 본다 (사용자 결정
+2026-09-05: 시간 제한 없이 다시 줄 때까지 기다린다 - sitewait). 판단 불가·즉시 판매가 없음으로 끝난 입찰은 화면 스냅샷을 dumps/ 에 남긴다.
 구매 페이지가 로그인 화면으로 넘어가면(로그인이 풀림) 다시 로그인하고 그 입찰을 한 번 더 본다. 목록 페이지가 로그인 화면으로
 넘어가도 (로그인 화면 주소에도 returnUrl 로 tab=bidding 이 들어가 0건으로 읽히던 문제, 2026-09-05) 다시 로그인하고 목록을 다시 읽는다.
 
@@ -51,6 +53,7 @@ from .cancel import (CancelAborted, CancelUncertain, OpenBid, apply_known, delet
 from .config import Settings
 from .debug import dump
 from .report import ProductResult
+from .sitewait import PROBE_SEC, TROUBLE_STREAK, sleep_with_stop, wait_until_site_back
 from .store import (ONE_SIZE, BidRecord, append_run_log, load_bid_products, load_bids, remove_bid, save_bid,
                     save_bid_products)
 
@@ -58,10 +61,8 @@ log = logging.getLogger(__name__)
 
 ITEM_PAUSE_SEC = (2.0, 4.0)      # 입찰 하나를 보고 다음으로 가기 전 무작위로 쉬는 시간
 MIN_CYCLE_GAP_SEC = 30           # 사이클이 간격보다 오래 걸렸어도 다음 사이클 전에 최소 이만큼은 쉰다
-TROUBLE_STREAK = 3               # 판단 불가(확인필요)·오류가 연달아 이만큼 나면 사이트가 응답을 안 주는 것으로 보고
-TROUBLE_PAUSE_SEC = 600          # 최대 10분 쉬고 로그인 상태를 확인한 뒤 이어서 본다. 같은 사이클에서 또 그러면 사이클을 끊고
-                                 # 다음 사이클 전에 10분 더 쉰다 (계속 두드리면 풀리지 않는다 - 2026-09-05 실측)
-TROUBLE_PROBE_SEC = 120          # 쉬는 동안 이만큼마다 한 번 구매 페이지를 열어 보고, '즉시 판매가' 가 그려지면 바로 이어서 본다
+# 판단 불가(확인필요)·오류·즉시 판매가 없음이 연달아 TROUBLE_STREAK 건 나면 사이트가 응답을 안 주는 것으로 보고 멈춘다.
+# PROBE_SEC 마다 마지막에 막힌 입찰의 구매 페이지를 한 번 열어 보고 '즉시 판매가' 가 그려지면 이어서 본다 (sitewait 공용).
 MAX_LIST_FAILURES = 3            # 목록을 연달아 이만큼 못 읽으면 멈춘다
 ERROR_BACKOFF_SEC = 120          # 목록을 못 읽었을 때 다시 시도하기 전에 쉬는 시간
 NO_B_PREFIX = "즉시 판매가 없음"   # 즉시 판매가가 없어 지운(또는 지우려 한) 결과의 사유 머리 - 연달아 난 수를 셀 때 쓴다
@@ -245,10 +246,18 @@ def _cancel_no_b(page: Page, bid: OpenBid, settings: Settings, r: ProductResult,
 
     지우기 전에 상세 API 로 살아 있는 입찰인지 본다 - 체결·만료·이미 지운 입찰이면 즉시 판매가가 없는 게 당연하니 건너뜀.
     """
-    log.info("%s - 입찰 #%d 을 지움 (지금 주소 %s)", why, bid.bid_id, page.url)
+    log.info("%s (지금 주소 %s) - 사이트가 살아 있는지 확인한 뒤 입찰 #%d 을 지움", why, page.url, bid.bid_id)
     if diagnose:
         dump(page, f"rebid{bid.bid_id}_no_b")
     head = f"{NO_B_PREFIX} ({why}, 내 희망가 {bid.price:,}원)"
+    # 사이트가 응답을 안 주는 시간대에는 즉시 판매가도 안 그려진다 - 그때 지우면 멀쩡한 입찰이 사라지므로 (사용자 결정 2026-09-05)
+    # 상품 페이지의 체결 내역이 불러와지는지 먼저 보고, 그것도 안 오면 판단 불가로 두고 (연달아 나면 멈춰 기다림) 지우지 않는다
+    alive, note = product_mod.sales_available(page, bid.product_url)
+    if not alive:
+        log.info("체결 내역도 불러오지 못함 - 사이트 문제로 보고 입찰 #%d 은 지우지 않음", bid.bid_id)
+        r.status, r.detail = "확인필요", f"판단 불가 - 지우지 않음: {why}인데 체결 내역도 불러오지 못함 ({note})"
+        return
+    log.info("체결 내역은 불러와짐 (%s) - 즉시 판매가가 정말 없는 것으로 보고 지움", note)
     if not settings.dry_run:
         data = read_bid_info(page, bid)
         status = (data or {}).get("status")
@@ -348,39 +357,20 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
 
 # ---------------------------------------------------------------- 사이클 반복
 
-def _wait_for_site(page: Page, probe: OpenBid | None, should_stop: Callable[[], bool],
+def _wait_for_site(page: Page, probe: OpenBid, should_stop: Callable[[], bool],
                    on_status: Callable[[str], None]) -> bool:
-    """사이트가 응답을 안 줄 때 최대 TROUBLE_PAUSE_SEC 쉰다. TROUBLE_PROBE_SEC 마다 마지막에 막힌 입찰의 구매 페이지를
-    한 번 열어 보고 '즉시 판매가' 가 그려지면 바로 돌아온다 (True). 끝까지 안 풀리면 False."""
-    deadline = time.monotonic() + TROUBLE_PAUSE_SEC
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        step = min(TROUBLE_PROBE_SEC, remaining)
-        on_status(f"사이트 응답 없음 - {int(remaining) // 60}분 {int(remaining) % 60}초 더 쉼 ({int(step)}초 뒤 확인)")
-        _sleep(should_stop, step)
-        if should_stop():
-            return False
-        if probe is None or not probe.product_id:
-            continue
-        try:
-            b = read_current_b(page, probe.product_id, probe.size_value or ONE_SIZE)
-        except Exception as e:  # noqa: BLE001
-            log.info("아직 응답 없음 (%s)", str(e).splitlines()[0])
-            continue
-        if b is not None:
-            log.info("사이트가 다시 응답함 (즉시 판매가 %s원) - 이어서 봄", f"{b:,}")
+    """사이트가 응답을 안 줄 때 다시 줄 때까지 멈춘다. PROBE_SEC 마다 마지막에 막힌 입찰의 구매 페이지를 한 번 열어 보고
+    '즉시 판매가' 가 그려지면 돌아온다 (True). 중지 요청이면 False."""
+    def check() -> bool:
+        if not probe.product_id:
+            # 확인할 상품을 모르면 (상세를 못 읽은 입찰) 한 번 쉰 뒤 그냥 이어서 본다 - 또 막히면 다시 멈춘다
             return True
+        b = read_current_b(page, probe.product_id, probe.size_value or ONE_SIZE)
+        if b is not None:
+            log.info("즉시 판매가 %s원이 다시 그려짐", f"{b:,}")
+        return b is not None
 
-
-def _sleep(should_stop: Callable[[], bool], seconds: float) -> None:
-    """중지 요청을 1초마다 보며 쉰다."""
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        if should_stop():
-            return
-        time.sleep(min(1.0, deadline - time.monotonic()))
+    return wait_until_site_back(check, should_stop, on_status, what="즉시 판매가")
 
 
 def _list_bids(page: Page, settings: Settings) -> list[OpenBid]:
@@ -425,7 +415,7 @@ def run(context: BrowserContext, page: Page, settings: Settings,
             if list_failures >= MAX_LIST_FAILURES:
                 raise RuntimeError(f"구매 입찰 목록을 {MAX_LIST_FAILURES}번 연달아 읽지 못해 멈춤: {e}") from e
             status(f"목록을 읽지 못해 {ERROR_BACKOFF_SEC // 60}분 뒤 다시 시도")
-            _sleep(stop, ERROR_BACKOFF_SEC)
+            sleep_with_stop(stop, ERROR_BACKOFF_SEC)
             continue
 
         known = load_bids()
@@ -444,8 +434,6 @@ def run(context: BrowserContext, page: Page, settings: Settings,
 
         cycle_results: list[ProductResult] = []
         trouble_streak = 0     # 판단 불가·오류가 연달아 난 수
-        paused = False         # 이번 사이클에서 이미 한 번 쉬었는지
-        broke_off = False      # 쉬고도 또 연달아 나서 사이클을 끊었는지
         for bid in bids:
             if stop():
                 log.info("사용자 요청으로 중지 - 남은 입찰 %d건은 보지 않음", len(bids) - len(cycle_results))
@@ -466,17 +454,10 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                 on_result(r)
             trouble_streak = trouble_streak + 1 if is_site_trouble(r) else 0
             if trouble_streak >= TROUBLE_STREAK:
-                if paused:
-                    broke_off = True
-                    log.warning("쉬고 나서도 판단 불가·오류가 %d건 연달아 남 - 이번 사이클을 끊고 %d분 더 쉰 뒤 다음 사이클",
-                                trouble_streak, TROUBLE_PAUSE_SEC // 60)
-                    break
-                paused = True
                 trouble_streak = 0
-                log.warning("판단 불가·오류가 %d건 연달아 남 - 사이트가 응답을 안 주는 듯해 최대 %d분 쉬며 %d분마다 확인, "
-                            "풀리면 로그인 상태를 확인한 뒤 이어서 봄", TROUBLE_STREAK, TROUBLE_PAUSE_SEC // 60, TROUBLE_PROBE_SEC // 60)
-                _wait_for_site(tab, bid, stop, lambda t: status(f"재입찰 {cycle}회차 ({bid.order}/{len(bids)} 까지 봄): {t}"))
-                if stop():
+                log.warning("판단 불가·오류가 %d건 연달아 남 - 사이트가 응답을 안 주는 듯해 멈춤. %d분마다 확인하고 "
+                            "다시 주면 로그인 상태를 확인한 뒤 이어서 봄", TROUBLE_STREAK, PROBE_SEC // 60)
+                if not _wait_for_site(tab, bid, stop, lambda t: status(f"재입찰 {cycle}회차 ({bid.order}/{len(bids)} 까지 봄): {t}")):
                     break
                 try:
                     auth.ensure_logged_in(page, settings)
@@ -484,7 +465,7 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                     log.exception("쉬고 나서 로그인 상태를 확인하지 못함 - 그대로 이어서 봄")
             if stop():
                 break
-            _sleep(stop, random.uniform(*ITEM_PAUSE_SEC))
+            sleep_with_stop(stop, random.uniform(*ITEM_PAUSE_SEC))
 
         counts: dict[str, int] = {}
         for r in cycle_results:
@@ -498,8 +479,6 @@ def run(context: BrowserContext, page: Page, settings: Settings,
             break
 
         wait = max(settings.rebid_interval_min * 60 - elapsed, MIN_CYCLE_GAP_SEC)
-        if broke_off:
-            wait += TROUBLE_PAUSE_SEC
         next_at = datetime.now() + timedelta(seconds=wait)
         # 간격은 '사이클 시작 시각 사이의 간격' - 이번 사이클이 오래 걸렸으면 그만큼 덜 쉰다 (최소 MIN_CYCLE_GAP_SEC)
         log.info("이번 사이클 %d초 걸림. 사이클 시작 간격 %g분(%d초)이라 %d초 쉬고 %s 에 다음 사이클 시작",
@@ -507,7 +486,7 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                  next_at.strftime("%H:%M:%S"))
         status(f"재입찰 {cycle}회차 끝({int(elapsed)}초): {summary} - {int(wait)}초 쉬고 {next_at:%H:%M} 에 다음 사이클 "
                f"(시작 간격 {settings.rebid_interval_min:g}분)")
-        _sleep(stop, wait)
+        sleep_with_stop(stop, wait)
     try:
         tab.close()
     except Exception:  # noqa: BLE001

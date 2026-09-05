@@ -40,6 +40,14 @@ class NoPriceB(SkipProduct):
     """구매 페이지는 떴는데 '즉시 판매가'(B) 가 없다. [재입찰]은 이 경우 입찰을 지운다."""
 
 
+class SalesNotLoaded(SkipProduct):
+    """체결 내역 패널이 열렸는데 사이트가 내역을 내려주지 않았다 (오류 표시 또는 끝까지 빈 채).
+
+    거래가 없는 게 아니라 '판단 불가' 다 - 0건으로 세면 [재입찰]이 기준 미달로 입찰을 지워 버린다. [입찰]·[재입찰] 은 이게
+    연달아 나면 사이트가 응답을 안 주는 시간대로 보고 멈춰 기다린다 (sitewait).
+    """
+
+
 @dataclass
 class SalesStats:
     fast_in_window: int      # 기간 내 빠른배송 체결 수
@@ -111,14 +119,90 @@ def open_sales_panel(page: Page) -> None:
             page.wait_for_timeout(700)
     else:
         raise SkipProduct("'거래 내역 더보기' 패널이 열리지 않음")
-    # 패널이 뜬 뒤 행이 그려질 때까지만 기다린다 (실측 0.3초쯤). 본문에 '체결 거래' 표가 있는 상품이니 행이 있어야 한다 -
-    # 3초가 지나도 비어 있으면 사이트가 내역을 안 준 것 (2026-09-05 실측: 0행이 나온 시간대에 구매 페이지도 안 그려짐).
-    # 0건으로 세면 [재입찰]이 기준 미달로 입찰을 지워 버리므로 판단 불가로 넘긴다.
+    # 패널이 뜬 뒤 표가 그려질 때까지 기다린다 (정상이면 0.3초쯤). 본문에 '체결 거래' 표가 있는 상품이니 행이 있어야 한다.
+    _await_sales_table(page, SALES_LOAD_TIMEOUT_MS)
+
+
+def sales_available(page: Page, url: str) -> tuple[bool, str]:
+    """사이트가 체결 내역을 주고 있는지 - 상품 페이지를 열어 패널 표가 그려지는지 본다. (주는지, 근거).
+
+    [입찰]·[재입찰] 이 멈춰 기다리는 동안의 확인과, [재입찰] 이 '즉시 판매가 없음' 으로 지우기 전 확인에 쓴다.
+    """
     try:
-        page.wait_for_function(f"() => ({_SALES_ROWS_JS})().length > 0", timeout=3000)
-    except PlaywrightTimeout:
+        open_product(page, url)
+        open_sales_panel(page)
+    except SalesNotLoaded as e:
+        return False, str(e)
+    except SkipProduct as e:
+        if "체결 거래 표가 없는" in str(e):
+            return True, "체결 거래 표가 없는 상품"   # 리셀 거래가 없는 상품 - 사이트 문제가 아니다
+        return False, str(e)
+    except (PlaywrightTimeout, PlaywrightError) as e:
+        return False, f"상품 페이지를 열지 못함: {str(e).splitlines()[0]}"
+    try:
         close_sales_panel(page)
-        raise SkipProduct("체결 내역 패널에 행이 없음 (내역을 불러오지 못함?)") from None
+    except SkipProduct:
+        pass
+    return True, "체결 내역 패널이 그려짐"
+
+
+SALES_LOAD_TIMEOUT_MS = 10_000   # 패널을 연 뒤 표(행 · 빈 표 · 오류 표시)가 그려지길 기다리는 최대 시간. 오류 표시는 5초쯤 뒤 뜬다
+OPTION_LOAD_TIMEOUT_MS = 6_000   # 옵션을 고른 뒤 그 옵션의 표가 그려지길 기다리는 최대 시간 (정상이면 즉시)
+
+
+def _await_sales_table(page: Page, timeout_ms: int, option: str | None = None) -> None:
+    """패널의 체결 표가 그려질 때까지 기다린다. 행이 있거나 빈 표(거래가 정말 없음)면 돌아온다.
+
+    사이트가 내역을 안 주는 시간대(2026-09-05 실측)에는 표가 끝까지 빈 채이거나 몇 초 뒤 '불러오는 중 문제가 생겼어요 / 다시 시도'
+    오류 표시가 뜬다 - 전체 표면 [다시 시도] 를 한 번 눌러 보고 (옵션을 고른 뒤에는 선택이 풀릴 수 있어 누르지 않음), 그래도
+    안 오면 SalesNotLoaded (판단 불가). 0건으로 세면 [재입찰] 이 기준 미달로 입찰을 지우고, 옵션 상품은 S~XXL 이 전부
+    '0건 < 15건' 으로 기록되던 문제 (2026-09-05).
+    """
+    subject = f"옵션 '{option}' 의 체결 내역" if option else "체결 내역"
+    state = _wait_sales_state(page, timeout_ms, option)
+    if state == "error" and option is None:
+        log.info("체결 내역 패널에 '불러오는 중 문제가 생겼어요' - [다시 시도] 한 번")
+        _click_panel_retry(page)
+        state = _wait_sales_state(page, timeout_ms)
+    if state == "rows":
+        return
+    if state.startswith("empty"):
+        log.info("%s: 행 없음 (%s)", subject, state.partition(":")[2].strip() or "빈 표")
+        return
+    if state == "closed":
+        raise SkipProduct("체결 내역 패널이 열렸다가 사라짐")
+    if state == "stale":
+        rows = page.evaluate(_SALES_ROWS_JS)
+        others = [r for r in rows if r.get("option") and r["option"] != option]
+        raise SkipProduct(f"옵션 '{option}' 을 골랐는데 표에 다른 옵션({others[0]['option'] if others else '?'}) 행이 남아 있음")
+    if option is None:
+        try:
+            close_sales_panel(page)
+        except SkipProduct:
+            log.debug("체결 내역 패널을 닫지 못함 - 판단 불가 사유를 그대로 알림")
+    if state == "error":
+        raise SalesNotLoaded(f"{subject}을 불러오지 못함 (패널에 '불러오는 중 문제가 생겼어요' 표시)")
+    raise SalesNotLoaded(f"{subject}을 불러오지 못함 (표가 {timeout_ms // 1000}초 지나도 빈 채)")
+
+
+def _wait_sales_state(page: Page, timeout_ms: int, option: str | None = None) -> str:
+    """패널의 체결 표 상태가 정해질 때까지 기다린다: 'rows' (행 있음) / 'empty:…' (표는 그려졌는데 행 없음) / 'error'
+    (불러오기 오류 표시) / 'closed' (패널 없음). 시간 안에 정해지지 않으면 그때 상태 ('loading', 옵션이면 'stale' 도)."""
+    js = _OPTION_STATE_JS if option else _SALES_PANEL_STATE_JS
+    try:
+        handle = page.wait_for_function(
+            f"(label) => {{ const s = ({js})(label); return (s === 'loading' || s === 'stale') ? false : s; }}",
+            arg=option, timeout=timeout_ms)
+        return str(handle.json_value())
+    except PlaywrightTimeout:
+        return str(page.evaluate(js, option))
+
+
+def _click_panel_retry(page: Page) -> None:
+    try:
+        page.locator(".error-boundary-content__actions__retry").first.click(timeout=2000)
+    except PlaywrightError:
+        log.debug("[다시 시도] 버튼을 누르지 못함")
 
 
 def list_options(page: Page) -> list[str]:
@@ -159,15 +243,8 @@ def select_option(page: Page, label: str) -> None:
         page.wait_for_function(f"(label) => ({_OPTION_PICKER_TITLE_JS})() === label", arg=label, timeout=5000)
     except PlaywrightTimeout:
         raise SkipProduct(f"옵션 '{label}' 을 골랐는데 패널 제목이 바뀌지 않음") from None
-    # 표가 그 옵션의 행으로 바뀔 때까지 (실측 즉시). 거래가 하나도 없는 옵션이면 행이 없을 수 있어 짧게만 기다린다.
-    try:
-        page.wait_for_function(_ROWS_OPTION_MATCH_JS, arg=label, timeout=3000)
-    except PlaywrightTimeout:
-        rows = page.evaluate(_SALES_ROWS_JS)
-        others = [r for r in rows if r.get("option") and r["option"] != label]
-        if others:
-            raise SkipProduct(f"옵션 '{label}' 을 골랐는데 표에 다른 옵션({others[0]['option']}) 행이 남아 있음") from None
-        log.info("옵션 %s: 체결 행 없음", label)
+    # 표가 그 옵션의 행으로 바뀔 때까지 (실측 즉시). 거래가 하나도 없는 옵션이면 표는 그려지되 행이 없다
+    _await_sales_table(page, OPTION_LOAD_TIMEOUT_MS, option=label)
 
 
 def count_sales(page: Page, lookback_days: int, need: int, option: str | None = None) -> SalesStats:
@@ -353,6 +430,36 @@ _ROWS_OPTION_MATCH_JS = r"""
   return rows.length > 0 && rows.every(r => r.option === label);
 }
 """ % _SALES_ROWS_JS.strip()
+
+# 패널의 체결 표 상태 (2026-09-05 실측):
+#  'closed'  - 보이는 패널이 없음
+#  'error'   - 패널 안에 '불러오는 중 문제가 생겼어요 / 다시 시도' 오류 표시 (.error-boundary-content) - 사이트가 내역을 안 줌
+#  'rows'    - 체결 행이 있음
+#  'empty:…' - 표(머리글 '거래일' 또는 '없습니다' 류 안내)는 그려졌는데 행이 없음 - 그 옵션은 거래가 정말 없는 것
+#  'loading' - 표 자리가 아직 비어 있음 (불러오는 중이면 tabpanel 글자가 하나도 없다). 오래 이어지면 사이트가 안 주는 것
+_SALES_PANEL_STATE_JS = r"""
+() => {
+  const panel = [...document.querySelectorAll('.product-transaction-history-drawer, .bottom-sheet__layer--open')]
+    .find(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+  if (!panel) return 'closed';
+  if (panel.querySelector('.error-boundary-content') || panel.innerText.includes('불러오는 중 문제')) return 'error';
+  if ((%s)().length > 0) return 'rows';
+  const shown = [...panel.querySelectorAll('[role=tabpanel]')]
+    .filter(p => p.offsetHeight > 0 && (p.innerText.includes('거래일') || /없습니다|없어요/.test(p.innerText)));
+  const text = shown.map(p => p.innerText.replace(/\s+/g, ' ').trim()).filter(Boolean).join(' / ');
+  return text ? 'empty:' + text.slice(0, 80) : 'loading';
+}
+""" % _SALES_ROWS_JS.strip()
+
+# 옵션을 고른 뒤의 표 상태: 위와 같되, 행이 있어도 전부 그 옵션의 행이 아니면 (예전 옵션 행이 남아 있음) 'stale'
+_OPTION_STATE_JS = r"""
+(label) => {
+  const s = (%s)();
+  if (s !== 'rows') return s;
+  const rows = (%s)();
+  return rows.every(r => r.option === label) ? 'rows' : 'stale';
+}
+""" % (_SALES_PANEL_STATE_JS.strip(), _SALES_ROWS_JS.strip())
 
 _SCROLL_SALES_JS = r"""
 () => {

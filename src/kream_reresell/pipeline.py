@@ -14,18 +14,34 @@ from typing import TYPE_CHECKING
 
 from playwright.sync_api import BrowserContext, Page
 
+from . import auth
 from . import bid as bid_mod
 from . import product as product_mod
 from .config import Settings
 from .debug import dump
 from .ranking import RankedProduct
 from .report import ProductResult
+from .sitewait import TROUBLE_STREAK, wait_until_site_back
 from .store import ONE_SIZE, BidRecord, append_run_log, save_bid
 
 if TYPE_CHECKING:  # cancel 이 pipeline 을 import 하므로 타입 표기용으로만
     from .cancel import OpenBid, OpenBids
 
 log = logging.getLogger(__name__)
+
+NOT_LOADED_PREFIX = "판단 불가"   # 사이트가 체결 내역을 안 줘서 판정하지 못한 결과의 사유 머리 (연달아 난 수를 셀 때 쓴다)
+
+
+def _skip_detail(e: product_mod.SkipProduct) -> str:
+    """SkipProduct 를 결과 사유로. 내역을 못 불러온 것은 '판단 불가:' 를 앞에 붙여 거래가 없는 것과 구별한다."""
+    if isinstance(e, product_mod.SalesNotLoaded):
+        return f"{NOT_LOADED_PREFIX}: {e}"
+    return str(e)
+
+
+def is_site_trouble(r: ProductResult) -> bool:
+    """사이트가 응답을 안 줘서 생겼을 수 있는 결과인지 (판단 불가 · 오류)."""
+    return r.status == "오류" or r.detail.startswith(NOT_LOADED_PREFIX)
 
 
 def evaluate(page: Page, url: str, r: ProductResult, settings: Settings, stop_early: bool = True,
@@ -107,7 +123,7 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
             product_mod.open_sales_panel(page)
             options = product_mod.list_options(page)
         except product_mod.SkipProduct as e:
-            r.status, r.detail = "건너뜀", str(e)
+            r.status, r.detail = "건너뜀", _skip_detail(e)
             return _done(results, r, item)
 
         if not options:
@@ -116,7 +132,7 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
                 stats = product_mod.count_sales(page, settings.lookback_days, settings.min_fast_sales)
                 product_mod.close_sales_panel(page)
             except product_mod.SkipProduct as e:
-                r.status, r.detail = "건너뜀", str(e)
+                r.status, r.detail = "건너뜀", _skip_detail(e)
                 return _done(results, r, item)
             _judge_and_bid(page, r, stats, item, settings, open_bids)
             return _done(results, r, item)
@@ -138,7 +154,7 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
                 product_mod.select_option(page, label)
                 stats_by_option[label] = product_mod.count_sales(page, settings.lookback_days, settings.min_fast_sales, label)
             except product_mod.SkipProduct as e:
-                stats_by_option[label] = f"거래량을 세지 못함: {e}"
+                stats_by_option[label] = _skip_detail(e) if isinstance(e, product_mod.SalesNotLoaded) else f"거래량을 세지 못함: {e}"
         try:
             product_mod.close_sales_panel(page)
         except product_mod.SkipProduct:
@@ -210,7 +226,7 @@ def _judge_and_bid(page: Page, r: ProductResult, stats: product_mod.SalesStats, 
             return
         _place_bid(page, r, settings)
     except product_mod.SkipProduct as e:
-        r.status, r.detail = "건너뜀", str(e)
+        r.status, r.detail = "건너뜀", _skip_detail(e)
     except bid_mod.StoppedBeforeSubmit as e:
         r.status, r.detail = "중단", str(e)
     except bid_mod.BidAborted as e:
@@ -258,20 +274,32 @@ def _open_bid_detail(ob: "OpenBid") -> str:
 def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
         should_stop: Callable[[], bool] | None = None,
         on_result: Callable[[ProductResult], None] | None = None,
-        open_bids: "OpenBids | None" = None) -> list[ProductResult]:
+        open_bids: "OpenBids | None" = None,
+        page: Page | None = None,
+        on_status: Callable[[str], None] | None = None) -> list[ProductResult]:
     """open_bids: 마이페이지 구매 입찰 탭에 지금 살아 있는 입찰 (cancel.OpenBids).
 
     거기에 있는 상품(옵션)만 건너뛴다. 그 밖의 상품은 (예전에 입찰했다가 체결·만료로 사라진 것도) 기준에 따라 다시 판정해
     조건이 맞으면 입찰을 시도하고, 시도가 안 되면 건너뛰고 다음 상품으로 간다.
     ONE SIZE 입찰이 있는 상품은 상품 페이지를 열지 않고 바로 건너뛴다. 옵션 상품은 입찰 중인 옵션만 건너뛰고 나머지 옵션은 본다.
     `data/bids.json` 은 건너뛰기 기준이 아니라 목록의 입찰을 상품 ID 로 잇는 기록으로만 쓴다.
+
+    사이트가 체결 내역을 안 주는 시간대: 상품이 연달아 TROUBLE_STREAK 개 판단 불가·오류로 끝나면 (옵션 상품은 모든 옵션이)
+    더 열지 않고 멈춘 채 2분마다 확인, 다시 주면 로그인 상태를 확인하고 그 상품들부터 다시 본다 (앞서 남긴 판단 불가 결과는
+    바꿔 넣는다). 사용자가 중지할 때까지 기다린다.
+    page: 로그인 확인용 메인 탭 (없으면 확인만 건너뜀). on_status: GUI 상태 한 줄.
     """
+    stop = should_stop or (lambda: False)
+    status = on_status or (lambda _t: None)
     results: list[ProductResult] = []
+    queue = list(items)
     done = 0
-    for item in items:
-        if should_stop and should_stop():
-            log.info("사용자 요청으로 중지 - 남은 %d개는 보지 않음", len(items) - done)
+    trouble_streak: list[RankedProduct] = []   # 연달아 판단 불가·오류로 끝난 상품 (사이트가 풀리면 다시 본다)
+    while queue:
+        if stop():
+            log.info("사용자 요청으로 중지 - 남은 %d개는 보지 않음", len(queue))
             break
+        item = queue.pop(0)
         done += 1
         ob = open_bids.find(item.product_id, ONE_SIZE) if open_bids is not None and not settings.force else None
         if ob is not None:
@@ -283,8 +311,47 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
             if on_result:
                 on_result(results[-1])
             continue
-        for r in process_product(context, item, settings, open_bids):
+        status(f"[{item.category}] {item.rank}위 {item.name[:24]} 확인 중 ({done}/{len(items)})")
+        product_results = process_product(context, item, settings, open_bids)
+        for r in product_results:
             results.append(r)
             if on_result:
                 on_result(r)
+        if product_results and all(is_site_trouble(r) for r in product_results):
+            trouble_streak.append(item)
+        else:
+            trouble_streak = []
+        if len(trouble_streak) < TROUBLE_STREAK:
+            continue
+
+        log.warning("판단 불가·오류가 %d개 상품 연달아 남 - 사이트가 체결 내역을 안 주는 듯해 멈춤. 2분마다 확인하고 "
+                    "다시 주면 이 %d개부터 이어서 봄", len(trouble_streak), len(trouble_streak))
+        probe_item = trouble_streak[-1]
+        if not wait_until_site_back(lambda: _site_gives_sales(context, probe_item), stop, status):
+            break
+        if page is not None:
+            try:
+                auth.ensure_logged_in(page, settings)
+            except Exception:  # noqa: BLE001
+                log.exception("멈췄다 이어가며 로그인 상태를 확인하지 못함 - 그대로 이어서 봄")
+        # 판단 불가로 남긴 결과를 빼고 그 상품들을 맨 앞에 다시 넣는다
+        retry_ids = {it.product_id for it in trouble_streak}
+        results = [r for r in results if not (r.product_id in retry_ids and is_site_trouble(r))]
+        queue = trouble_streak + queue
+        done -= len(trouble_streak)
+        trouble_streak = []
     return results
+
+
+def _site_gives_sales(context: BrowserContext, item: RankedProduct) -> bool:
+    """사이트가 체결 내역을 다시 주는지 - 막혔던 상품의 페이지를 새 탭에 열고 패널 표가 그려지는지 본다."""
+    tab = context.new_page()
+    try:
+        ok, note = product_mod.sales_available(tab, item.url)
+        log.info("확인: %s", note)
+        return ok
+    finally:
+        try:
+            tab.close()
+        except Exception:  # noqa: BLE001
+            pass

@@ -350,7 +350,8 @@ class App:
 
     def _worker(self, settings: Settings, categories: list[str]) -> None:
         try:
-            job = run_job(settings, categories, should_stop=self.stop_flag.is_set)
+            job = run_job(settings, categories, should_stop=self.stop_flag.is_set,
+                          on_status=lambda text: self.q.put(("status", text)))
             self.q.put(("done", job))
         except Exception as e:  # noqa: BLE001
             logging.getLogger("gui").exception("실행 중 오류")

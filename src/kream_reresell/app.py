@@ -84,7 +84,9 @@ def normalize_categories(categories: str | list[str] | None) -> list[str]:
 def run_job(settings: Settings, categories: str | list[str] | None = None,
             product_ids: list[int] | None = None,
             should_stop: Callable[[], bool] | None = None,
-            on_result: Callable[[ProductResult], None] | None = None) -> JobResult:
+            on_result: Callable[[ProductResult], None] | None = None,
+            on_status: Callable[[str], None] | None = None) -> JobResult:
+    """[입찰]. on_status: 상태 한 줄 (GUI 상태 표시용 - 사이트가 내역을 안 줘 멈춰 있을 때 그 사정을 보인다)."""
     settings.validate()
     categories = normalize_categories(categories)
     mode = describe_mode(settings)
@@ -104,7 +106,8 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
             items = [ranking.RankedProduct(rank=i + 1, product_id=pid, name=str(pid), price=None,
                                            url=f"https://kream.co.kr/products/{pid}", category="지정")
                      for i, pid in enumerate(product_ids)]
-            results = pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result, open_bids=open_bids)
+            results = pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
+                                   open_bids=open_bids, page=page, on_status=on_status)
         else:
             for n, category in enumerate(categories, start=1):
                 if should_stop and should_stop():
@@ -125,7 +128,8 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
                     continue
                 for it in items:
                     log.info("  %2d위 %s %s %s", it.rank, it.name, f"{it.price:,}원" if it.price else "", it.url)
-                results.extend(pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result, open_bids=open_bids))
+                results.extend(pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
+                                            open_bids=open_bids, page=page, on_status=on_status))
 
     log.info("==== 결과 ====")
     for r in results:
