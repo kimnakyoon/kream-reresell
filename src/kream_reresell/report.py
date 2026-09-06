@@ -37,7 +37,7 @@ class ProductResult:
     product_id: int
     name: str
     url: str
-    category: str = ""          # 랭킹 상품군 (가방, 신발 ...)
+    category: str = ""          # 랭킹 (가방, 신발 ...)
     option: str = ""            # 옵션(사이즈) 화면 표기 (W240, M ...). ONE SIZE 상품은 비움
     size: str = ""              # 구매 페이지 주소의 size 값 (240). 입찰 기록(bids.json)에 남긴다
     status: str = ""            # 입찰완료 / 입찰대상(dry-run) / 건너뜀 / 중단 / 오류 / 확인필요
@@ -65,7 +65,7 @@ class ProductResult:
 
 
 COLUMNS = [
-    ("상품군", 10), ("순위", 6), ("상품명", 46), ("옵션", 9), ("상품ID", 10), ("판정", 12), ("사유 / 결과", 46),
+    ("랭킹", 10), ("순위", 6), ("상품명", 46), ("옵션", 9), ("상품ID", 10), ("판정", 12), ("사유 / 결과", 46),
     ("30일 빠른배송", 13), ("30일 전체", 10), ("A 빠른배송가", 14), ("B 즉시판매가", 14),
     ("A−B", 11), ("마진율", 9), ("기준마진", 9), ("입찰가", 12), ("입찰기한", 9), ("처리시각", 20), ("링크", 40),
 ]
@@ -94,7 +94,7 @@ REBID_LEGEND = ("판정: 변경완료 = 밀린 입찰의 희망가를 B 로 올�
                 "입찰취소 = 밀렸는데 기준 미달이거나, 즉시 판매가가 없거나, 변경 화면이 예상과 달라 못 올려 입찰을 지움 / "
                 "취소대상 = dry-run에서 지울 대상 / 변경안함 = 기준은 충족하나 A 가 상품 금액 상한을 넘어 그대로 둠 / "
                 "변경못함 = 희망가·옵션을 못 읽어 변경 화면까지 못 감 / 확인필요 = 판단 불가 또는 올렸는지 불확실 - 마이페이지에서 확인. "
-                "상품군 열 = 몇 번째 사이클인지, 입찰가 열 = 처리 뒤 내 희망가")
+                "랭킹 열 = 몇 번째 사이클인지, 입찰가 열 = 처리 뒤 내 희망가")
 LEGENDS = {"입찰": BID_LEGEND, "입찰취소": CANCEL_LEGEND, "재입찰": REBID_LEGEND}
 
 
@@ -148,7 +148,7 @@ def write_report(results: list[ProductResult], settings_line: str, mode: str,
                 ws.cell(row=i, column=col).fill = PatternFill("solid", fgColor=fill)
     ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(COLUMNS))}{header_row + max(len(results), 1)}"
 
-    # 요약 시트: 판정별 합계 + 상품군별 판정 수
+    # 요약 시트: 판정별 합계 + 랭킹별 판정 수
     ss = wb.create_sheet("요약")
     counts: dict[str, int] = {}
     for r in results:
@@ -169,7 +169,7 @@ def write_report(results: list[ProductResult], settings_line: str, mode: str,
     if len(categories) > 1:
         row += 1
         statuses = sorted(counts)
-        ss.cell(row=row, column=1, value="상품군").font = Font(bold=True)
+        ss.cell(row=row, column=1, value="랭킹").font = Font(bold=True)
         for j, st in enumerate(statuses, start=2):
             ss.cell(row=row, column=j, value=st).font = Font(bold=True)
         for cat in categories:

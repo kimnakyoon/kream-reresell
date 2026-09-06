@@ -1,6 +1,7 @@
 """KREAM 리리셀 - 더블클릭으로 실행하는 창 (송장 자동화 GUI 와 같은 방식).
 
-[입찰] 을 누르면 랭킹 → 상품 → 입찰까지 자동으로 진행한다. 크롬은 화면 밖에서 돌아가고
+[입찰] 을 누르면 랭킹(또는 검색 결과) → 상품 → 입찰까지 자동으로 진행한다. '상품 고르기' 에서 랭킹 / 검색을 고르면
+그쪽 설정만 보인다 (검색: 검색어 + 검색 결과 앞에서부터 시도할 상품 수). 크롬은 화면 밖에서 돌아가고
 (작업표시줄에만 남음) 진행 상황은 이 창에만 표시된다. [크롬 창 보기] 를 켜면 실행 중에도 불러올 수 있다.
 [입찰취소] 는 마이페이지 > 구매 내역 > 구매 입찰 목록을 순서대로 다시 판정해 기준 미달 입찰을 지운다.
 [재입찰] 은 같은 목록을 설정칸에 정한 횟수만큼 돌며(기본 1회, 0 이면 [중지] 까지 계속), 즉시 판매가가 내 희망가보다
@@ -35,7 +36,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from kream_reresell import browser  # noqa: E402
-from kream_reresell.app import run_cancel_job, run_history_job, run_job, run_rebid_job  # noqa: E402
+from kream_reresell.app import normalize_keywords, run_cancel_job, run_history_job, run_job, run_rebid_job  # noqa: E402
 from kream_reresell.config import LOG_DIR, RULES_PATH, Settings  # noqa: E402
 from kream_reresell.ranking import ALL_CATEGORIES, DEFAULT_CATEGORY  # noqa: E402
 from kream_reresell.report import REPORT_DIR  # noqa: E402
@@ -45,7 +46,7 @@ WINDOW_WIDTH = 660
 WINDOW_HEIGHT = 900
 RIGHT_MARGIN = 40
 
-# 상품군 체크박스는 랭킹 칩 순서(ALL_CATEGORIES)대로 나열하고, 체크한 것을 그 순서대로 실행한다.
+# 랭킹 체크박스는 랭킹 칩 순서(ALL_CATEGORIES)대로 나열하고, 체크한 것을 그 순서대로 실행한다.
 CATEGORY_COLUMNS = 6
 
 
@@ -84,8 +85,21 @@ class App:
         frame = tk.LabelFrame(root, text="실행 설정")
         frame.pack(fill="x", padx=12, pady=(12, 4))
 
-        # 상품군: 전부 나열해 두고 체크한 것을 위→아래, 왼쪽→오른쪽(랭킹 칩 순서) 순으로 실행한다
-        cat_frame = tk.LabelFrame(frame, text="상품군 (체크한 것을 나열된 순서대로 실행)")
+        # 상품을 어디서 고를지: 랭킹(순위대로) / 검색(검색 결과 순서대로). 고른 쪽의 설정만 보인다 (창이 좁아서)
+        src_row = tk.Frame(frame)
+        src_row.pack(fill="x", padx=12, pady=(8, 0))
+        tk.Label(src_row, text="상품 고르기:", font=("맑은 고딕", 9, "bold")).pack(side="left")
+        self.source = tk.StringVar(value="ranking")
+        tk.Radiobutton(src_row, text="랭킹 (랭킹 탭의 순위대로)", variable=self.source, value="ranking",
+                       command=self._show_source).pack(side="left", padx=(10, 0))
+        tk.Radiobutton(src_row, text="검색 (검색 결과 순서대로)", variable=self.source, value="search",
+                       command=self._show_source).pack(side="left", padx=(10, 0))
+        self.source_area = tk.Frame(frame)
+        self.source_area.pack(fill="x")
+
+        # ---- 랭킹 화면: 전부 나열해 두고 체크한 것을 위→아래, 왼쪽→오른쪽(랭킹 칩 순서) 순으로 실행한다
+        self.ranking_frame = tk.Frame(self.source_area)
+        cat_frame = tk.LabelFrame(self.ranking_frame, text="랭킹 (체크한 것을 나열된 순서대로 실행)")
         cat_frame.pack(fill="x", padx=12, pady=(6, 2))
         self.category_vars: dict[str, tk.BooleanVar] = {}
         grid = tk.Frame(cat_frame)
@@ -104,14 +118,43 @@ class App:
         tk.Label(sel, text="※ 신발·의류처럼 사이즈 옵션이 있는 상품은 옵션마다 따로 판정해 입찰합니다 (보고서에 옵션마다 한 줄)",
                  fg="#888").pack(side="left", padx=(12, 0))
 
-        row1 = tk.Frame(frame)
+        row1 = tk.Frame(self.ranking_frame)
         row1.pack(fill="x", **pad)
-        tk.Label(row1, text="상품군마다 볼 상품 수").pack(side="left")
+        tk.Label(row1, text="랭킹마다 볼 상품 수").pack(side="left")
         self.limit = tk.Spinbox(row1, from_=1, to=200, width=6)
         self.limit.delete(0, "end")
         self.limit.insert(0, str(self.base.max_products))
         self.limit.pack(side="left", padx=(6, 0))
         tk.Label(row1, text="([입찰] 에만 쓰임)", fg="#888").pack(side="left", padx=(6, 0))
+
+        # ---- 검색 화면: 검색어 + 시도할 상품 수 (+ 빠른배송 필터)
+        self.search_frame = tk.Frame(self.source_area)
+        s_frame = tk.LabelFrame(self.search_frame, text="검색 (검색 결과에 나온 순서대로 한 개씩 판정)")
+        s_frame.pack(fill="x", padx=12, pady=(6, 2))
+        s_row1 = tk.Frame(s_frame)
+        s_row1.pack(fill="x", padx=6, pady=(6, 2))
+        tk.Label(s_row1, text="검색어").pack(side="left")
+        self.keyword_entry = tk.Entry(s_row1, width=34, font=("맑은 고딕", 10))
+        self.keyword_entry.pack(side="left", padx=(6, 0))
+        tk.Label(s_row1, text="(여러 개면 쉼표로 구분 - 적은 순서대로 검색)", fg="#888").pack(side="left", padx=(8, 0))
+        s_row2 = tk.Frame(s_frame)
+        s_row2.pack(fill="x", padx=6, pady=2)
+        tk.Label(s_row2, text="시도할 상품 수").pack(side="left")
+        self.search_limit = tk.Spinbox(s_row2, from_=1, to=500, width=6)
+        self.search_limit.delete(0, "end")
+        self.search_limit.insert(0, str(self.base.max_products))
+        self.search_limit.pack(side="left", padx=(6, 0))
+        tk.Label(s_row2, text="(입찰 성공 수가 아니라, 검색 결과 앞에서부터 판정해 볼 상품 수 - 검색어마다)",
+                 fg="#888").pack(side="left", padx=(8, 0))
+        s_row3 = tk.Frame(s_frame)
+        s_row3.pack(fill="x", padx=6, pady=(2, 4))
+        self.search_quick = tk.BooleanVar(value=self.base.search_quick_only)
+        tk.Checkbutton(s_row3, text="빠른배송 판매자가 있는 상품만 (검색 결과의 '빠른배송' 필터, 권장)",
+                       variable=self.search_quick, anchor="w").pack(side="left")
+        tk.Label(s_frame, text="※ 빠른배송 판매자가 없는 상품은 A(빠른배송 가격)를 읽을 수 없어 어차피 건너뛰므로, 필터를 켜면 "
+                               "그런 상품에 낭비되는 요청(사이트 스로틀 대상)을 아낍니다. 판정·입찰 규칙은 랭킹과 똑같습니다.",
+                 fg="#888", anchor="w", justify="left", wraplength=580).pack(fill="x", padx=6, pady=(0, 6))
+        self._show_source()
 
         # 재입찰: 몇 바퀴 돌지 + 바퀴 시작 간격
         row_rebid = tk.Frame(frame)
@@ -141,7 +184,7 @@ class App:
         cond = (f"조건: 최근 {self.base.lookback_days}일 빠른배송 {self.base.min_fast_sales}건 이상 · "
                 f"마진 (A−B) > A×[아래 입찰 기준의 구간별 %] · 입찰 {self.base.bid_days}일 · 창고보관 · 포인트 최대 사용")
         tk.Label(frame, text=cond, fg="#555", anchor="w", justify="left", wraplength=580).pack(fill="x", padx=12, pady=(0, 6))
-        tk.Label(frame, text="(거래량·기간·입찰기한은 프로젝트 폴더의 .env 에서 바꿉니다. 상품군·상품 수는 [입찰]에만, "
+        tk.Label(frame, text="(거래량·기간·입찰기한은 프로젝트 폴더의 .env 에서 바꿉니다. 랭킹·검색어·상품 수는 [입찰]에만, "
                              "재입찰 횟수·사이클 간격은 [재입찰]에만 쓰입니다)",
                  fg="#888", anchor="w", justify="left", wraplength=600).pack(fill="x", padx=12, pady=(0, 6))
 
@@ -316,52 +359,84 @@ class App:
             self._log(f"입찰 기준 저장: {rules.describe()}  ({RULES_PATH})")
 
     # ------------------------------------------------------------ 실행
+    def _show_source(self) -> None:
+        """'상품 고르기' 에서 고른 쪽(랭킹 / 검색)의 설정만 보인다."""
+        if self.source.get() == "search":
+            self.ranking_frame.pack_forget()
+            self.search_frame.pack(fill="x")
+            self.keyword_entry.focus_set()
+        else:
+            self.search_frame.pack_forget()
+            self.ranking_frame.pack(fill="x")
+
     def _set_all_categories(self, value: bool) -> None:
         for var in self.category_vars.values():
             var.set(value)
 
     def selected_categories(self) -> list[str]:
-        """체크된 상품군을 나열된(랭킹 칩) 순서대로."""
+        """체크된 랭킹을 나열된(랭킹 칩) 순서대로."""
         return [name for name in ALL_CATEGORIES if self.category_vars[name].get()]
 
     def start(self) -> None:
         if self.worker and self.worker.is_alive():
             return
+        searching = self.source.get() == "search"
+        limit_box = self.search_limit if searching else self.limit
         try:
-            limit = int(self.limit.get())
+            limit = int(limit_box.get())
         except ValueError:
             messagebox.showerror("입력 오류", "상품 수는 숫자로 넣어주세요.")
             return
-        categories = self.selected_categories()
-        if not categories:
-            messagebox.showerror("입력 오류", "상품군을 하나 이상 체크해 주세요.")
+        if limit < 1:
+            messagebox.showerror("입력 오류", "상품 수는 1 이상이어야 합니다.")
             return
-        cat_text = " → ".join(categories)
+        categories: list[str] = []
+        keywords: list[str] = []
+        if searching:
+            keywords = normalize_keywords(self.keyword_entry.get())
+            if not keywords:
+                messagebox.showerror("입력 오류", "검색어를 넣어주세요.")
+                self.keyword_entry.focus_set()
+                return
+            quick = self.search_quick.get()
+            src_text = " → ".join(keywords)
+            what = (f"검색 {len(keywords)}개를 순서대로 돌며 각각 검색 결과 앞에서부터 {limit}개"
+                    f"{' (빠른배송 판매자가 있는 상품만)' if quick else ''} 중 조건에 맞는 상품에")
+            log_head = f"검색 {src_text} / 검색어마다 {limit}개 시도{' (빠른배송 필터)' if quick else ' (필터 없음)'}"
+        else:
+            categories = self.selected_categories()
+            if not categories:
+                messagebox.showerror("입력 오류", "랭킹을 하나 이상 체크해 주세요.")
+                return
+            src_text = " → ".join(categories)
+            what = f"랭킹 {len(categories)}개를 순서대로 돌며 각각 상위 {limit}개 중 조건에 맞는 상품에"
+            log_head = f"{src_text} / 랭킹마다 상위 {limit}개"
         rules = self._apply_rules()
         if rules is None:
             return
         dry = self.mode.get() == "dry"
         if not dry and not messagebox.askyesno(
-                "실제 입찰", f"상품군 {len(categories)}개를 순서대로 돌며 각각 상위 {limit}개 중 조건에 맞는 상품에 "
-                             f"실제로 구매 입찰을 넣습니다.\n\n{cat_text}\n\n{rules.describe()}\n\n"
+                "실제 입찰", f"{what} 실제로 구매 입찰을 넣습니다.\n\n{src_text}\n\n{rules.describe()}\n\n"
                              "배송방법은 창고보관, 포인트는 최대 사용입니다.\n\n진행할까요?"):
             return
 
         settings = self._make_settings(dry, rules)
         settings.max_products = limit
+        if searching:
+            settings.search_quick_only = self.search_quick.get()
         self.stop_flag.clear()
         self.last_report = None
         self.open_report_button.configure(state="disabled")
         self._set_busy(True, "실행 중...")
-        self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 시작: {cat_text} / 상품군마다 상위 {limit}개, "
+        self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 시작: {log_head}, "
                   f"{'판단만' if dry else '실제 입찰'} =====\n입찰 기준: {rules.describe()}")
 
-        self.worker = threading.Thread(target=self._worker, args=(settings, categories), daemon=True)
+        self.worker = threading.Thread(target=self._worker, args=(settings, categories, keywords), daemon=True)
         self.worker.start()
 
-    def _worker(self, settings: Settings, categories: list[str]) -> None:
+    def _worker(self, settings: Settings, categories: list[str], keywords: list[str]) -> None:
         try:
-            job = run_job(settings, categories, should_stop=self.stop_flag.is_set,
+            job = run_job(settings, categories, keywords=keywords, should_stop=self.stop_flag.is_set,
                           on_status=lambda text: self.q.put(("status", text)))
             self.q.put(("done", job))
         except Exception as e:  # noqa: BLE001

@@ -50,6 +50,9 @@ class Settings:
     rules: BidRules = field(default_factory=lambda: BidRules.load(RULES_PATH, _float("MIN_MARGIN_RATE", 0.10)))
     bid_days: int = field(default_factory=lambda: _int("BID_DAYS", 7))
     max_products: int = field(default_factory=lambda: _int("MAX_PRODUCTS", 30))
+    # [입찰] 검색 모드: 검색 결과에 '빠른배송' 필터(delivery_method=quick_delivery)를 걸어 빠른배송 판매자가 있는 상품만 본다.
+    # 판매자가 없는 상품은 어차피 A 를 못 읽어 건너뛰므로 기본 켬 - 스로틀 대상 요청을 아낀다. 0 이면 필터 없이 전부 본다
+    search_quick_only: bool = field(default_factory=lambda: _bool("SEARCH_QUICK_ONLY", True))
     # [재입찰] 사이클 시작 간격(분). 구매 입찰 목록을 한 바퀴 돈 뒤 다음 바퀴를 이 간격으로 시작한다 (봇 탐지 대비, 1분 이상)
     rebid_interval_min: float = field(default_factory=lambda: _float("REBID_INTERVAL_MIN", 5))
     # [재입찰] 몇 사이클 돌고 끝낼지 (GUI "재입찰 횟수" 칸의 기본값). 0 이면 [중지]/Ctrl+C 까지 계속

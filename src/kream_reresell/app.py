@@ -1,7 +1,7 @@
 """한 번의 실행(브라우저 띄우기 → 로그인 → 랭킹 → 상품 처리 → 엑셀 보고서) 을 묶은 진입점.
 
 명령행(scripts/run.py) 과 GUI(scripts/gui.pyw) 가 같이 쓴다.
-상품군을 여러 개 주면 준 순서대로 하나씩 랭킹을 열어 처리하고, 결과는 엑셀 보고서 하나에 모은다.
+랭킹을 여러 개 주면 준 순서대로 하나씩 랭킹을 열어 처리하고, 결과는 엑셀 보고서 하나에 모은다.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from playwright.sync_api import sync_playwright
 
 from datetime import datetime
 
-from . import auth, cancel, history, history_report, pacing, pipeline, ranking, rebid, report
+from . import auth, cancel, history, history_report, pacing, pipeline, ranking, rebid, report, search
 from .browser import real_chrome_context
 from .config import Settings
 from .history import HistoryResult
@@ -60,11 +60,29 @@ def describe_mode(settings: Settings, kind: str = "입찰") -> str:
     return f"실제 {kind}"
 
 
-def describe_settings(settings: Settings, categories: list[str]) -> str:
+def describe_settings(settings: Settings, categories: list[str], keywords: list[str] | None = None) -> str:
+    if keywords:
+        source = (f"검색 {' → '.join(repr(k) for k in keywords)} (검색어마다 결과 순서대로 {settings.max_products}개 시도"
+                  f"{', 빠른배송 필터' if settings.search_quick_only else ', 필터 없음'})")
+    else:
+        source = f"랭킹 {' → '.join(categories)} (랭킹마다 {settings.max_products}개)"
     return (f"조건: 최근 {settings.lookback_days}일 빠른배송 {settings.min_fast_sales}건 이상, "
-            f"{settings.rules.describe()}, 입찰기한 {settings.bid_days}일, "
-            f"상품군 {' → '.join(categories)} (상품군마다 {settings.max_products}개)"
+            f"{settings.rules.describe()}, 입찰기한 {settings.bid_days}일, {source}"
             + (", 조건 무시(--force)" if settings.force else ""))
+
+
+def normalize_keywords(keywords: str | list[str] | None) -> list[str]:
+    """검색어: 문자열 하나(쉼표로 여러 개) / 목록 → 순서를 지키고 빈 것·중복을 뺀 목록."""
+    if not keywords:
+        return []
+    if isinstance(keywords, str):
+        keywords = keywords.split(",")
+    out: list[str] = []
+    for k in keywords:
+        k = " ".join(k.split())
+        if k and k not in out:
+            out.append(k)
+    return out
 
 
 def normalize_categories(categories: str | list[str] | None) -> list[str]:
@@ -81,16 +99,51 @@ def normalize_categories(categories: str | list[str] | None) -> list[str]:
     return out or [DEFAULT_CATEGORY]
 
 
+def skip_low_trades(items: list[ranking.RankedProduct], settings: Settings,
+                    on_result: Callable[[ProductResult], None] | None = None
+                    ) -> tuple[list[ranking.RankedProduct], list[ProductResult]]:
+    """카드에 적힌 전체 거래 수가 기준(min_fast_sales)보다 적은 상품은 상품 페이지를 열지 않고 건너뛴다.
+
+    전체 거래 수 ≥ 기간 내 빠른배송 건수이므로 전체가 기준 미달이면 기간 내 빠른배송도 반드시 미달이다 - 판정이 달라지지 않으면서
+    상품 페이지·체결 내역 요청(사이트 스로틀 대상)을 아낀다. 거래 수를 모르는 카드와 --force 는 그대로 본다.
+    돌려주는 것: (볼 상품, 건너뛴 결과). 건너뛴 것도 '시도한 상품 수' 에 든다 (보고서에 한 줄).
+    """
+    if settings.force:
+        return items, []
+    keep: list[ranking.RankedProduct] = []
+    skipped: list[ProductResult] = []
+    for it in items:
+        if it.trades is None or it.trades >= settings.min_fast_sales:
+            keep.append(it)
+            continue
+        r = ProductResult(rank=it.rank, product_id=it.product_id, name=it.name, url=it.url, category=it.category,
+                          status="건너뜀", total_sales=it.trades,
+                          detail=f"카드의 전체 거래 {it.trades}건 < {settings.min_fast_sales}건 (상품 페이지 열지 않음)")
+        log.info("[%s %d위] %s - %s", it.category, it.rank, it.name, r.detail)
+        skipped.append(r)
+        if on_result:
+            on_result(r)
+    if skipped:
+        log.info("전체 거래 수가 기준 미달인 상품 %d개는 상품 페이지를 열지 않고 건너뜀", len(skipped))
+    return keep, skipped
+
+
 def run_job(settings: Settings, categories: str | list[str] | None = None,
             product_ids: list[int] | None = None,
             should_stop: Callable[[], bool] | None = None,
             on_result: Callable[[ProductResult], None] | None = None,
-            on_status: Callable[[str], None] | None = None) -> JobResult:
-    """[입찰]. on_status: 상태 한 줄 (GUI 상태 표시용 - 사이트가 내역을 안 줘 멈춰 있을 때 그 사정을 보인다)."""
+            on_status: Callable[[str], None] | None = None,
+            keywords: str | list[str] | None = None) -> JobResult:
+    """[입찰]. on_status: 상태 한 줄 (GUI 상태 표시용 - 사이트가 내역을 안 줘 멈춰 있을 때 그 사정을 보인다).
+
+    상품을 고르는 방식은 셋 중 하나: product_ids (지정 상품) > keywords (검색 결과 순서대로, 검색어마다 max_products 개 시도)
+    > categories (랭킹 순위대로). 검색·랭킹 뒤의 판정·입찰 규칙은 똑같다 (pipeline).
+    """
     settings.validate()
     categories = normalize_categories(categories)
+    keywords = normalize_keywords(keywords)
     mode = describe_mode(settings)
-    settings_line = describe_settings(settings, categories)
+    settings_line = describe_settings(settings, categories, keywords)
     log.info("%s | %s", mode, settings_line)
 
     results: list[ProductResult] = []
@@ -108,17 +161,52 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
                      for i, pid in enumerate(product_ids)]
             results = pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
                                    open_bids=open_bids, page=page, on_status=on_status)
+        elif keywords:
+            for n, keyword in enumerate(keywords, start=1):
+                if should_stop and should_stop():
+                    log.info("사용자 요청으로 중지 - 남은 검색어 %s 은 보지 않음", ", ".join(keywords[n - 1:]))
+                    break
+                label = search.category_label(keyword)
+                log.info("===== 검색 %d/%d: '%s' =====", n, len(keywords), keyword)
+                try:
+                    search.open_search(page, keyword, settings.search_quick_only)
+                    items = search.collect_products(page, settings.max_products, keyword, settings.search_quick_only)
+                except Exception as e:  # noqa: BLE001
+                    log.exception("검색 '%s' 결과를 열지 못해 건너뜀", keyword)
+                    results.append(ProductResult(
+                        rank=0, product_id=0, name=f"[{label}] 검색 결과 열기 실패",
+                        url=search.search_url(keyword, settings.search_quick_only), category=label,
+                        status="오류", detail=f"{type(e).__name__}: {e}"))
+                    if on_result:
+                        on_result(results[-1])
+                    continue
+                if not items:
+                    log.info("검색 '%s': 볼 상품이 없음", keyword)
+                    results.append(ProductResult(
+                        rank=0, product_id=0, name=f"[{label}] 검색 결과 없음",
+                        url=search.search_url(keyword, settings.search_quick_only), category=label,
+                        status="건너뜀", detail="검색 결과가 없음" + (" (빠른배송 필터)" if settings.search_quick_only else "")))
+                    if on_result:
+                        on_result(results[-1])
+                    continue
+                for it in items:
+                    log.info("  %2d번째 %s %s %s %s", it.rank, it.name, f"{it.price:,}원" if it.price else "",
+                             f"거래 {it.trades:,}" if it.trades is not None else "", it.url)
+                items, skipped = skip_low_trades(items, settings, on_result)
+                results.extend(skipped)
+                results.extend(pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
+                                            open_bids=open_bids, page=page, on_status=on_status))
         else:
             for n, category in enumerate(categories, start=1):
                 if should_stop and should_stop():
-                    log.info("사용자 요청으로 중지 - 남은 상품군 %s 은 보지 않음", ", ".join(categories[n - 1:]))
+                    log.info("사용자 요청으로 중지 - 남은 랭킹 %s 은 보지 않음", ", ".join(categories[n - 1:]))
                     break
-                log.info("===== 상품군 %d/%d: %s =====", n, len(categories), category)
+                log.info("===== 랭킹 %d/%d: %s =====", n, len(categories), category)
                 try:
                     ranking.open_category(page, category)
                     items = ranking.collect_products(page, settings.max_products, category)
                 except Exception as e:  # noqa: BLE001
-                    log.exception("상품군 '%s' 랭킹을 열지 못해 건너뜀", category)
+                    log.exception("랭킹 '%s' 랭킹을 열지 못해 건너뜀", category)
                     results.append(ProductResult(
                         rank=0, product_id=0, name=f"[{category}] 랭킹 열기 실패",
                         url=ranking.RANKING_URL, category=category,
@@ -127,7 +215,10 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
                         on_result(results[-1])
                     continue
                 for it in items:
-                    log.info("  %2d위 %s %s %s", it.rank, it.name, f"{it.price:,}원" if it.price else "", it.url)
+                    log.info("  %2d위 %s %s %s %s", it.rank, it.name, f"{it.price:,}원" if it.price else "",
+                             f"거래 {it.trades:,}" if it.trades is not None else "", it.url)
+                items, skipped = skip_low_trades(items, settings, on_result)
+                results.extend(skipped)
                 results.extend(pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
                                             open_bids=open_bids, page=page, on_status=on_status))
 
