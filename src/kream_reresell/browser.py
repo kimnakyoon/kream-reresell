@@ -35,7 +35,7 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import BrowserContext, Playwright
 
-from . import pacing, winproc
+from . import hangwatch, pacing, winproc
 from .config import ROOT
 
 log = logging.getLogger(__name__)
@@ -369,8 +369,11 @@ def real_chrome_context(playwright: Playwright, window_size: str = "1400,1000",
         if block_images:
             block_heavy_resources(context)
         watch_api_requests(context, trim=trim_api)
+        # 탭의 렌더러가 완전히 멈춰 호출이 영영 안 돌아오면 그 탭을 닫아 이어가게 한다 (hangwatch 참고, 2026-09-06 실측)
+        hangwatch.start(context, port)
         yield context
     finally:
+        hangwatch.stop()
         _active_window = None
         if browser is not None:
             # 정상 종료를 요청해야 프로필(쿠키)이 디스크에 남는다

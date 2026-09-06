@@ -35,6 +35,9 @@ product.NoFastDelivery) 그 입찰도 지운다 (사용자 결정 2026-09-06 - �
 넘어가도 (로그인 화면 주소에도 returnUrl 로 tab=bidding 이 들어가 0건으로 읽히던 문제, 2026-09-05) 다시 로그인하고 목록을 다시 읽는다.
 크롬이 잠시 멈춰 화면을 안 그리면(product.PageStalled - '구매하기' 가 보이는데 눌리지 않고 스냅샷도 안 찍힘, 2026-09-06 실측 80초쯤)
 STALL_WAIT_SEC 까지 기다렸다가 다시 그려지면 그 입찰을 한 번 더 보고, 그래도 안 그리면 판단 불가(확인필요)로 남긴다.
+탭이 아예 멈춰 Playwright 호출이 시간 제한을 넘겨도 돌아오지 않으면 (2026-09-06 실측 160번째: 구매 페이지로 넘어간 직후 렌더러가
+멈춰 22분 넘게 대기, [중지]도 안 들음) 감시 스레드(hangwatch)가 그 탭을 닫아 호출을 오류로 끝내고, 여기서는 새 탭을 열어
+그 입찰을 한 번 더 본다. 새 탭에서도 또 멈추면 판단 불가(확인필요)로 남기고 다음 입찰로 간다.
 
 밀렸는데 기준(거래량 · 마진)에 못 미쳐 올릴 수 없는 입찰과, 밀리지 않았어도 마진(최신 A·B)이 기준에 못 미치는 입찰은 [입찰취소] 와 같은 방식으로 지운다
 (상세의 '입찰 지우기' → 확인창 → DELETE 204 확인, cancel.delete_bid). 판단할 수 없는 경우(상품 페이지 오류 등)는 지우지 않는다.
@@ -58,7 +61,7 @@ from urllib.parse import quote_plus, urlparse
 
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeout
 
-from . import auth, browser, pipeline
+from . import auth, browser, hangwatch, pipeline
 from . import bid as bid_mod
 from . import product as product_mod
 from .cancel import (CancelAborted, CancelUncertain, OpenBid, apply_known, delete_bid, ensure_product_id,
@@ -451,6 +454,12 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
     except CancelAborted as e:
         r.status, r.detail = "건너뜀", str(e)
     except Exception as e:  # noqa: BLE001
+        trip = hangwatch.tripped()
+        if trip is not None and page.is_closed():
+            # 감시 스레드가 멈춘 탭을 닫아 걸려 있던 호출이 오류로 끝난 것 - 상품·사이트 문제가 아니다 (run 이 새 탭으로 한 번 더 봄)
+            log.warning("[%d회차 %d번째] %s - 걸려 있던 호출: %s", cycle, bid.order, trip.describe(), str(e).splitlines()[0])
+            r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: {trip.describe()}"
+            return
         dump(page, f"rebid{bid.bid_id}_error")
         log.exception("입찰 #%d 재입찰 처리 중 오류", bid.bid_id)
         r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
@@ -501,6 +510,17 @@ def run(context: BrowserContext, page: Page, settings: Settings,
     # 입찰번호 -> 상품 ID. 파일(data/bid_products.json)에 남겨 두어 프로그램이 넣지 않은 입찰도 상세는 처음 한 번만 연다
     pid_cache = load_bid_products()
     tab: Page = context.new_page()   # 입찰마다 탭을 열고 닫지 않고 실행 내내 이 탭을 다시 쓴다
+
+    def look(bid: OpenBid, cycle: int, trouble_streak: int) -> tuple[ProductResult, hangwatch.Trip | None]:
+        """입찰 하나를 본다. 탭이 (멈춰서) 닫혀 있으면 새로 열고, 보는 동안 감시 스레드가 탭을 닫았으면 그 기록도 돌려준다."""
+        nonlocal tab
+        if tab.is_closed():
+            tab = context.new_page()
+        # 스냅샷은 연달아 난 처음 몇 건만 남긴다 (사이트가 안 줄 때 수십 장 쌓이지 않게)
+        with hangwatch.watching(tab):
+            r = rebid_one(tab, bid, settings, cycle, diagnose=trouble_streak < TROUBLE_STREAK)
+        return r, hangwatch.take_trip()
+
     cycle = 0
     list_failures = 0
     while not stop():
@@ -509,7 +529,8 @@ def run(context: BrowserContext, page: Page, settings: Settings,
         api_calls_before = pacing.BUDGET.total
         status(f"재입찰 {cycle}회차: 구매 입찰 목록 읽는 중...")
         try:
-            bids = _list_bids(page, settings)
+            with hangwatch.watching(page):
+                bids = _list_bids(page, settings)
             list_failures = 0
         except Exception as e:  # noqa: BLE001
             list_failures += 1
@@ -541,10 +562,13 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                 log.info("사용자 요청으로 중지 - 남은 입찰 %d건은 보지 않음", len(bids) - len(cycle_results))
                 break
             status(f"재입찰 {cycle}회차: {bid.order}/{len(bids)} {bid.name[:24]}")
-            if tab.is_closed():
-                tab = context.new_page()
-            # 스냅샷은 연달아 난 처음 몇 건만 남긴다 (사이트가 안 줄 때 수십 장 쌓이지 않게)
-            r = rebid_one(tab, bid, settings, cycle, diagnose=trouble_streak < TROUBLE_STREAK)
+            r, trip = look(bid, cycle, trouble_streak)
+            if trip is not None:
+                # 탭이 멈춰 감시 스레드가 닫은 것 - 새 탭을 열어 그 입찰을 한 번 더 본다 (또 멈추면 그 결과(확인필요)로 둔다)
+                log.warning("[%d회차 %d번째] 탭이 멈춰 닫힘 (%s) - 새 탭을 열어 한 번 더 봄", cycle, bid.order, trip.describe())
+                r, trip = look(bid, cycle, trouble_streak)
+                if trip is not None:
+                    log.warning("[%d회차 %d번째] 새 탭에서도 멈춤 - 이 입찰은 확인필요로 두고 다음으로 감", cycle, bid.order)
             if bid.product_id and bid.size_value:
                 entry = {"product_id": bid.product_id, "size": bid.size_value, "option": bid.option or ONE_SIZE}
                 if pid_cache.get(bid.bid_id) != entry:
@@ -559,7 +583,11 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                 trouble_streak = 0
                 log.warning("판단 불가·오류가 %d건 연달아 남 - 사이트가 응답을 안 주는 듯해 멈춤. %d분마다 확인하고 "
                             "다시 주면 로그인 상태를 확인한 뒤 이어서 봄", TROUBLE_STREAK, PROBE_SEC // 60)
-                if not _wait_for_site(tab, bid, stop, lambda t: status(f"재입찰 {cycle}회차 ({bid.order}/{len(bids)} 까지 봄): {t}")):
+                if tab.is_closed():
+                    tab = context.new_page()
+                with hangwatch.watching(tab):
+                    back = _wait_for_site(tab, bid, stop, lambda t: status(f"재입찰 {cycle}회차 ({bid.order}/{len(bids)} 까지 봄): {t}"))
+                if not back:
                     break
                 try:
                     auth.ensure_logged_in(page, settings)

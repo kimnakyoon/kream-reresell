@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from playwright.sync_api import BrowserContext, Page
 
-from . import auth
+from . import auth, hangwatch
 from . import bid as bid_mod
 from . import product as product_mod
 from .config import Settings
@@ -118,6 +118,7 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
     open_bids 에 상품 ID 를 못 읽은 입찰이 있으면 상품 페이지 제목(= 마이페이지 표기)으로 대조해 이미 입찰 중이면 건너뛴다.
     """
     page: Page = context.new_page()
+    hangwatch.set_page(page)   # 탭이 아예 멈추면 감시 스레드가 닫는다 (이 상품은 오류로 끝나고 다음 상품은 새 탭) - hangwatch 참고
     pid = item.product_id
     results: list[ProductResult] = []
 
@@ -208,6 +209,8 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
         r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
         return _done(results, r, item)
     finally:
+        hangwatch.clear_page(page)
+        hangwatch.take_trip()
         try:
             page.close()
         except Exception:  # noqa: BLE001
