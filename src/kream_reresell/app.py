@@ -1,7 +1,7 @@
-"""한 번의 실행(브라우저 띄우기 → 로그인 → 랭킹 → 상품 처리 → 엑셀 보고서) 을 묶은 진입점.
+"""한 번의 실행(브라우저 띄우기 → 로그인 → 랭킹/검색/SHOP → 상품 처리 → 엑셀 보고서) 을 묶은 진입점.
 
 명령행(scripts/run.py) 과 GUI(scripts/gui.pyw) 가 같이 쓴다.
-랭킹을 여러 개 주면 준 순서대로 하나씩 랭킹을 열어 처리하고, 결과는 엑셀 보고서 하나에 모은다.
+랭킹(검색어, SHOP 카테고리)을 여러 개 주면 준 순서대로 하나씩 열어 처리하고, 결과는 엑셀 보고서 하나에 모은다.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from playwright.sync_api import sync_playwright
 
 from datetime import datetime
 
-from . import auth, cancel, history, history_report, pacing, pipeline, ranking, rebid, report, search
+from . import auth, cancel, history, history_report, pacing, pipeline, ranking, rebid, report, search, shop
 from .browser import real_chrome_context
 from .config import Settings
 from .history import HistoryResult
@@ -60,10 +60,14 @@ def describe_mode(settings: Settings, kind: str = "입찰") -> str:
     return f"실제 {kind}"
 
 
-def describe_settings(settings: Settings, categories: list[str], keywords: list[str] | None = None) -> str:
+def describe_settings(settings: Settings, categories: list[str], keywords: list[str] | None = None,
+                      shop_categories: list[str] | None = None) -> str:
     if keywords:
         source = (f"검색 {' → '.join(repr(k) for k in keywords)} (검색어마다 결과 순서대로 {settings.max_products}개 시도"
                   f"{', 빠른배송 필터' if settings.search_quick_only else ', 필터 없음'})")
+    elif shop_categories:
+        source = (f"SHOP {' → '.join(shop_categories)} (카테고리마다 나온 순서대로 {settings.max_products}개 시도"
+                  f"{', 빠른배송 필터' if settings.shop_quick_only else ', 필터 없음'})")
     else:
         source = f"랭킹 {' → '.join(categories)} (랭킹마다 {settings.max_products}개)"
     return (f"조건: 최근 {settings.lookback_days}일 빠른배송 {settings.min_fast_sales}건 이상, "
@@ -97,6 +101,20 @@ def normalize_categories(categories: str | list[str] | None) -> list[str]:
         if c and c not in out:
             out.append(c)
     return out or [DEFAULT_CATEGORY]
+
+
+def normalize_shop_categories(categories: str | list[str] | None) -> list[str]:
+    """SHOP 카테고리: 문자열 하나(쉼표로 여러 개) / 목록 → 순서를 지키고 빈 것·중복을 뺀 목록 (없으면 빈 목록)."""
+    if not categories:
+        return []
+    if isinstance(categories, str):
+        categories = categories.split(",")
+    out: list[str] = []
+    for c in categories:
+        c = " ".join(c.split())
+        if c and c not in out:
+            out.append(c)
+    return out
 
 
 def skip_low_trades(items: list[ranking.RankedProduct], settings: Settings,
@@ -133,17 +151,20 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
             should_stop: Callable[[], bool] | None = None,
             on_result: Callable[[ProductResult], None] | None = None,
             on_status: Callable[[str], None] | None = None,
-            keywords: str | list[str] | None = None) -> JobResult:
+            keywords: str | list[str] | None = None,
+            shop_categories: str | list[str] | None = None) -> JobResult:
     """[입찰]. on_status: 상태 한 줄 (GUI 상태 표시용 - 사이트가 내역을 안 줘 멈춰 있을 때 그 사정을 보인다).
 
-    상품을 고르는 방식은 셋 중 하나: product_ids (지정 상품) > keywords (검색 결과 순서대로, 검색어마다 max_products 개 시도)
-    > categories (랭킹 순위대로). 검색·랭킹 뒤의 판정·입찰 규칙은 똑같다 (pipeline).
+    상품을 고르는 방식은 넷 중 하나: product_ids (지정 상품) > keywords (검색 결과 순서대로, 검색어마다 max_products 개 시도)
+    > shop_categories (SHOP 카테고리 목록 순서대로, 카테고리마다 max_products 개 시도) > categories (랭킹 순위대로).
+    그 뒤의 판정·입찰 규칙은 똑같다 (pipeline).
     """
     settings.validate()
     categories = normalize_categories(categories)
     keywords = normalize_keywords(keywords)
+    shop_categories = normalize_shop_categories(shop_categories)
     mode = describe_mode(settings)
-    settings_line = describe_settings(settings, categories, keywords)
+    settings_line = describe_settings(settings, categories, keywords, shop_categories)
     log.info("%s | %s", mode, settings_line)
 
     results: list[ProductResult] = []
@@ -161,31 +182,40 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
                      for i, pid in enumerate(product_ids)]
             results = pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
                                    open_bids=open_bids, page=page, on_status=on_status)
-        elif keywords:
-            for n, keyword in enumerate(keywords, start=1):
+        elif keywords or shop_categories:
+            # 검색과 SHOP 은 같은 카드 목록 화면(/search)이라 여는 방법만 다르다
+            if keywords:
+                kind, names, quick = "검색", keywords, settings.search_quick_only
+                label_of, url_of = search.category_label, (lambda k: search.search_url(k, quick))
+                open_of = lambda p, k: search.open_search(p, k, quick)   # noqa: E731
+                collect_of = lambda p, k: search.collect_products(p, settings.max_products, k, quick)   # noqa: E731
+            else:
+                kind, names, quick = "SHOP", shop_categories, settings.shop_quick_only
+                label_of, url_of = shop.category_label, (lambda k: shop.shop_url(k, quick))
+                open_of = lambda p, k: shop.open_category(p, k, quick)   # noqa: E731
+                collect_of = lambda p, k: shop.collect_products(p, settings.max_products, k, quick)   # noqa: E731
+            for n, name in enumerate(names, start=1):
                 if should_stop and should_stop():
-                    log.info("사용자 요청으로 중지 - 남은 검색어 %s 은 보지 않음", ", ".join(keywords[n - 1:]))
+                    log.info("사용자 요청으로 중지 - 남은 %s %s 은 보지 않음", kind, ", ".join(names[n - 1:]))
                     break
-                label = search.category_label(keyword)
-                log.info("===== 검색 %d/%d: '%s' =====", n, len(keywords), keyword)
+                label = label_of(name)
+                log.info("===== %s %d/%d: '%s' =====", kind, n, len(names), name)
                 try:
-                    search.open_search(page, keyword, settings.search_quick_only)
-                    items = search.collect_products(page, settings.max_products, keyword, settings.search_quick_only)
+                    open_of(page, name)
+                    items = collect_of(page, name)
                 except Exception as e:  # noqa: BLE001
-                    log.exception("검색 '%s' 결과를 열지 못해 건너뜀", keyword)
+                    log.exception("%s '%s' 목록을 열지 못해 건너뜀", kind, name)
                     results.append(ProductResult(
-                        rank=0, product_id=0, name=f"[{label}] 검색 결과 열기 실패",
-                        url=search.search_url(keyword, settings.search_quick_only), category=label,
+                        rank=0, product_id=0, name=f"[{label}] 목록 열기 실패", url=url_of(name), category=label,
                         status="오류", detail=f"{type(e).__name__}: {e}"))
                     if on_result:
                         on_result(results[-1])
                     continue
                 if not items:
-                    log.info("검색 '%s': 볼 상품이 없음", keyword)
+                    log.info("%s '%s': 볼 상품이 없음", kind, name)
                     results.append(ProductResult(
-                        rank=0, product_id=0, name=f"[{label}] 검색 결과 없음",
-                        url=search.search_url(keyword, settings.search_quick_only), category=label,
-                        status="건너뜀", detail="검색 결과가 없음" + (" (빠른배송 필터)" if settings.search_quick_only else "")))
+                        rank=0, product_id=0, name=f"[{label}] 상품 없음", url=url_of(name), category=label,
+                        status="건너뜀", detail="목록에 상품이 없음" + (" (빠른배송 필터)" if quick else "")))
                     if on_result:
                         on_result(results[-1])
                     continue

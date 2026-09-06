@@ -41,6 +41,11 @@ def category_label(keyword: str) -> str:
 def open_search(page: Page, keyword: str, quick_only: bool = True) -> int:
     """검색 결과(상품 탭)를 연다. 첫 화면에 그려진 카드 수를 돌려준다 (0 이면 결과 없음)."""
     page.goto(search_url(keyword, quick_only), wait_until="domcontentloaded")
+    return wait_cards(page, f"검색 '{keyword}'" + (" (빠른배송 필터)" if quick_only else ""))
+
+
+def wait_cards(page: Page, log_name: str) -> int:
+    """카드 목록 화면(검색·SHOP)이 그려질 때까지 기다린다. 첫 화면 카드 수를 돌려준다 (0 이면 결과 없음)."""
     try:
         page.locator(_CARD).first.wait_for(state="visible", timeout=15_000)
     except Exception:  # noqa: BLE001
@@ -48,19 +53,27 @@ def open_search(page: Page, keyword: str, quick_only: bool = True) -> int:
         page.wait_for_timeout(1500)
         if page.locator(_CARD).count() == 0:
             body = page.locator("body").inner_text(timeout=3000)
-            if "검색 결과가 없" in body or "결과가 없습니다" in body:
-                log.info("검색 '%s'%s: 결과 없음", keyword, " (빠른배송 필터)" if quick_only else "")
+            if "검색 결과가 없" in body or "결과가 없습니다" in body or "상품이 없" in body:
+                log.info("%s: 결과 없음", log_name)
                 return 0
             raise
     page.wait_for_timeout(800)
     n = page.locator(_CARD).count()
-    log.info("검색 '%s'%s 열림 - 첫 화면 카드 %d개", keyword, " (빠른배송 필터)" if quick_only else "", n)
+    log.info("%s 열림 - 첫 화면 카드 %d개", log_name, n)
     return n
 
 
 def collect_products(page: Page, limit: int, keyword: str, quick_only: bool = True) -> list[RankedProduct]:
     """검색 결과를 화면 순서대로 limit 개까지 모은다. 부족하면 휠 스크롤로 다음 50개를 불러온다."""
-    label = category_label(keyword)
+    return collect_cards(page, limit, category_label(keyword),
+                         f"검색 '{keyword}'" + (" (빠른배송 필터)" if quick_only else ""))
+
+
+def collect_cards(page: Page, limit: int, label: str, log_name: str) -> list[RankedProduct]:
+    """상품 카드(`a.product_card`) 목록 화면을 화면 순서대로 limit 개까지 모은다 (검색·SHOP 공통).
+
+    부족하면 휠 스크롤로 다음 50개를 불러온다. label 은 보고서의 '랭킹' 열, log_name 은 로그에 적을 이름.
+    """
     seen: dict[int, RankedProduct] = {}
     stale_rounds = 0
     page.mouse.move(600, 400)   # 휠 이벤트가 문서에 닿도록
@@ -89,7 +102,7 @@ def collect_products(page: Page, limit: int, keyword: str, quick_only: bool = Tr
         page.mouse.wheel(0, 2500)
         page.wait_for_timeout(1000)   # 다음 50개가 그려질 시간 (스피너 → 카드)
     result = list(seen.values())[:limit]
-    log.info("검색 '%s'%s 상품 %d개 수집%s", keyword, " (빠른배송 필터)" if quick_only else "", len(result),
+    log.info("%s 상품 %d개 수집%s", log_name, len(result),
              "" if len(result) >= limit else f" (결과가 {limit}개보다 적음)")
     return result
 
