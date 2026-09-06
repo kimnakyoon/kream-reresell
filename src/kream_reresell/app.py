@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Page, sync_playwright
 
 from datetime import datetime
 
@@ -117,6 +117,69 @@ def normalize_shop_categories(categories: str | list[str] | None) -> list[str]:
     return out
 
 
+@dataclass
+class ProductSource:
+    """[입찰] 에서 상품 목록을 가져오는 곳 하나 (랭킹 하나 / 검색어 하나 / SHOP 카테고리 하나). 여는 방법만 다르고 그 뒤는 같다."""
+    kind: str                                   # 로그에 적는 종류: 랭킹 / 검색 / SHOP
+    name: str                                   # 랭킹 이름 / 검색어 / 카테고리 이름
+    label: str                                  # 보고서의 '랭킹' 열
+    url: str                                    # 목록 화면 주소 (열기 실패 행에 남김)
+    quick: bool                                 # 빠른배송 필터를 걸었는지
+    rank_word: str                              # 순위 표기: 랭킹은 '위', 나온 순서는 '번째'
+    collect: Callable[[Page], list[ranking.RankedProduct]]   # 목록을 열고 max_products 개까지 모은다
+
+
+def _product_sources(settings: Settings, categories: list[str], keywords: list[str],
+                     shop_categories: list[str]) -> list[ProductSource]:
+    """상품을 고르는 방식 하나를 목록으로: keywords > shop_categories > categories 순으로 있는 것 하나만 쓴다."""
+    limit = settings.max_products
+    if keywords:
+        quick = settings.search_quick_only
+        return [ProductSource(
+            "검색", k, search.category_label(k), search.search_url(k, quick), quick, "번째",
+            lambda page, k=k: (search.open_search(page, k, quick), search.collect_products(page, limit, k, quick))[1])
+            for k in keywords]
+    if shop_categories:
+        quick = settings.shop_quick_only
+        return [ProductSource(
+            "SHOP", c, shop.category_label(c), shop.shop_url(c, quick), quick, "번째",
+            lambda page, c=c: (shop.open_category(page, c, quick), shop.collect_products(page, limit, c, quick))[1])
+            for c in shop_categories]
+    return [ProductSource(
+        "랭킹", c, c, ranking.RANKING_URL, False, "위",
+        lambda page, c=c: (ranking.open_category(page, c), ranking.collect_products(page, limit, c))[1])
+        for c in categories]
+
+
+def skip_seen(items: list[ranking.RankedProduct], seen: dict[int, str], rank_word: str,
+              on_result: Callable[[ProductResult], None] | None = None
+              ) -> tuple[list[ranking.RankedProduct], list[ProductResult]]:
+    """이 실행에서 이미 판정한 상품은 다시 보지 않는다 (SHOP 럭셔리·가방, 랭킹 신발·러닝화처럼 겹치는 목록).
+
+    두 번째로 만나면 상품 페이지·체결 내역 요청(사이트 스로틀 대상)을 또 쓰고, 앞에서 입찰에 성공한 상품이면 같은 입찰을 하나 더 넣게 된다
+    (마이페이지 입찰 목록은 실행 시작 때 한 번만 읽는다). seen 에는 이번에 처음 본 상품을 더한다.
+    돌려주는 것: (볼 상품, 건너뛴 결과) - 건너뛴 것도 보고서에 한 줄 남는다.
+    """
+    keep: list[ranking.RankedProduct] = []
+    skipped: list[ProductResult] = []
+    for it in items:
+        where = seen.get(it.product_id)
+        if where is None:
+            seen[it.product_id] = f"[{it.category}] {it.rank}{rank_word}"
+            keep.append(it)
+            continue
+        r = ProductResult(rank=it.rank, product_id=it.product_id, name=it.name, url=it.url, category=it.category,
+                          status="건너뜀", total_sales=it.trades,
+                          detail=f"이 실행에서 이미 봄 ({where}) - 결과는 그 줄에")
+        log.info("[%s %d%s] %s - %s", it.category, it.rank, rank_word, it.name, r.detail)
+        skipped.append(r)
+        if on_result:
+            on_result(r)
+    if skipped:
+        log.info("이 실행에서 이미 본 상품 %d개는 다시 열지 않고 건너뜀", len(skipped))
+    return keep, skipped
+
+
 def skip_low_trades(items: list[ranking.RankedProduct], settings: Settings,
                     on_result: Callable[[ProductResult], None] | None = None
                     ) -> tuple[list[ranking.RankedProduct], list[ProductResult]]:
@@ -182,71 +245,38 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
                      for i, pid in enumerate(product_ids)]
             results = pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
                                    open_bids=open_bids, page=page, on_status=on_status)
-        elif keywords or shop_categories:
-            # 검색과 SHOP 은 같은 카드 목록 화면(/search)이라 여는 방법만 다르다
-            if keywords:
-                kind, names, quick = "검색", keywords, settings.search_quick_only
-                label_of, url_of = search.category_label, (lambda k: search.search_url(k, quick))
-                open_of = lambda p, k: search.open_search(p, k, quick)   # noqa: E731
-                collect_of = lambda p, k: search.collect_products(p, settings.max_products, k, quick)   # noqa: E731
-            else:
-                kind, names, quick = "SHOP", shop_categories, settings.shop_quick_only
-                label_of, url_of = shop.category_label, (lambda k: shop.shop_url(k, quick))
-                open_of = lambda p, k: shop.open_category(p, k, quick)   # noqa: E731
-                collect_of = lambda p, k: shop.collect_products(p, settings.max_products, k, quick)   # noqa: E731
-            for n, name in enumerate(names, start=1):
+        else:
+            sources = _product_sources(settings, categories, keywords, shop_categories)
+            seen: dict[int, str] = {}   # 이 실행에서 이미 판정한 상품 ID -> 어디서 봤는지
+            for n, src in enumerate(sources, start=1):
                 if should_stop and should_stop():
-                    log.info("사용자 요청으로 중지 - 남은 %s %s 은 보지 않음", kind, ", ".join(names[n - 1:]))
+                    log.info("사용자 요청으로 중지 - 남은 %s %s 은 보지 않음", src.kind,
+                             ", ".join(x.name for x in sources[n - 1:]))
                     break
-                label = label_of(name)
-                log.info("===== %s %d/%d: '%s' =====", kind, n, len(names), name)
+                log.info("===== %s %d/%d: '%s' =====", src.kind, n, len(sources), src.name)
                 try:
-                    open_of(page, name)
-                    items = collect_of(page, name)
+                    items = src.collect(page)
                 except Exception as e:  # noqa: BLE001
-                    log.exception("%s '%s' 목록을 열지 못해 건너뜀", kind, name)
+                    log.exception("%s '%s' 목록을 열지 못해 건너뜀", src.kind, src.name)
                     results.append(ProductResult(
-                        rank=0, product_id=0, name=f"[{label}] 목록 열기 실패", url=url_of(name), category=label,
+                        rank=0, product_id=0, name=f"[{src.label}] 목록 열기 실패", url=src.url, category=src.label,
                         status="오류", detail=f"{type(e).__name__}: {e}"))
                     if on_result:
                         on_result(results[-1])
                     continue
                 if not items:
-                    log.info("%s '%s': 볼 상품이 없음", kind, name)
+                    log.info("%s '%s': 볼 상품이 없음", src.kind, src.name)
                     results.append(ProductResult(
-                        rank=0, product_id=0, name=f"[{label}] 상품 없음", url=url_of(name), category=label,
-                        status="건너뜀", detail="목록에 상품이 없음" + (" (빠른배송 필터)" if quick else "")))
+                        rank=0, product_id=0, name=f"[{src.label}] 상품 없음", url=src.url, category=src.label,
+                        status="건너뜀", detail="목록에 상품이 없음" + (" (빠른배송 필터)" if src.quick else "")))
                     if on_result:
                         on_result(results[-1])
                     continue
                 for it in items:
-                    log.info("  %2d번째 %s %s %s %s", it.rank, it.name, f"{it.price:,}원" if it.price else "",
+                    log.info("  %2d%s %s %s %s %s", it.rank, src.rank_word, it.name, f"{it.price:,}원" if it.price else "",
                              f"거래 {it.trades:,}" if it.trades is not None else "", it.url)
-                items, skipped = skip_low_trades(items, settings, on_result)
+                items, skipped = skip_seen(items, seen, src.rank_word, on_result)
                 results.extend(skipped)
-                results.extend(pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
-                                            open_bids=open_bids, page=page, on_status=on_status))
-        else:
-            for n, category in enumerate(categories, start=1):
-                if should_stop and should_stop():
-                    log.info("사용자 요청으로 중지 - 남은 랭킹 %s 은 보지 않음", ", ".join(categories[n - 1:]))
-                    break
-                log.info("===== 랭킹 %d/%d: %s =====", n, len(categories), category)
-                try:
-                    ranking.open_category(page, category)
-                    items = ranking.collect_products(page, settings.max_products, category)
-                except Exception as e:  # noqa: BLE001
-                    log.exception("랭킹 '%s' 랭킹을 열지 못해 건너뜀", category)
-                    results.append(ProductResult(
-                        rank=0, product_id=0, name=f"[{category}] 랭킹 열기 실패",
-                        url=ranking.RANKING_URL, category=category,
-                        status="오류", detail=f"{type(e).__name__}: {e}"))
-                    if on_result:
-                        on_result(results[-1])
-                    continue
-                for it in items:
-                    log.info("  %2d위 %s %s %s %s", it.rank, it.name, f"{it.price:,}원" if it.price else "",
-                             f"거래 {it.trades:,}" if it.trades is not None else "", it.url)
                 items, skipped = skip_low_trades(items, settings, on_result)
                 results.extend(skipped)
                 results.extend(pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
