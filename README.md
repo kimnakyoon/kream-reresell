@@ -206,13 +206,18 @@ copy .env.example .env
 .venv\Scripts\python scripts\run.py --list-categories                    # 랭킹 이름 목록
 .venv\Scripts\python scripts\run.py --search 롱샴 --limit 20 --dry-run     # 랭킹 대신 검색 결과 순서대로 20개 판단 (빠른배송 필터)
 .venv\Scripts\python scripts\run.py --search 롱샴 "메종 마르지엘라 지갑"    # 검색어 여러 개를 준 순서대로, 실제 입찰
+.venv\Scripts\python scripts\run.py --shop 신발 가방 --limit 30 --dry-run  # SHOP 카테고리 목록을 나온 순서대로 30개씩 판단 (빠른배송 필터)
+.venv\Scripts\python scripts\run.py --all-shop --dry-run                  # SHOP 의 모든 카테고리(전체 제외)를 탭 순서대로
+.venv\Scripts\python scripts\run.py --list-shop                           # SHOP 카테고리 이름 목록
 .venv\Scripts\python scripts\run.py --product 385408 --force --stop-before-submit --inspect
 ```
 
 - `--category 이름 [이름 ...]` : 랭킹. 여러 개면 준 순서대로 하나씩 랭킹을 열어 처리한다. `--limit` 은 랭킹마다 적용.
 - `--all-categories` : 랭킹 탭의 랭킹 21개를 칩 순서대로 전부 돈다.
 - `--search 검색어 [검색어 ...]` : 랭킹 대신 검색 결과를 나온 순서대로 본다 (위 "검색으로 상품 고르기"). `--limit` 은 검색어마다 시도할 상품 수.
-- `--no-quick-filter` : 검색 결과에 빠른배송 필터를 걸지 않는다 (기본은 빠른배송 판매자가 있는 상품만).
+- `--shop 카테고리 [카테고리 ...]` : 랭킹 대신 SHOP 탭의 카테고리 목록을 나온 순서대로 본다 (위 "SHOP 카테고리로 상품 고르기"). `--limit` 은 카테고리마다 시도할 상품 수.
+- `--all-shop` : SHOP 의 카테고리 19개(전체 제외)를 탭 순서대로 전부 돈다.
+- `--no-quick-filter` : 검색 결과·SHOP 목록에 빠른배송 필터를 걸지 않는다 (기본은 빠른배송 판매자가 있는 상품만).
 - `--dry-run` : 거래량/마진 판단까지만 하고 입찰 폼은 건드리지 않는다.
 - `--stop-before-submit` : 입찰 화면을 다 채우되 마지막 "입찰하기" 는 누르지 않는다.
 - `--force` : 거래량/마진 조건을 무시한다 (화면 점검용).
