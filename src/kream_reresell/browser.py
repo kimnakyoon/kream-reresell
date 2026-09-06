@@ -11,6 +11,14 @@ KREAM 은 네이버 계열 사이트라 봇 탐지를 염두에 둬야 한다. a
 포커스를 뺏지 않고 창도 움직이지 않는다). 필요하면 show_window() 로 다시 불러온다.
 
 프로필은 auth/chrome_profile_kream 에 계속 남는다(로그인 유지, 쓸수록 이력이 쌓임).
+
+크롬은 프로필 하나를 한 인스턴스만 쓴다. 같은 프로필로 크롬을 또 띄우면 새 크롬은 떠 있는 쪽에 창만 넘기고 조용히 끝나
+디버깅 포트가 열리지 않는다. 그래서 띄우기 전에 프로필을 잡고 있는 크롬이 있는지 보고 (프로필의 lockfile 을 크롬이
+독점으로 열어 둔다 - 2026-09-06 실측), 있으면 그걸 띄운 python 이 아직 살아 있는지로 나눈다:
+  - 살아 있음: 이 프로그램의 다른 실행(GUI 또는 명령행)이 쓰는 중 → 바로 오류 (30초 기다리지 않음)
+  - 죽었음: 이전 실행이 남긴 크롬 (GUI 창을 닫거나 작업 관리자로 끝내면 작업 스레드가 정리를 못 해 남는다,
+    2026-09-06 실측) → 정상 종료를 요청해 닫고(안 되면 강제 종료) 새로 띄운다
+또 띄운 크롬을 Job Object 에 넣어 이 python 이 어떻게 끝나든 크롬도 같이 끝나게 한다 (winproc 참고).
 """
 
 from __future__ import annotations
@@ -27,7 +35,7 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import BrowserContext, Playwright
 
-from . import pacing
+from . import pacing, winproc
 from .config import ROOT
 
 log = logging.getLogger(__name__)
@@ -246,6 +254,71 @@ def window_shown():
         yield
 
 
+# ---------------------------------------------------------------- 프로필을 잡고 있는 크롬 정리
+
+def profile_in_use(profile: Path) -> bool:
+    """크롬이 이 프로필로 떠 있는지. 크롬은 켜져 있는 동안 프로필의 lockfile 을 독점으로 열어 둔다 (열면 PermissionError)."""
+    lock = profile / "lockfile"
+    if not lock.exists():
+        return False
+    try:
+        with open(lock, "ab"):
+            return False
+    except OSError:
+        return True
+
+
+def _wait_until(check, timeout_sec: float) -> bool:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if check():
+            return True
+        time.sleep(0.3)
+    return check()
+
+
+def _close_leftover_chrome(playwright: Playwright, chrome: winproc.ChromeProcess) -> None:
+    """이전 실행이 남긴 크롬을 닫는다. 정상 종료(Browser.close)를 먼저 시켜 프로필(쿠키)이 저장되게 하고, 안 되면 강제 종료."""
+    gone = lambda: winproc.process_image(chrome.pid) is None  # noqa: E731
+    asked = False
+    if chrome.port:
+        try:
+            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{chrome.port}", timeout=5_000)
+            try:
+                browser.new_browser_cdp_session().send("Browser.close")
+                asked = True
+            finally:
+                with contextlib.suppress(Exception):
+                    browser.close()
+        except Exception as e:  # noqa: BLE001 - 멈춘 크롬은 붙지 못한다 (2026-09-06 실측: 5초 timeout)
+            log.info("남은 크롬에 정상 종료를 요청하지 못함 (%s) - 강제 종료", str(e).splitlines()[0])
+    if not (asked and _wait_until(gone, 10)):
+        winproc.kill_tree(chrome.pid)
+        if not _wait_until(gone, 10):
+            raise RuntimeError(f"이전 실행이 남긴 크롬(프로세스 {chrome.pid})을 닫지 못했습니다. "
+                               "작업 관리자에서 chrome.exe 를 끝낸 뒤 다시 실행해 주세요.")
+
+
+def reclaim_profile(playwright: Playwright, profile: Path) -> None:
+    """프로필을 잡고 있는 크롬이 있으면: 다른 실행이 쓰는 중이면 RuntimeError, 이전 실행이 남긴 것이면 닫는다."""
+    if not profile_in_use(profile):
+        return
+    chromes = winproc.find_profile_chromes(profile)
+    if not chromes:
+        log.warning("프로필이 잠겨 있는데 그 크롬 프로세스를 찾지 못함 - 그냥 띄워 봅니다")
+        return
+    for chrome in chromes:
+        owner = winproc.process_image(chrome.parent_pid)
+        if owner in winproc.PYTHON_IMAGES:
+            raise RuntimeError(f"이 프로그램의 다른 실행(프로세스 {chrome.parent_pid})이 크롬(프로세스 {chrome.pid})을 쓰고 있습니다. "
+                               "그쪽을 먼저 끝내거나 [중지]한 뒤 다시 실행해 주세요.")
+        log.info("이전 실행이 남긴 크롬(프로세스 %d, 띄운 프로세스 %d 는 %s)을 닫고 새로 띄웁니다",
+                 chrome.pid, chrome.parent_pid, f"'{owner}'" if owner else "이미 없음")
+        _close_leftover_chrome(playwright, chrome)
+    if not _wait_until(lambda: not profile_in_use(profile), 10):
+        raise RuntimeError("남은 크롬을 닫았는데도 프로필이 아직 잠겨 있습니다. 잠시 뒤 다시 실행해 주세요.")
+
+
 @contextlib.contextmanager
 def real_chrome_context(playwright: Playwright, window_size: str = "1400,1000",
                         profile_dir: Path | None = None, block_images: bool = True,
@@ -260,6 +333,7 @@ def real_chrome_context(playwright: Playwright, window_size: str = "1400,1000",
     global _active_window
     profile = (profile_dir or PROFILE_DIR).resolve()  # 상대경로를 주면 크롬이 조용히 종료한다
     profile.mkdir(parents=True, exist_ok=True)
+    reclaim_profile(playwright, profile)
     port = _free_port()
     args = [
         chrome_executable(),
@@ -275,12 +349,14 @@ def real_chrome_context(playwright: Playwright, window_size: str = "1400,1000",
         args.append(f"--window-position={OFFSCREEN_POS[0]},{OFFSCREEN_POS[1]}")
     args.append("about:blank")
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    winproc.kill_with_this_process(proc.pid)   # 이 python 이 어떻게 끝나든 크롬도 같이 끝나게 (남으면 다음 실행이 막힌다)
     browser = None
     try:
         if not _wait_for_port(port, CDP_READY_TIMEOUT_SEC):
-            # 같은 프로필을 쓰는 크롬이 이미 떠 있으면(예: GUI 가 실행 중일 때 명령행을 또 돌림) 새 크롬은 조용히 종료된다
+            # 같은 프로필을 쓰는 크롬이 이미 떠 있으면 새 크롬은 조용히 종료된다 (reclaim_profile 이 놓친 경우)
             raise RuntimeError(f"크롬이 디버깅 포트({port})를 {CDP_READY_TIMEOUT_SEC}초 안에 열지 않았습니다. "
-                               "이 프로그램의 다른 실행(GUI 또는 명령행)이 아직 크롬을 쓰고 있지 않은지 확인해 주세요.")
+                               "이 프로그램의 다른 실행(GUI 또는 명령행)이 아직 크롬을 쓰고 있지 않은지, "
+                               "작업 관리자에 chrome.exe 가 남아 있지 않은지 확인해 주세요.")
         browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
         _active_window = ChromeWindow(proc.pid, hidden=not show_chrome)
         if not show_chrome:
@@ -309,3 +385,4 @@ def real_chrome_context(playwright: Playwright, window_size: str = "1400,1000",
                 proc.terminate()
             with contextlib.suppress(Exception):
                 proc.wait(timeout=10)
+        winproc.release(proc.pid)   # 그래도 살아 있으면 Job 핸들이 닫히며 죽는다

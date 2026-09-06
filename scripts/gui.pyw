@@ -80,6 +80,7 @@ class App:
         self.worker: threading.Thread | None = None
         self.last_report: Path | None = None
         self.base = Settings()
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         pad = {"padx": 12, "pady": 4}
 
@@ -652,6 +653,19 @@ class App:
         self.status.configure(text="지금 것까지 보고 멈춥니다...")
         self.stop_button.configure(state="disabled")
 
+    def _running(self) -> bool:
+        return bool(self.worker and self.worker.is_alive())
+
+    def _on_close(self) -> None:
+        """창 닫기. 실행 중이면 확인을 받고 끝낸다 - 작업 스레드는 daemon 이라 창이 닫히면 같이 사라지고, 크롬은 Job Object 로
+        묶여 있어 이 프로세스가 끝나면 같이 닫힌다 (browser.py 참고). 멈춰 버린 실행도 이 경로로 끝낼 수 있다."""
+        if self._running() and not messagebox.askyesno(
+                "종료", "아직 실행 중입니다. 지금 끝내면 진행 중인 작업이 끊기고 크롬도 같이 닫힙니다.\n\n"
+                        "([중지] 를 누르면 지금 보는 상품까지 마치고 멈춥니다)\n\n그래도 끝낼까요?"):
+            return
+        self.stop_flag.set()
+        self.root.destroy()
+
     def _set_busy(self, busy: bool, text: str = "") -> None:
         self.run_button.configure(state="disabled" if busy else "normal")
         self.cancel_button.configure(state="disabled" if busy else "normal")
@@ -777,8 +791,12 @@ class MonthDialog:
 
 def main() -> None:
     root = tk.Tk()
-    App(root)
+    app = App(root)
     root.mainloop()
+    if app._running():
+        # 실행 중에 창을 닫은 것. Playwright 를 붙든 daemon 스레드가 인터프리터 종료를 붙잡을 수 있어 바로 끝낸다 (크롬은 Job 으로 같이 죽음)
+        logging.shutdown()
+        os._exit(0)
 
 
 if __name__ == "__main__":
