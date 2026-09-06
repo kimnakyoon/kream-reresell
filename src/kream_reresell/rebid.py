@@ -33,6 +33,8 @@ product.NoFastDelivery) 그 입찰도 지운다 (사용자 결정 2026-09-06 - �
 2026-09-05: 시간 제한 없이 다시 줄 때까지 기다린다 - sitewait). 판단 불가·즉시 판매가 없음으로 끝난 입찰은 화면 스냅샷을 dumps/ 에 남긴다.
 구매 페이지가 로그인 화면으로 넘어가면(로그인이 풀림) 다시 로그인하고 그 입찰을 한 번 더 본다. 목록 페이지가 로그인 화면으로
 넘어가도 (로그인 화면 주소에도 returnUrl 로 tab=bidding 이 들어가 0건으로 읽히던 문제, 2026-09-05) 다시 로그인하고 목록을 다시 읽는다.
+크롬이 잠시 멈춰 화면을 안 그리면(product.PageStalled - '구매하기' 가 보이는데 눌리지 않고 스냅샷도 안 찍힘, 2026-09-06 실측 80초쯤)
+STALL_WAIT_SEC 까지 기다렸다가 다시 그려지면 그 입찰을 한 번 더 보고, 그래도 안 그리면 판단 불가(확인필요)로 남긴다.
 
 밀렸는데 기준(거래량 · 마진)에 못 미쳐 올릴 수 없는 입찰과, 밀리지 않았어도 마진(최신 A·B)이 기준에 못 미치는 입찰은 [입찰취소] 와 같은 방식으로 지운다
 (상세의 '입찰 지우기' → 확인창 → DELETE 204 확인, cancel.delete_bid). 판단할 수 없는 경우(상품 페이지 오류 등)는 지우지 않는다.
@@ -77,6 +79,7 @@ CHANGE_ATTEMPTS = 2              # [입찰 변경하기] 화면이 예상과 다
 CHANGE_RETRY_PAUSE_SEC = (2.0, 4.0)
 # 판단 불가(확인필요)·오류·즉시 판매가 없음이 연달아 TROUBLE_STREAK 건 나면 사이트가 응답을 안 주는 것으로 보고 멈춘다.
 # PROBE_SEC 마다 마지막에 막힌 입찰의 구매 페이지를 한 번 열어 보고 '즉시 판매가' 가 그려지면 이어서 본다 (sitewait 공용).
+STALL_WAIT_SEC = 90              # 탭이 화면을 그리지 않을 때(product.PageStalled) 다시 그려지길 기다리는 최대 시간
 MAX_LIST_FAILURES = 3            # 목록을 연달아 이만큼 못 읽으면 멈춘다
 ERROR_BACKOFF_SEC = 120          # 목록을 못 읽었을 때 다시 시도하기 전에 쉬는 시간
 NO_B_PREFIX = "즉시 판매가 없음"   # 즉시 판매가가 없어 지운(또는 지우려 한) 결과의 사유 머리 - 연달아 난 수를 셀 때 쓴다
@@ -234,18 +237,20 @@ def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, diagnose
                       category=f"{cycle}회차", bid_price=bid.price, option="" if bid.is_one_size else bid.option)
     try:
         try:
-            _rebid_one(page, bid, settings, cycle, r, diagnose)
-        except LoginLost as e:
-            log.warning("[%d회차 %d번째] %s - 다시 로그인하고 한 번 더 봄", cycle, bid.order, e)
-            try:
-                auth.ensure_logged_in(page, settings)
-            except Exception as e3:
-                r.status, r.detail = "오류", f"로그인이 풀렸는데 다시 로그인하지 못함: {e3}"
-                raise
-            try:
-                _rebid_one(page, bid, settings, cycle, r, diagnose)
-            except LoginLost as e2:
-                r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: 다시 로그인했는데도 {e2}"
+            _rebid_with_relogin(page, bid, settings, cycle, r, diagnose)
+        except product_mod.PageStalled as e:
+            # 탭이 화면을 그리지 않아 버튼을 못 누른 것 (크롬이 잠시 멈춤) - 상품·사이트 문제가 아니므로
+            # 다시 그려질 때까지 잠깐 기다렸다가 한 번 더 본다 (2026-09-06 실측: 80초쯤 멈췄다가 다음 상품부터 정상)
+            log.warning("[%d회차 %d번째] %s - 최대 %d초 기다렸다가 한 번 더 봄", cycle, bid.order, e, STALL_WAIT_SEC)
+            note = product_mod.wait_page_drawing(page, STALL_WAIT_SEC)
+            if note:
+                r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: {e} ({STALL_WAIT_SEC}초 기다려도 {note})"
+            else:
+                log.info("[%d회차 %d번째] 화면이 다시 그려짐 - 한 번 더 봄", cycle, bid.order)
+                try:
+                    _rebid_with_relogin(page, bid, settings, cycle, r, diagnose)
+                except product_mod.PageStalled as e2:
+                    r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: 화면이 다시 그려져 한 번 더 봤는데도 {e2}"
     finally:
         r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log.info("[%d회차 %d번째] 결과: %s - %s", cycle, bid.order, r.status, r.detail)
@@ -256,6 +261,23 @@ def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, diagnose
             "status": r.status, "detail": r.detail,
         })
     return r
+
+
+def _rebid_with_relogin(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: ProductResult, diagnose: bool) -> None:
+    """_rebid_one 을 부르되, 로그인이 풀린 것이 보이면 다시 로그인하고 한 번 더 본다."""
+    try:
+        _rebid_one(page, bid, settings, cycle, r, diagnose)
+    except LoginLost as e:
+        log.warning("[%d회차 %d번째] %s - 다시 로그인하고 한 번 더 봄", cycle, bid.order, e)
+        try:
+            auth.ensure_logged_in(page, settings)
+        except Exception as e3:
+            r.status, r.detail = "오류", f"로그인이 풀렸는데 다시 로그인하지 못함: {e3}"
+            raise
+        try:
+            _rebid_one(page, bid, settings, cycle, r, diagnose)
+        except LoginLost as e2:
+            r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: 다시 로그인했는데도 {e2}"
 
 
 def is_site_trouble(r: ProductResult) -> bool:
@@ -408,6 +430,8 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
         if _on_login_page(page):
             raise LoginLost(f"상품 페이지 확인 중 로그인 화면으로 넘어감: {page.url}") from e
         _cancel_no_fast(page, bid, settings, r, str(e), diagnose)
+    except product_mod.PageStalled:
+        raise   # rebid_one 이 화면이 다시 그려질 때까지 기다렸다가 한 번 더 본다 (그리지 않는 화면은 스냅샷도 못 찍는다)
     except product_mod.SkipProduct as e:
         if _on_login_page(page):
             raise LoginLost(f"상품 페이지 확인 중 로그인 화면으로 넘어감: {page.url}") from e

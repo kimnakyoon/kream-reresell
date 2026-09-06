@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -54,6 +55,56 @@ class SalesNotLoaded(SkipProduct):
     거래가 없는 게 아니라 '판단 불가' 다 - 0건으로 세면 [재입찰]이 기준 미달로 입찰을 지워 버린다. [입찰]·[재입찰] 은 이게
     연달아 나면 사이트가 응답을 안 주는 시간대로 보고 멈춰 기다린다 (sitewait).
     """
+
+
+class PageStalled(SkipProduct):
+    """탭이 화면을 그리지 않아(크롬이 잠시 멈춤) 버튼을 누르지 못했다 - 상품·사이트 문제가 아니다.
+
+    Playwright 의 클릭·보임 대기·스크린샷은 모두 화면이 한 번 그려지기(requestAnimationFrame)를 기다리므로, 탭이 그리지 않으면
+    전부 타임아웃만 채운다 (2026-09-06 재입찰 실측: '구매하기' 가 보인 직후부터 80초쯤 아무 명령도 안 먹다가 다음 상품부터 정상 -
+    클릭 15초 × 3번 뒤 '모달이 뜨지 않음', 스냅샷도 30초 뒤 실패). 우리가 띄우는 크롬은 창을 최소화하거나 다른 탭을 앞에 둬도
+    계속 그린다 (--disable-backgrounding-occluded-windows 등 + Playwright 의 포커스 에뮬레이션, 2026-09-06 확인) - 그러니
+    이건 크롬 자체가 멈춘 것이다. [재입찰]은 화면이 다시 그려지면 그 입찰을 한 번 더 본다.
+    """
+
+
+# ---------------------------------------------------------------- 화면이 그려지는지 (멈춤 감지)
+
+FRAME_PROBE_MS = 1500     # 이 안에 한 프레임도 안 그려지면 멈춘 것으로 본다 (정상이면 20ms 안)
+
+
+def page_stall(page: Page) -> str | None:
+    """탭이 화면을 그리고 있으면 None, 아니면 사유. wait_for_function 은 rAF 뒤에 처음 확인하므로 타임아웃 = 프레임 없음.
+
+    page.evaluate 는 타임아웃이 없어 렌더러가 완전히 멈추면 영영 돌아오지 않는다 - 그래서 시간 제한이 있는 wait_for_function 을 쓴다
+    (타임아웃은 드라이버 쪽에서 재므로 페이지가 응답하지 않아도 제때 돌아온다).
+    """
+    try:
+        page.wait_for_function("() => true", timeout=FRAME_PROBE_MS)
+        return None
+    except PlaywrightTimeout:
+        return "화면이 그려지지 않음 (크롬이 멈춤?)"
+    except PlaywrightError as e:
+        return f"페이지가 응답하지 않음 ({str(e).splitlines()[0]})"
+
+
+def wait_page_drawing(page: Page, timeout_sec: float) -> str | None:
+    """탭이 다시 화면을 그릴 때까지 3초마다 확인하며 기다린다. 그리면 None, timeout_sec 안에 안 그리면 마지막 사유.
+
+    혹시 탭이 뒤로 가 있는 것이면 bring_to_front 로 앞으로 불러온다 (브라우저 프로세스가 처리하므로 렌더러가 멈춰도 바로 돌아온다).
+    """
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        try:
+            page.bring_to_front()
+        except PlaywrightError:
+            pass
+        reason = page_stall(page)
+        left = deadline - time.monotonic()
+        if reason is None or left <= 0:
+            return reason
+        log.info("화면이 그려질 때까지 기다림: %s (%d초 남음)", reason, int(left))
+        time.sleep(min(3.0, left))
 
 
 @dataclass
@@ -622,13 +673,20 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None =
     want = option or ONE_SIZE
     buy = page.get_by_role("button", name="구매하기", exact=True).first
     modal = page.locator(MODAL_SELECTOR).first
+    # 앞 옵션을 보다 그냥 두고 나온 모달(빠른배송 없음 등)이 아직 열려 있으면 먼저 닫는다 - 열린 모달이 '구매하기' 버튼을 덮어
+    # 클릭이 15초씩 세 번 막히다 '모달이 뜨지 않음' 으로 끝나던 것 (2026-09-06 실측, 옵션 5개 지갑의 마지막 옵션)
+    _close_buy_modal_if_open(page, modal)
     for attempt in range(3):
         try:
-            buy.scroll_into_view_if_needed()
-            buy.click()
+            buy.scroll_into_view_if_needed(timeout=BUY_CLICK_TIMEOUT_MS)
+            buy.click(timeout=BUY_CLICK_TIMEOUT_MS)
             modal.wait_for(state="visible", timeout=4000)
-        except PlaywrightTimeout:
-            log.debug("구매하기 모달 열기 재시도 %d", attempt + 1)
+        except PlaywrightTimeout as e:
+            # 버튼이 보이는데도 못 누르는 건 탭이 화면을 그리지 않는 것일 수 있다 - 그러면 재시도해도 소용없으니 바로 알린다
+            stall = page_stall(page)
+            if stall:
+                raise PageStalled(f"'구매하기' 를 누르지 못함 - {stall}") from e
+            log.info("구매하기 모달 열기 재시도 %d/3: %s", attempt + 1, str(e).splitlines()[0])
             continue
         # 모달에 고를 옵션(ONE SIZE 또는 사이즈)이 그려질 때까지. 2초 안에 안 나오는데 내용은 있으면 옵션 구성이 다른 것
         try:
@@ -638,7 +696,7 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None =
                 if option:
                     raise SkipProduct(f"구매하기 모달에 옵션 '{option}' 이 없음") from None
                 raise SkipProduct("옵션(사이즈)이 있는 상품인데 옵션 목록을 읽지 못함 (모달에 ONE SIZE 없음)") from None
-            log.debug("구매하기 모달 내용 대기 재시도 %d", attempt + 1)
+            log.info("구매하기 모달 내용 대기 재시도 %d/3", attempt + 1)
             continue
         break
     else:
@@ -730,6 +788,40 @@ _BUY_PAGE_OR_MODEL_CHECK_JS = r"""
 
 
 MODAL_SELECTOR = ".bottom-sheet__layer--open.layer-option-picker"
+BUY_CLICK_TIMEOUT_MS = 5000   # '구매하기' 는 이미 보이는 버튼이라 정상이면 1초 안에 눌린다 (기본 15초를 세 번 채우지 않게)
+
+_CLOSE_BUY_MODAL_JS = r"""
+() => {
+  const m = document.querySelector('.bottom-sheet__layer--open.layer-option-picker');
+  if (!m) return 'none';
+  const r = m.getBoundingClientRect();
+  if (r.width === 0 || r.height === 0) return 'none';
+  const btn = m.querySelector('a[aria-label="닫기"], button[aria-label="닫기"]');
+  if (!btn) return 'no-button';
+  btn.click();
+  return 'clicked';
+}
+"""
+
+
+def _close_buy_modal_if_open(page: Page, modal) -> None:
+    """구매하기 모달이 열려 있으면 닫기 버튼으로 닫는다. 닫히지 않으면 상품 페이지를 다시 연다 (그래야 '구매하기' 를 누를 수 있다)."""
+    try:
+        # evaluate 는 타임아웃이 없어 크롬이 멈추면 영영 안 돌아온다 - 시간 제한이 있는 wait_for_function 으로 (결과 문자열은 늘 참)
+        state = page.wait_for_function(_CLOSE_BUY_MODAL_JS, polling=100, timeout=FRAME_PROBE_MS * 2).json_value()
+    except PlaywrightTimeout as e:
+        raise PageStalled("구매하기 모달 상태를 읽지 못함 - 페이지가 응답하지 않음 (크롬이 멈춤?)") from e
+    if state == "none":
+        return
+    log.info("구매하기 모달이 이미 열려 있음 - 닫고 다시 엶 (%s)", state)
+    if state == "clicked":
+        try:
+            modal.wait_for(state="hidden", timeout=3000)
+            page.wait_for_timeout(300)
+            return
+        except PlaywrightTimeout:
+            pass
+    open_product(page, page.url)   # 닫기 버튼이 없거나 안 닫히면 상품 페이지를 다시 연다 (모달 없는 새 화면)
 
 # 모달에 고를 항목(ONE SIZE 또는 옵션명)이 있는지. 옵션 항목은 .select_option_picker (옵션명 + 즉시 구매가) 이고,
 # ONE SIZE 상품은 'ONE SIZE' 글자만 있다 (2026-09-05 실측)
