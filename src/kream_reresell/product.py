@@ -39,7 +39,11 @@ class SkipProduct(Exception):
 
 
 class NoPriceB(SkipProduct):
-    """구매 페이지는 떴는데 '즉시 판매가'(B) 가 없다. [재입찰]은 이 경우 입찰을 지운다."""
+    """구매 페이지가 상품 정보를 다 불러왔는데 '즉시 판매가'(B) 가 '-' 다 (구매 입찰 없음). [재입찰]은 이 경우 입찰을 지운다.
+
+    아직 불러오는 중('리스트 로딩중입니다.' 그림)에 '-' 인 것은 이게 아니다 - wait_buy_page_loaded 가 다 불러올 때까지 기다리고,
+    시간 안에 못 불러오면 SkipProduct(판단 불가)로 둔다 (2026-09-06~07 에 불러오는 중의 '-' 를 보고 멀쩡한 입찰 14건을 지웠음).
+    """
 
 
 class NoFastDelivery(SkipProduct):
@@ -738,20 +742,69 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None =
     except PlaywrightTimeout as e:
         dump(page, f"{product_id}_no_buy_page")
         raise SkipProduct(f"'즉시 구매 / 구매 입찰' 을 눌렀는데 구매 페이지로 넘어가지 않음 (지금 주소 {page.url})") from e
-    try:
-        page.get_by_text("즉시 판매가", exact=True).first.wait_for(state="visible", timeout=10_000)
-    except PlaywrightTimeout as e:
-        if urlparse(page.url).path.startswith(f"/buy/{product_id}"):
-            # 구매 페이지에는 왔는데 즉시 판매가가 없다 (구매 입찰이 하나도 없음) - [재입찰]은 이 경우 입찰을 지운다
-            raise NoPriceB("구매 페이지가 떴는데 '즉시 판매가' 가 없음") from e
-        raise SkipProduct(f"구매 페이지가 뜨지 않음 ('즉시 판매가' 없음, 지금 주소 {page.url})") from e
-    page.wait_for_timeout(300)
+    wait_buy_page_loaded(page, product_id, want)
     if option:
-        # 구매 페이지 상단의 옵션 표기가 고른 것과 같은지 (다른 사이즈에 입찰하지 않도록)
+        # 구매 페이지 상단의 옵션 표기가 고른 것과 같은지 (다른 사이즈에 입찰하지 않도록). 다 불러온 뒤에 본다 - 불러오는 중에는
+        # 상품명·옵션 자리에 '리스트 로딩중입니다.' 그림만 있어 옵션 표기가 없다
         body = page.locator("body").inner_text()
         if not re.search(rf"(^|\n)\s*{re.escape(option)}\s*(\n|$)", body):
             raise SkipProduct(f"구매 페이지의 옵션 표기가 '{option}' 이 아님 (주소 {page.url})")
     return price_a
+
+
+# 구매 페이지가 상품 정보를 다 불러왔는지. '즉시 판매가' 글자는 페이지 뼈대에 있어 API 응답 전에도 '-' 값과 함께 바로 그려지고,
+# 상품명·모델번호·옵션 자리에는 '리스트 로딩중입니다.' 그림(img alt)만 있다 (2026-09-06~07 실측: 보통 1~2초, 그 사이에 읽으면
+# 즉시 판매가가 '-' 라 '구매 입찰 없음' 으로 잘못 보여 [재입찰]이 멀쩡한 입찰 14건을 지웠고, 옵션 표기가 없어 '옵션 표기가 아님' 확인필요 5건).
+#  'price'    - '즉시 판매가 N원' 이 그려짐
+#  'no-price' - 로딩 그림이 사라지고 옵션 표기(ONE SIZE 또는 사이즈)까지 그려졌는데 즉시 판매가가 '-' = 구매 입찰이 정말 없음
+#  'loading'  - 로딩 그림이 아직 보임
+#  'blank'    - 로딩 그림은 없는데 즉시 판매가도 옵션 표기도 없음 (그리는 중이거나 옵션 표기가 다름)
+# final 이 아니면 판정이 끝난 상태('price'·'no-price')만 돌려주고 나머지는 false (wait_for_function 이 계속 기다리도록)
+_BUY_PAGE_STATE_JS = r"""
+([label, final]) => {
+  const text = document.body.innerText;
+  let state;
+  if (/즉시 판매가\s*[\d,]+\s*원/.test(text)) state = 'price';
+  else if ([...document.querySelectorAll('img[alt*="로딩"]')]
+             .some(i => { const r = i.getBoundingClientRect(); return r.width > 0 || r.height > 0; })) state = 'loading';
+  else if (text.split('\n').some(line => line.trim() === label)) state = 'no-price';
+  else state = 'blank';
+  if (final || state === 'price' || state === 'no-price') return state;
+  return false;
+}
+"""
+BUY_PAGE_LOAD_TIMEOUT_MS = 12_000   # 상품 정보(가격·옵션 표기)를 다 불러오길 기다리는 최대 시간 (정상이면 1~2초, 느린 시간대 대비)
+
+
+def wait_buy_page_loaded(page: Page, product_id: int, label: str) -> None:
+    """구매 페이지가 상품 정보를 다 불러올 때까지 기다린다. '즉시 판매가 N원' 이 그려지면 돌아온다.
+
+    다 불러왔는데(로딩 그림 없음, 옵션 표기 label 그려짐) 즉시 판매가가 '-' 이면 구매 입찰이 없는 것 → NoPriceB ([재입찰]은 지운다).
+    시간 안에 다 불러오지 못하면 판단 불가(SkipProduct) - 아직 불러오는 중에 '-' 를 보고 지우지 않도록.
+    구매 페이지가 아닌 곳으로 갔으면 SkipProduct, 페이지가 응답하지 않으면 PageStalled.
+    """
+    try:
+        state = page.wait_for_function(_BUY_PAGE_STATE_JS, arg=[label, False], timeout=BUY_PAGE_LOAD_TIMEOUT_MS).json_value()
+    except PlaywrightTimeout:
+        state = ""
+    if not state:
+        try:
+            # evaluate 는 타임아웃이 없어 크롬이 멈추면 영영 안 돌아온다 - 시간 제한이 있는 wait_for_function 으로 (final 이면 늘 문자열)
+            state = page.wait_for_function(_BUY_PAGE_STATE_JS, arg=[label, True], polling=100,
+                                           timeout=FRAME_PROBE_MS * 2).json_value()
+        except PlaywrightTimeout as e:
+            raise PageStalled("구매 페이지 상태를 읽지 못함 - 페이지가 응답하지 않음 (크롬이 멈춤?)") from e
+    if not urlparse(page.url).path.startswith(f"/buy/{product_id}"):
+        raise SkipProduct(f"구매 페이지가 뜨지 않음 (지금 주소 {page.url})")
+    if state == "price":
+        return
+    if state == "no-price":
+        # 다 불러왔는데 즉시 판매가가 '-' (구매 입찰이 하나도 없음) - [재입찰]은 이 경우 입찰을 지운다
+        raise NoPriceB(f"구매 페이지를 다 불러왔는데 '즉시 판매가' 가 없음 ('-', 옵션 표기 '{label}' 은 그려짐)")
+    if state == "loading":
+        raise SkipProduct(f"구매 페이지가 {BUY_PAGE_LOAD_TIMEOUT_MS // 1000}초 넘게 상품 정보를 불러오는 중 "
+                          f"('리스트 로딩중' 표시, 즉시 판매가 '-') - 사이트가 느림, 지우지 않음")
+    raise SkipProduct(f"구매 페이지에 '즉시 판매가' 도 옵션 표기 '{label}' 도 그려지지 않음 (주소 {page.url})")
 
 
 MODEL_CHECK_BUTTON = "확인 후 계속"
