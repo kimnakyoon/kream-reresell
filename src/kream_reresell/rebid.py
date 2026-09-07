@@ -33,12 +33,11 @@ product.NoFastDelivery) 그 입찰도 지운다 (사용자 결정 2026-09-06 - �
 2026-09-05: 시간 제한 없이 다시 줄 때까지 기다린다 - sitewait). 판단 불가·즉시 판매가 없음으로 끝난 입찰은 화면 스냅샷을 dumps/ 에 남긴다.
 구매 페이지가 로그인 화면으로 넘어가면(로그인이 풀림) 다시 로그인하고 그 입찰을 한 번 더 본다. 목록 페이지가 로그인 화면으로
 넘어가도 (로그인 화면 주소에도 returnUrl 로 tab=bidding 이 들어가 0건으로 읽히던 문제, 2026-09-05) 다시 로그인하고 목록을 다시 읽는다.
-탭이 응답하지 않아 '구매하기' 가 보이는데 눌리지 않으면(product.PageStalled) data: URL 을 거쳐 상품 페이지로 다시 이동해(새 렌더러) 그 입찰을
-한 번 더 보고, 되살아나지 않거나 또 멈추면 판단 불가(확인필요)로 남긴다 (2026-09-07 실측 5건: 같은 페이지에서 90초를 기다려도
-안 풀렸는데 다음 상품으로 이동하자 바로 정상 - 기다리는 건 소용없다).
+탭이 응답하지 않아 '구매하기' 가 보이는데 눌리지 않으면(product.PageStalled) 그 탭을 닫는다 - 같은 페이지에서 기다리는 건 소용없다
+(2026-09-07 실측 5건: 90초를 기다려도 안 풀렸는데 다음 상품으로 이동하자 바로 정상).
 탭이 아예 멈춰 Playwright 호출이 시간 제한을 넘겨도 돌아오지 않으면 (2026-09-06 실측 160번째: 구매 페이지로 넘어간 직후 렌더러가
-멈춰 22분 넘게 대기, [중지]도 안 들음) 감시 스레드(hangwatch)가 그 탭을 닫아 호출을 오류로 끝내고, 여기서는 새 탭을 열어
-그 입찰을 한 번 더 본다. 새 탭에서도 또 멈추면 판단 불가(확인필요)로 남기고 다음 입찰로 간다.
+멈춰 22분 넘게 대기, [중지]도 안 들음) 감시 스레드(hangwatch)가 그 탭을 닫아 호출을 오류로 끝낸다. 어느 쪽이든 탭이 닫혔으면
+새 탭을 열어 그 입찰을 한 번 더 본다. 새 탭에서도 또 멈추면 판단 불가(확인필요)로 남기고 다음 입찰로 간다.
 
 밀렸는데 기준(거래량 · 마진)에 못 미쳐 올릴 수 없는 입찰과, 밀리지 않았어도 마진(최신 A·B)이 기준에 못 미치는 입찰은 [입찰취소] 와 같은 방식으로 지운다
 (상세의 '입찰 지우기' → 확인창 → DELETE 204 확인, cancel.delete_bid). 판단할 수 없는 경우(상품 페이지 오류 등)는 지우지 않는다.
@@ -233,18 +232,13 @@ def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, diagnose
             _rebid_with_relogin(page, bid, settings, cycle, r, diagnose)
         except product_mod.PageStalled as e:
             # 탭이 응답하지 않아 버튼을 못 누른 것 - 상품·사이트 문제가 아니다. 같은 페이지가 풀리길 기다려도 소용없어
-            # (2026-09-07 실측 5건: 90초 안에 안 풀림) 상품 페이지로 다시 이동해 탭을 되살리고 한 번 더 본다
-            log.warning("[%d회차 %d번째] %s (지금 주소 %s) - 탭을 되살려 한 번 더 봄", cycle, bid.order, e, page.url)
-            with browser.sales_trimmed():   # 되살리려 여는 상품 페이지의 sales 요청(스로틀 대상)은 보내지 않는다
-                note = product_mod.reopen_stalled_page(page, bid.product_url)
-            if note:
-                r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: {e} ({note})"
-            else:
-                log.info("[%d회차 %d번째] 탭이 다시 응답함 - 한 번 더 봄", cycle, bid.order)
-                try:
-                    _rebid_with_relogin(page, bid, settings, cycle, r, diagnose)
-                except product_mod.PageStalled as e2:
-                    r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: 탭을 되살려 한 번 더 봤는데도 {e2}"
+            # (2026-09-07 실측 5건: 90초 안에 안 풀림) 탭을 닫는다 - run 이 새 탭을 열어 한 번 더 본다 (hangwatch 가 닫았을 때와 같은 경로)
+            log.warning("[%d회차 %d번째] %s (지금 주소 %s) - 탭을 닫음", cycle, bid.order, e, page.url)
+            try:
+                page.close()
+            except PlaywrightError as e2:
+                log.info("탭을 닫지 못함: %s", str(e2).splitlines()[0])
+            r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: {e} - 탭을 닫음"
     finally:
         r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log.info("[%d회차 %d번째] 결과: %s - %s", cycle, bid.order, r.status, r.detail)
@@ -425,7 +419,7 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
             raise LoginLost(f"상품 페이지 확인 중 로그인 화면으로 넘어감: {page.url}") from e
         _cancel_no_fast(page, bid, settings, r, str(e), diagnose)
     except product_mod.PageStalled:
-        raise   # rebid_one 이 화면이 다시 그려질 때까지 기다렸다가 한 번 더 본다 (그리지 않는 화면은 스냅샷도 못 찍는다)
+        raise   # rebid_one 이 탭을 닫는다 (응답 없는 탭은 스냅샷도 못 찍는다)
     except product_mod.SkipProduct as e:
         if _on_login_page(page):
             raise LoginLost(f"상품 페이지 확인 중 로그인 화면으로 넘어감: {page.url}") from e
@@ -554,11 +548,12 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                 break
             status(f"재입찰 {cycle}회차: {bid.order}/{len(bids)} {bid.name[:24]}")
             r, trip = look(bid, cycle, trouble_streak)
-            if trip is not None:
-                # 탭이 멈춰 감시 스레드가 닫은 것 - 새 탭을 열어 그 입찰을 한 번 더 본다 (또 멈추면 그 결과(확인필요)로 둔다)
-                log.warning("[%d회차 %d번째] 탭이 멈춰 닫힘 (%s) - 새 탭을 열어 한 번 더 봄", cycle, bid.order, trip.describe())
+            if tab.is_closed():
+                # 탭이 멈춰 닫힌 것 (감시 스레드가 닫았거나 rebid_one 이 PageStalled 로 닫음) - 새 탭을 열어 그 입찰을 한 번 더 본다
+                log.warning("[%d회차 %d번째] 탭이 멈춰 닫힘 (%s) - 새 탭을 열어 한 번 더 봄",
+                            cycle, bid.order, trip.describe() if trip else r.detail)
                 r, trip = look(bid, cycle, trouble_streak)
-                if trip is not None:
+                if tab.is_closed():
                     log.warning("[%d회차 %d번째] 새 탭에서도 멈춤 - 이 입찰은 확인필요로 두고 다음으로 감", cycle, bid.order)
             if bid.product_id and bid.size_value:
                 entry = {"product_id": bid.product_id, "size": bid.size_value, "option": bid.option or ONE_SIZE}
