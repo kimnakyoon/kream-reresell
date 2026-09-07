@@ -62,13 +62,15 @@ class SalesNotLoaded(SkipProduct):
 
 
 class PageStalled(SkipProduct):
-    """탭이 화면을 그리지 않아(크롬이 잠시 멈춤) 버튼을 누르지 못했다 - 상품·사이트 문제가 아니다.
+    """탭(렌더러)이 응답하지 않아 버튼을 누르지 못했다 - 상품·사이트 문제가 아니다.
 
     Playwright 의 클릭·보임 대기·스크린샷은 모두 화면이 한 번 그려지기(requestAnimationFrame)를 기다리므로, 탭이 그리지 않으면
     전부 타임아웃만 채운다 (2026-09-06 재입찰 실측: '구매하기' 가 보인 직후부터 80초쯤 아무 명령도 안 먹다가 다음 상품부터 정상 -
     클릭 15초 × 3번 뒤 '모달이 뜨지 않음', 스냅샷도 30초 뒤 실패). 우리가 띄우는 크롬은 창을 최소화하거나 다른 탭을 앞에 둬도
-    계속 그린다 (--disable-backgrounding-occluded-windows 등 + Playwright 의 포커스 에뮬레이션, 2026-09-06 확인) - 그러니
-    이건 크롬 자체가 멈춘 것이다. [재입찰]은 화면이 다시 그려지면 그 입찰을 한 번 더 본다.
+    계속 그린다 (--disable-backgrounding-occluded-windows 등 + Playwright 의 포커스 에뮬레이션, 2026-09-06 확인).
+    같은 페이지에서 다시 응답하길 기다려도 소용없다 (2026-09-07 실측 5건: 90초를 기다려도 안 풀렸는데 다음 상품 페이지로
+    이동(goto)하자 3초 만에 정상 - 크롬은 응답 없는 렌더러에서 벗어나는 이동을 새 프로세스로 처리한다). [재입찰]은 상품 페이지를
+    다시 열어 그 입찰을 한 번 더 본다 (reopen_stalled_page).
     """
 
 
@@ -90,7 +92,8 @@ def eval_bounded(page: Page, js: str, arg=None, what: str = "페이지 상태"):
 
 
 def page_stall(page: Page) -> str | None:
-    """탭이 화면을 그리고 있으면 None, 아니면 사유. wait_for_function 은 rAF 뒤에 처음 확인하므로 타임아웃 = 프레임 없음.
+    """탭이 응답하고 있으면 None, 아니면 사유. wait_for_function 은 조건을 먼저 한 번 바로 평가하므로 늘 참인 조건이
+    FRAME_PROBE_MS 안에 안 돌아오면 렌더러가 JS 를 돌리지 못하는 것이다 (프레임 문제가 아니라 페이지 자체가 멈춘 것).
 
     page.evaluate 는 타임아웃이 없어 렌더러가 완전히 멈추면 영영 돌아오지 않는다 - 그래서 시간 제한이 있는 wait_for_function 을 쓴다
     (타임아웃은 드라이버 쪽에서 재므로 페이지가 응답하지 않아도 제때 돌아온다).
@@ -99,28 +102,41 @@ def page_stall(page: Page) -> str | None:
         page.wait_for_function("() => true", timeout=FRAME_PROBE_MS)
         return None
     except PlaywrightTimeout:
-        return "화면이 그려지지 않음 (크롬이 멈춤?)"
+        return "페이지가 응답하지 않음 (탭이 멈춤?)"
     except PlaywrightError as e:
         return f"페이지가 응답하지 않음 ({str(e).splitlines()[0]})"
 
 
-def wait_page_drawing(page: Page, timeout_sec: float) -> str | None:
-    """탭이 다시 화면을 그릴 때까지 3초마다 확인하며 기다린다. 그리면 None, timeout_sec 안에 안 그리면 마지막 사유.
+REOPEN_TIMEOUT_MS = 20_000   # 멈춘 탭에서 벗어나는 이동은 보통보다 오래 걸릴 수 있다 (2026-09-07 00:01 실측: 멈춤 직후 첫 goto 가 15초를 넘김)
+REOPEN_ATTEMPTS = 2
+# 멈춘 탭을 되살리는 경유지. 같은 사이트(kream → kream)나 about:blank 로의 이동은 같은 렌더러 프로세스에서 처리돼 렌더러가 막혀 있으면
+# 영영 안 끝나지만, data: URL 은 다른 사이트로 취급돼 새 프로세스에서 열리므로 렌더러가 무한 루프에 걸려 있어도 바로 열린다
+# (2026-09-07 임시 크롬 실험: 메인 스레드를 막은 탭에서 같은 사이트·about:blank 는 10~20초 타임아웃, data: 는 0.0초에 열리고 그 뒤
+# 같은 사이트 이동도 0.1초). 실측 멈춤 5건은 다음 상품(같은 사이트)으로의 이동만으로도 풀렸지만 안전하게 늘 경유한다.
+STALL_DETOUR_URL = "data:text/html,<title>kream-reresell</title>"
 
-    혹시 탭이 뒤로 가 있는 것이면 bring_to_front 로 앞으로 불러온다 (브라우저 프로세스가 처리하므로 렌더러가 멈춰도 바로 돌아온다).
+
+def reopen_stalled_page(page: Page, url: str) -> str | None:
+    """멈춘 탭을 data: URL 로 한 번 보냈다가(새 렌더러 프로세스) url 로 다시 이동해 되살린다. 되살아나면 None, 안 되면 사유.
+
+    같은 페이지가 다시 응답하길 기다리는 건 소용없다 (2026-09-07 실측 5건 모두 90초 안에 안 풀렸고 다음 상품으로 이동하자 바로 정상).
+    이동이 시간 제한을 넘기면 한 번 더 - 탭이 아예 안 돌아오면 감시 스레드(hangwatch)가 90초 뒤 탭을 닫아 호출을 끝낸다.
     """
-    deadline = time.monotonic() + timeout_sec
-    while True:
+    for attempt in range(REOPEN_ATTEMPTS):
         try:
-            page.bring_to_front()
-        except PlaywrightError:
-            pass
-        reason = page_stall(page)
-        left = deadline - time.monotonic()
-        if reason is None or left <= 0:
-            return reason
-        log.info("화면이 그려질 때까지 기다림: %s (%d초 남음)", reason, int(left))
-        time.sleep(min(3.0, left))
+            page.goto(STALL_DETOUR_URL, wait_until="domcontentloaded", timeout=REOPEN_TIMEOUT_MS)
+            page.goto(url, wait_until="domcontentloaded", timeout=REOPEN_TIMEOUT_MS)
+        except PlaywrightTimeout:
+            log.info("멈춘 탭 되살리기 %d/%d: %d초 안에 이동이 끝나지 않음 (지금 주소 %s)",
+                     attempt + 1, REOPEN_ATTEMPTS, REOPEN_TIMEOUT_MS // 1000, page.url)
+            continue
+        except PlaywrightError as e:
+            return f"탭을 되살리지 못함 ({str(e).splitlines()[0]})"
+        stall = page_stall(page)
+        if stall is None:
+            return None
+        log.info("멈춘 탭 되살리기 %d/%d: 상품 페이지로 이동은 됐는데 %s", attempt + 1, REOPEN_ATTEMPTS, stall)
+    return f"탭을 {REOPEN_ATTEMPTS}번 되살려 봐도 응답하지 않음"
 
 
 @dataclass
@@ -703,7 +719,7 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None =
             buy.click(timeout=BUY_CLICK_TIMEOUT_MS)
             modal.wait_for(state="visible", timeout=4000)
         except PlaywrightTimeout as e:
-            # 버튼이 보이는데도 못 누르는 건 탭이 화면을 그리지 않는 것일 수 있다 - 그러면 재시도해도 소용없으니 바로 알린다
+            # 버튼이 보이는데도 못 누르는 건 탭이 응답하지 않는 것일 수 있다 - 그러면 재시도해도 소용없으니 바로 알린다
             stall = page_stall(page)
             if stall:
                 raise PageStalled(f"'구매하기' 를 누르지 못함 - {stall}") from e
