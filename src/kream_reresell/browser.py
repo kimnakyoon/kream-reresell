@@ -152,6 +152,25 @@ def watch_api_requests(context: BrowserContext, trim: bool = True) -> None:
     context.route(f"{pacing.API_ORIGIN}/**", _api_route)
 
 
+def _count_visit(frame) -> None:
+    """메인 프레임이 kream.co.kr 주소로 이동했으면 접속 예산에 하나 센다 (주소 안 이동도 framenavigated 로 온다)."""
+    if frame.parent_frame is None and (urlparse(frame.url).hostname or "").endswith("kream.co.kr"):
+        pacing.PAGE_BUDGET.count()
+
+
+def watch_page_visits(context: BrowserContext) -> None:
+    """이 컨텍스트의 모든 탭(지금 있는 것과 앞으로 열 것)의 페이지 이동을 접속 예산에 센다 (pacing 대응 5).
+
+    호출 지점에서 세지 않고 여기서 세므로 상품·구매 페이지뿐 아니라 변경 화면, 입찰 상세, 재시도, 사이트 확인 페이지도 다 들어간다.
+    """
+    def on_page(page) -> None:
+        page.on("framenavigated", _count_visit)
+
+    for page in context.pages:
+        on_page(page)
+    context.on("page", on_page)
+
+
 # ---------------------------------------------------------------- 크롬 창 위치 (Windows 전용)
 
 if sys.platform == "win32":
@@ -369,6 +388,7 @@ def real_chrome_context(playwright: Playwright, window_size: str = "1400,1000",
         if block_images:
             block_heavy_resources(context)
         watch_api_requests(context, trim=trim_api)
+        watch_page_visits(context)
         # 탭의 렌더러가 완전히 멈춰 호출이 영영 안 돌아오면 그 탭을 닫아 이어가게 한다 (hangwatch 참고, 2026-09-06 실측)
         hangwatch.start(context, port)
         yield context

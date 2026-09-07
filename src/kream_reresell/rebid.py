@@ -45,6 +45,7 @@ product.NoFastDelivery) 그 입찰도 지운다 (사용자 결정 2026-09-06 - �
 변경 화면을 다시 열어 한 번 더 시도하고(CHANGE_ATTEMPTS - 화면이 늦게 그려져 생기는 일시적 불일치가 대부분), 그래도 못 올리면
 같은 방식으로 지운다 (사용자 결정 2026-09-06 - 밀린 채 두지 않음). 마지막 '입찰하기' 를 누른 뒤 결과가 불확실한 건은 지우지 않고 확인필요.
 사이클이 끝날 때마다 그 사이클에 나간 스로틀 대상 API 요청 수를 로그에 남긴다 (pacing.BUDGET).
+입찰 하나를 보기 전에 접속 예산(페이지 이동 수, pacing 대응 5)에 자리가 날 때까지 쉰다 (pacing.before_product).
 상품 금액 상한은 새로 입찰할 때만 쓰는 규칙이라 ([입찰취소] 와 같음) 기준은 충족하는데 A 가 상한을 넘기만 하는 입찰은
 올리지도 지우지도 않고 그대로 둔다 (변경안함).
 """
@@ -546,6 +547,8 @@ def run(context: BrowserContext, page: Page, settings: Settings,
             if stop():
                 log.info("사용자 요청으로 중지 - 남은 입찰 %d건은 보지 않음", len(bids) - len(cycle_results))
                 break
+            if not pacing.before_product(stop, status):   # 접속 예산 (pacing 대응 5) - 자리가 없으면 날 때까지 쉰다
+                break
             status(f"재입찰 {cycle}회차: {bid.order}/{len(bids)} {bid.name[:24]}")
             r, trip = look(bid, cycle, trouble_streak)
             if tab.is_closed():
@@ -589,8 +592,9 @@ def run(context: BrowserContext, page: Page, settings: Settings,
         summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "처리한 입찰 없음"
         elapsed = time.monotonic() - started
         api_calls = pacing.BUDGET.total - api_calls_before
-        log.info("===== 재입찰 %d회차 끝 (%d초): %s | 스로틀 대상 API 요청 %d건 (지금 10분 창 %d/%d건) =====",
-                 cycle, int(elapsed), summary, api_calls, pacing.BUDGET.used(), pacing.BUDGET.limit)
+        log.info("===== 재입찰 %d회차 끝 (%d초): %s | 스로틀 대상 API 요청 %d건 (지금 10분 창 %d/%d건), 페이지 이동 %d/%d번 =====",
+                 cycle, int(elapsed), summary, api_calls, pacing.BUDGET.used(), pacing.BUDGET.limit,
+                 pacing.PAGE_BUDGET.used(), pacing.PAGE_BUDGET.limit)
         if on_cycle:
             on_cycle(cycle, cycle_results)
         if stop():

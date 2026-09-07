@@ -347,6 +347,8 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
             continue
         if done > 1:
             pacing.pause(pacing.PRODUCT_PAUSE_SEC, stop)   # 상품 사이 간격 (사이트 스로틀 대응)
+        if not pacing.before_product(stop, status):        # 접속 예산 (pacing 대응 5) - 자리가 없으면 날 때까지 쉰다
+            break
         status(f"[{item.category}] {item.rank}위 {item.name[:24]} 확인 중 ({done}/{len(items)})")
         product_results = process_product(context, item, settings, open_bids, stop, status)
         for r in product_results:

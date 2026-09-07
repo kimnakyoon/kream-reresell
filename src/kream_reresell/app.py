@@ -71,7 +71,8 @@ def describe_settings(settings: Settings, categories: list[str], keywords: list[
     else:
         source = f"랭킹 {' → '.join(categories)} (랭킹마다 {settings.max_products}개)"
     return (f"조건: 최근 {settings.lookback_days}일 빠른배송 {settings.min_fast_sales}건 이상, "
-            f"{settings.rules.describe()}, 입찰기한 {settings.bid_days}일, {source}"
+            f"{settings.rules.describe()}, 입찰기한 {settings.bid_days}일, {source}, "
+            f"접속 예산 10분 {settings.page_budget_per_10min}번"
             + (", 조건 무시(--force)" if settings.force else ""))
 
 
@@ -288,7 +289,8 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
                  r.status, r.detail)
     path = report.write_report(results, settings_line, mode)
     log.info("엑셀 보고서: %s", path)
-    log.info("사이트 스로틀 대상 API 요청 %d건 보냄 (10분 예산 %d건)", pacing.BUDGET.total, pacing.BUDGET.limit)
+    log.info("사이트 스로틀 대상 API 요청 %d건 보냄 (10분 예산 %d건), 페이지 이동 %d번 (10분 예산 %d번)",
+             pacing.BUDGET.total, pacing.BUDGET.limit, pacing.PAGE_BUDGET.total, pacing.PAGE_BUDGET.limit)
     return JobResult(results=results, report_path=path, mode=mode)
 
 
@@ -327,7 +329,7 @@ def describe_rebid_settings(settings: Settings) -> str:
             f"{settings.min_fast_sales}건 이상, {settings.rules.describe()}) 하고, 충족하면 [입찰 변경하기] 로 희망가를 "
             f"최신 B 로 올림 (마감 {settings.bid_days}일, 창고보관). 기준 미달이거나 빠른배송(판매자)이 없으면 입찰을 지움 "
             f"(상한만 넘는 것은 그대로 둠). "
-            f"사이클 간격 {settings.rebid_interval_min:g}분, "
+            f"사이클 간격 {settings.rebid_interval_min:g}분, 접속 예산 10분 {settings.page_budget_per_10min}번, "
             f"{'중지할 때까지 반복' if not settings.rebid_cycles else f'{settings.rebid_cycles}회 돌고 끝'}")
 
 

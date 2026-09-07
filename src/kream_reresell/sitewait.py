@@ -4,6 +4,7 @@
 '불러오는 중 문제가 생겼어요 / 다시 시도' 오류 표시), 계속 두드리는 동안은 20분 넘게 이어지다가 7분쯤 쉬면 풀렸다.
 그래서 판단 불가·오류가 TROUBLE_STREAK 건 연달아 나면 상품을 더 열지 않고 멈춘 채, PROBE_SEC 마다 한 번씩만
 확인해 보고 다시 주기 시작하면 이어서 본다 (사용자 결정, 2026-09-05: 포기하고 끝내지 않고 풀릴 때까지 기다린다).
+풀리면 남은 실행의 접속 예산을 반으로 줄인다 (pacing.PAGE_BUDGET.tighten - 계속 접속해서 막힌 것이니 더 천천히).
 """
 
 from __future__ import annotations
@@ -11,6 +12,8 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+
+from . import pacing
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +57,7 @@ def wait_until_site_back(probe: Callable[[], bool], should_stop: Callable[[], bo
                 log.info("아직 %s을 주지 않음 (%d번째 확인, %d분 지남)", what, tries, int(time.monotonic() - started) // 60)
         if ok:
             log.info("사이트가 %s을 다시 줌 (%d분 멈췄음) - 이어서 봄", what, int(time.monotonic() - started) // 60)
+            pacing.PAGE_BUDGET.tighten()
             return True
     log.info("사용자 요청으로 중지 - %s을 기다리던 중", what)
     return False
