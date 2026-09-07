@@ -77,6 +77,18 @@ class PageStalled(SkipProduct):
 FRAME_PROBE_MS = 1500     # 이 안에 한 프레임도 안 그려지면 멈춘 것으로 본다 (정상이면 20ms 안)
 
 
+def eval_bounded(page: Page, js: str, arg=None, what: str = "페이지 상태"):
+    """page.evaluate 대신 쓰는 시간 제한 있는 평가. js 는 늘 참인 값(문자열·객체)을 돌려줘야 한다.
+
+    evaluate 는 타임아웃이 없어 크롬이 멈추면 영영 안 돌아온다 - 시간 제한이 있는 wait_for_function 으로 대신하고
+    (타임아웃은 드라이버 쪽에서 재므로 페이지가 응답하지 않아도 제때 돌아온다), 안 돌아오면 PageStalled.
+    """
+    try:
+        return page.wait_for_function(js, arg=arg, polling=100, timeout=FRAME_PROBE_MS * 2).json_value()
+    except PlaywrightTimeout as e:
+        raise PageStalled(f"{what}를 읽지 못함 - 페이지가 응답하지 않음 (크롬이 멈춤?)") from e
+
+
 def page_stall(page: Page) -> str | None:
     """탭이 화면을 그리고 있으면 None, 아니면 사유. wait_for_function 은 rAF 뒤에 처음 확인하므로 타임아웃 = 프레임 없음.
 
@@ -140,6 +152,11 @@ def open_product(page: Page, url: str) -> str:
 
 def on_product_page(page: Page, product_id: int) -> bool:
     return urlparse(page.url).path.rstrip("/") == f"/products/{product_id}"
+
+
+def on_buy_page(page: Page, product_id: int) -> bool:
+    """구매 페이지(/buy/{id}, 입찰 변경 화면도 같은 경로)인지. 로그인 화면의 returnUrl 에도 /buy/{id} 가 들어가므로 경로로 본다."""
+    return urlparse(page.url).path.startswith(f"/buy/{product_id}")
 
 
 # ---------------------------------------------------------------- 체결 내역
@@ -668,8 +685,8 @@ _SALES_PANEL_VISIBLE_JS = r"""
 
 # ---------------------------------------------------------------- 구매하기 모달 -> A
 
-def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None = None) -> int:
-    """'구매하기' 모달에서 빠른배송 가격 A 를 읽고, 일반배송을 골라 구매 페이지로 넘어간다.
+def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None = None) -> tuple[int, int]:
+    """'구매하기' 모달에서 빠른배송 가격 A 를 읽고, 일반배송을 골라 구매 페이지로 넘어가 즉시 판매가 B 까지 읽는다. (A, B).
 
     모달 루트는 .bottom-sheet__layer--open.layer-option-picker (사이즈 목록 + 배송 선택 + 버튼).
     option 을 주면 모달의 옵션 목록에서 그 옵션(화면 표기, 예 W240)을 고른 뒤 읽는다. 없으면 ONE SIZE 상품이어야 한다.
@@ -742,62 +759,68 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None =
     except PlaywrightTimeout as e:
         dump(page, f"{product_id}_no_buy_page")
         raise SkipProduct(f"'즉시 구매 / 구매 입찰' 을 눌렀는데 구매 페이지로 넘어가지 않음 (지금 주소 {page.url})") from e
-    wait_buy_page_loaded(page, product_id, want)
-    if option:
-        # 구매 페이지 상단의 옵션 표기가 고른 것과 같은지 (다른 사이즈에 입찰하지 않도록). 다 불러온 뒤에 본다 - 불러오는 중에는
+    loaded = wait_buy_page_loaded(page, product_id, want)
+    if option and not loaded.option_shown:
+        # 구매 페이지 상단의 옵션 표기가 고른 것과 같아야 한다 (다른 사이즈에 입찰하지 않도록). 다 불러온 뒤에 본다 - 불러오는 중에는
         # 상품명·옵션 자리에 '리스트 로딩중입니다.' 그림만 있어 옵션 표기가 없다
-        body = page.locator("body").inner_text()
-        if not re.search(rf"(^|\n)\s*{re.escape(option)}\s*(\n|$)", body):
-            raise SkipProduct(f"구매 페이지의 옵션 표기가 '{option}' 이 아님 (주소 {page.url})")
-    return price_a
+        raise SkipProduct(f"구매 페이지의 옵션 표기가 '{option}' 이 아님 (주소 {page.url})")
+    log.info("B(즉시 판매가) = %s원", f"{loaded.price_b:,}")
+    return price_a, loaded.price_b
 
 
 # 구매 페이지가 상품 정보를 다 불러왔는지. '즉시 판매가' 글자는 페이지 뼈대에 있어 API 응답 전에도 '-' 값과 함께 바로 그려지고,
 # 상품명·모델번호·옵션 자리에는 '리스트 로딩중입니다.' 그림(img alt)만 있다 (2026-09-06~07 실측: 보통 1~2초, 그 사이에 읽으면
 # 즉시 판매가가 '-' 라 '구매 입찰 없음' 으로 잘못 보여 [재입찰]이 멀쩡한 입찰 14건을 지웠고, 옵션 표기가 없어 '옵션 표기가 아님' 확인필요 5건).
-#  'price'    - '즉시 판매가 N원' 이 그려짐
-#  'no-price' - 로딩 그림이 사라지고 옵션 표기(ONE SIZE 또는 사이즈)까지 그려졌는데 즉시 판매가가 '-' = 구매 입찰이 정말 없음
-#  'loading'  - 로딩 그림이 아직 보임
-#  'blank'    - 로딩 그림은 없는데 즉시 판매가도 옵션 표기도 없음 (그리는 중이거나 옵션 표기가 다름)
+# 돌려주는 값 {state, price, optionShown}:
+#  state 'price'    - '즉시 판매가 N원' 이 그려짐 (price 에 그 값)
+#        'no-price' - 로딩 그림이 사라지고 옵션 표기(ONE SIZE 또는 사이즈)까지 그려졌는데 즉시 판매가가 '-' = 구매 입찰이 정말 없음
+#        'loading'  - 로딩 그림이 아직 보임
+#        'blank'    - 로딩 그림은 없는데 즉시 판매가도 옵션 표기도 없음 (그리는 중이거나 옵션 표기가 다름)
+#  optionShown      - 본문에 한 줄이 정확히 label 인 곳이 있는지 (구매 페이지 상단의 옵션 표기)
 # final 이 아니면 판정이 끝난 상태('price'·'no-price')만 돌려주고 나머지는 false (wait_for_function 이 계속 기다리도록)
 _BUY_PAGE_STATE_JS = r"""
 ([label, final]) => {
   const text = document.body.innerText;
+  const m = text.match(/즉시 판매가\s*([\d,]+)\s*원/);
+  const optionShown = text.split('\n').some(line => line.trim() === label);
   let state;
-  if (/즉시 판매가\s*[\d,]+\s*원/.test(text)) state = 'price';
+  if (m) state = 'price';
   else if ([...document.querySelectorAll('img[alt*="로딩"]')]
              .some(i => { const r = i.getBoundingClientRect(); return r.width > 0 || r.height > 0; })) state = 'loading';
-  else if (text.split('\n').some(line => line.trim() === label)) state = 'no-price';
+  else if (optionShown) state = 'no-price';
   else state = 'blank';
-  if (final || state === 'price' || state === 'no-price') return state;
+  if (final || state === 'price' || state === 'no-price')
+    return { state, price: m ? parseInt(m[1].replace(/,/g, ''), 10) : null, optionShown };
   return false;
 }
 """
 BUY_PAGE_LOAD_TIMEOUT_MS = 12_000   # 상품 정보(가격·옵션 표기)를 다 불러오길 기다리는 최대 시간 (정상이면 1~2초, 느린 시간대 대비)
+BUY_PAGE_POLL_MS = 200              # 위 상태를 이 간격으로 본다 (기본 'raf' 는 매 프레임 본문 전체를 읽어 로딩 중인 페이지를 더 느리게 한다)
 
 
-def wait_buy_page_loaded(page: Page, product_id: int, label: str) -> None:
-    """구매 페이지가 상품 정보를 다 불러올 때까지 기다린다. '즉시 판매가 N원' 이 그려지면 돌아온다.
+@dataclass
+class BuyPageLoaded:
+    price_b: int          # 즉시 판매가 (B)
+    option_shown: bool    # 상단의 옵션 표기가 기대한 label 과 같은지
+
+
+def wait_buy_page_loaded(page: Page, product_id: int, label: str) -> BuyPageLoaded:
+    """구매 페이지가 상품 정보를 다 불러올 때까지 기다린다. '즉시 판매가 N원' 이 그려지면 그 값(B)과 옵션 표기 여부를 돌려준다.
 
     다 불러왔는데(로딩 그림 없음, 옵션 표기 label 그려짐) 즉시 판매가가 '-' 이면 구매 입찰이 없는 것 → NoPriceB ([재입찰]은 지운다).
     시간 안에 다 불러오지 못하면 판단 불가(SkipProduct) - 아직 불러오는 중에 '-' 를 보고 지우지 않도록.
     구매 페이지가 아닌 곳으로 갔으면 SkipProduct, 페이지가 응답하지 않으면 PageStalled.
     """
     try:
-        state = page.wait_for_function(_BUY_PAGE_STATE_JS, arg=[label, False], timeout=BUY_PAGE_LOAD_TIMEOUT_MS).json_value()
+        result = page.wait_for_function(_BUY_PAGE_STATE_JS, arg=[label, False], polling=BUY_PAGE_POLL_MS,
+                                        timeout=BUY_PAGE_LOAD_TIMEOUT_MS).json_value()
     except PlaywrightTimeout:
-        state = ""
-    if not state:
-        try:
-            # evaluate 는 타임아웃이 없어 크롬이 멈추면 영영 안 돌아온다 - 시간 제한이 있는 wait_for_function 으로 (final 이면 늘 문자열)
-            state = page.wait_for_function(_BUY_PAGE_STATE_JS, arg=[label, True], polling=100,
-                                           timeout=FRAME_PROBE_MS * 2).json_value()
-        except PlaywrightTimeout as e:
-            raise PageStalled("구매 페이지 상태를 읽지 못함 - 페이지가 응답하지 않음 (크롬이 멈춤?)") from e
-    if not urlparse(page.url).path.startswith(f"/buy/{product_id}"):
+        result = eval_bounded(page, _BUY_PAGE_STATE_JS, arg=[label, True], what="구매 페이지 상태")
+    if not on_buy_page(page, product_id):
         raise SkipProduct(f"구매 페이지가 뜨지 않음 (지금 주소 {page.url})")
+    state = result["state"]
     if state == "price":
-        return
+        return BuyPageLoaded(price_b=result["price"], option_shown=result["optionShown"])
     if state == "no-price":
         # 다 불러왔는데 즉시 판매가가 '-' (구매 입찰이 하나도 없음) - [재입찰]은 이 경우 입찰을 지운다
         raise NoPriceB(f"구매 페이지를 다 불러왔는데 '즉시 판매가' 가 없음 ('-', 옵션 표기 '{label}' 은 그려짐)")
@@ -820,7 +843,7 @@ def _pass_model_number_check(page: Page, product_id: int) -> None:
         page.wait_for_function(_BUY_PAGE_OR_MODEL_CHECK_JS, arg=[product_id, MODEL_CHECK_BUTTON], timeout=8000)
     except PlaywrightTimeout:
         return  # 둘 다 아니면 뒤의 wait_for_url 이 판단한다
-    if urlparse(page.url).path.startswith(f"/buy/{product_id}"):
+    if on_buy_page(page, product_id):
         return
     button = page.get_by_role("button", name=MODEL_CHECK_BUTTON, exact=True).first
     try:
@@ -859,11 +882,7 @@ _CLOSE_BUY_MODAL_JS = r"""
 
 def _close_buy_modal_if_open(page: Page, modal) -> None:
     """구매하기 모달이 열려 있으면 닫기 버튼으로 닫는다. 닫히지 않으면 상품 페이지를 다시 연다 (그래야 '구매하기' 를 누를 수 있다)."""
-    try:
-        # evaluate 는 타임아웃이 없어 크롬이 멈추면 영영 안 돌아온다 - 시간 제한이 있는 wait_for_function 으로 (결과 문자열은 늘 참)
-        state = page.wait_for_function(_CLOSE_BUY_MODAL_JS, polling=100, timeout=FRAME_PROBE_MS * 2).json_value()
-    except PlaywrightTimeout as e:
-        raise PageStalled("구매하기 모달 상태를 읽지 못함 - 페이지가 응답하지 않음 (크롬이 멈춤?)") from e
+    state = eval_bounded(page, _CLOSE_BUY_MODAL_JS, what="구매하기 모달 상태")
     if state == "none":
         return
     log.info("구매하기 모달이 이미 열려 있음 - 닫고 다시 엶 (%s)", state)
@@ -917,17 +936,6 @@ def _parse_fast_price(modal_text: str) -> int | None:
         if not m.group(1):
             return int(m.group(2).replace(",", ""))
     return None
-
-
-def read_price_b(page: Page) -> int:
-    """구매 페이지 상단의 '즉시 판매가' = B."""
-    text = page.locator("body").inner_text()
-    m = re.search(r"즉시 판매가\s*([\d,]+)\s*원", text)
-    if not m:
-        raise NoPriceB("즉시 판매가(B)를 읽지 못함 (구매 입찰 없음?)")
-    price_b = int(m.group(1).replace(",", ""))
-    log.info("B(즉시 판매가) = %s원", f"{price_b:,}")
-    return price_b
 
 
 def size_from_url(url: str) -> str:

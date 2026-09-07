@@ -129,12 +129,13 @@ CHANGE_PAGE_MATCH_TIMEOUT_MS = 12_000   # 상품명·옵션이 그려지길 기�
 
 # ---------------------------------------------------------------- 빠른 확인
 
-def read_current_b(page: Page, product_id: int, size: str = ONE_SIZE) -> int | None:
-    """구매 페이지를 바로 열어 '즉시 판매가' B 만 읽는다. 구매 페이지가 안 뜨고 다른 곳으로 가면(옵션 상품 등) None.
+def read_current_b(page: Page, product_id: int, size: str = ONE_SIZE, label: str = ONE_SIZE) -> int | None:
+    """구매 페이지를 바로 열어 '즉시 판매가' B 만 읽는다. 구매 페이지가 안 뜨고 다른 곳으로 가거나 다 불러오지 못하면 None.
 
+    size 는 주소의 size 값(240), label 은 화면의 옵션 표기(W240) - 다 불러왔는지 볼 때 쓴다 (product.wait_buy_page_loaded).
     사이트가 응답을 안 줄 때 다시 주는지 보는 확인(_wait_for_site)에 쓴다. 입찰마다 하던 빠른 확인은 2026-09-06 에 뺐다 -
     A 도 매번 읽게 되어 어차피 같은 구매 페이지를 다시 열기 때문 (지금은 product.read_price_a_and_go_to_buy 가 같은 구매 페이지에서 B 를 읽는다).
-    구매 페이지에 와 있는데 '즉시 판매가' 가 안 그려지면 NoPriceB.
+    구매 페이지를 다 불러왔는데 '즉시 판매가' 가 '-' 이면 NoPriceB.
     구매 페이지 이동이 15초 안에 안 끝나거나 끊기면(net::ERR_ABORTED) 1.5초 뒤 한 번 더 열고, 그래도 안 되면 SkipProduct(판단 불가).
     """
     url = buy_page_url(product_id, size)
@@ -147,26 +148,15 @@ def read_current_b(page: Page, product_id: int, size: str = ONE_SIZE) -> int | N
                 raise product_mod.SkipProduct(f"구매 페이지를 열지 못함 (두 번 시도): {str(e).splitlines()[0]}") from e
             log.info("구매 페이지 이동이 안 끝남 (%s) - 1.5초 뒤 다시 엶", str(e).splitlines()[0])
             page.wait_for_timeout(1500)
-    # 고정 대기 대신 '즉시 판매가 N원' 이 실제로 그려질 때까지만 기다린다 (상품 페이지로 돌려보내지면 안 그려져 타임아웃)
     try:
-        page.wait_for_function(_PRICE_B_RENDERED_JS, timeout=8000)
-    except PlaywrightTimeout:
+        return product_mod.wait_buy_page_loaded(page, product_id, label).price_b
+    except product_mod.NoPriceB:
+        raise
+    except product_mod.SkipProduct as e:
         if _on_login_page(page):
-            raise LoginLost(f"구매 페이지가 로그인 화면으로 넘어감: {page.url}") from None
-        if urlparse(page.url).path.startswith(f"/buy/{product_id}"):
-            raise product_mod.NoPriceB("구매 페이지가 떴는데 '즉시 판매가' 가 없음") from None
-        log.info("구매 페이지가 다른 곳으로 넘어감 (지금 주소 %s)", page.url)
+            raise LoginLost(f"구매 페이지가 로그인 화면으로 넘어감: {page.url}") from e
+        log.info("즉시 판매가가 그려지지 않음: %s", e)
         return None
-    # 로그인 화면의 returnUrl 에도 /buy/{id} 가 들어가므로 경로로 본다
-    if not urlparse(page.url).path.startswith(f"/buy/{product_id}"):
-        return None
-    try:
-        return product_mod.read_price_b(page)
-    except product_mod.SkipProduct:
-        return None
-
-
-_PRICE_B_RENDERED_JS = "() => /즉시 판매가\\s*[\\d,]+\\s*원/.test(document.body.innerText)"
 
 
 # ---------------------------------------------------------------- 변경
@@ -475,7 +465,7 @@ def _wait_for_site(page: Page, probe: OpenBid, should_stop: Callable[[], bool],
         if not probe.product_id:
             # 확인할 상품을 모르면 (상세를 못 읽은 입찰) 한 번 쉰 뒤 그냥 이어서 본다 - 또 막히면 다시 멈춘다
             return True
-        b = read_current_b(page, probe.product_id, probe.size_value or ONE_SIZE)
+        b = read_current_b(page, probe.product_id, probe.size_value or ONE_SIZE, probe.option or ONE_SIZE)
         if b is not None:
             log.info("즉시 판매가 %s원이 다시 그려짐", f"{b:,}")
         return b is not None

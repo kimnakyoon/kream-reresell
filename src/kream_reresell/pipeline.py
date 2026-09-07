@@ -86,14 +86,13 @@ def judge_prices(page: Page, r: ProductResult, settings: Settings, price_limit: 
     [재입찰]은 밀리지 않은 입찰의 A 변동을 볼 때 거래량 없이 이것만 부른다 (browser.sales_trimmed 안에서).
     """
     pid = r.product_id
-    r.price_a = product_mod.read_price_a_and_go_to_buy(page, pid, option)
+    r.price_a, r.price_b = product_mod.read_price_a_and_go_to_buy(page, pid, option)
     r.size = product_mod.size_from_url(page.url) or (ONE_SIZE if not option else "")
     if price_limit and settings.rules.over_limit(r.price_a):
         log.info("A %s원 > 상품 금액 상한 %s원 - 바로 건너뜀", f"{r.price_a:,}", f"{settings.rules.max_price_a:,}")
         return f"A {r.price_a:,}원 > 상품 금액 상한 {settings.rules.max_price_a:,}원"
     if settings.inspect:
         dump(page, f"{pid}_1_buy_page")
-    r.price_b = product_mod.read_price_b(page)
 
     rate = r.margin_rate or 0.0
     tier = settings.rules.tier_for(r.price_a)
