@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-from playwright.sync_api import BrowserContext, Playwright
+from playwright.sync_api import BrowserContext, Frame, Page, Playwright
 
 from . import hangwatch, pacing, winproc
 from .config import ROOT
@@ -152,9 +152,19 @@ def watch_api_requests(context: BrowserContext, trim: bool = True) -> None:
     context.route(f"{pacing.API_ORIGIN}/**", _api_route)
 
 
-def _count_visit(frame) -> None:
-    """메인 프레임이 kream.co.kr 주소로 이동했으면 접속 예산에 하나 센다 (주소 안 이동도 framenavigated 로 온다)."""
-    if frame.parent_frame is None and (urlparse(frame.url).hostname or "").endswith("kream.co.kr"):
+# 탭마다 마지막으로 센 주소 - 사이트가 같은 주소로 되풀이하는 replaceState 를 안 세려고 (pacing 대응 5 참고).
+# 공개 API 의 framenavigated 는 진짜 문서 로드와 주소 안 이동을 구분해 주지 않아 주소가 바뀔 때만 센다 - 같은 주소를
+# 다시 여는 재시도 한 번은 안 세지지만, 모든 요청을 파이썬으로 받는 request 리스너보다 싸다
+_last_visit: dict[Page, str] = {}
+
+
+def _count_visit(frame: Frame) -> None:
+    """메인 프레임이 kream.co.kr 의 다른 주소로 이동했으면(주소 안 이동 pushState 포함) 접속 예산에 하나 센다."""
+    if frame.parent_frame is not None:
+        return
+    url = frame.url
+    if (urlparse(url).hostname or "").endswith("kream.co.kr") and _last_visit.get(frame.page) != url:
+        _last_visit[frame.page] = url
         pacing.PAGE_BUDGET.count()
 
 
@@ -163,8 +173,9 @@ def watch_page_visits(context: BrowserContext) -> None:
 
     호출 지점에서 세지 않고 여기서 세므로 상품·구매 페이지뿐 아니라 변경 화면, 입찰 상세, 재시도, 사이트 확인 페이지도 다 들어간다.
     """
-    def on_page(page) -> None:
+    def on_page(page: Page) -> None:
         page.on("framenavigated", _count_visit)
+        page.on("close", lambda p: _last_visit.pop(p, None))
 
     for page in context.pages:
         on_page(page)

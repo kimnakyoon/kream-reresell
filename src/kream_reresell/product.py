@@ -77,13 +77,15 @@ PROBE_MS = 1500     # 늘 참인 JS 가 이 안에 안 돌아오면 멈춘 것�
 
 
 def eval_bounded(page: Page, js: str, arg=None, what: str = "페이지 상태"):
-    """page.evaluate 대신 쓰는 시간 제한 있는 평가. js 는 늘 참인 값(문자열·객체)을 돌려줘야 한다.
+    """page.evaluate 대신 쓰는 시간 제한 있는 평가 (js 는 인자 하나를 받는 함수, 거짓 값을 돌려줘도 된다).
 
     evaluate 는 타임아웃이 없어 탭이 멈추면 영영 안 돌아온다 - 시간 제한이 있는 wait_for_function 으로 대신하고
     (타임아웃은 드라이버 쪽에서 재므로 페이지가 응답하지 않아도 제때 돌아온다), 안 돌아오면 PageStalled.
+    wait_for_function 은 참 값이 나와야 돌아오므로 결과를 객체로 감싸 한 번에 돌려받는다.
     """
     try:
-        return page.wait_for_function(js, arg=arg, polling=100, timeout=PROBE_MS * 2).json_value()
+        return page.wait_for_function(f"(a) => ({{ v: ({js})(a) }})", arg=arg, polling=100,
+                                      timeout=PROBE_MS * 2).json_value().get("v")
     except PlaywrightTimeout as e:
         raise PageStalled(f"{what}를 읽지 못함 - 페이지가 응답하지 않음 (탭이 멈춤?)") from e
 
@@ -102,6 +104,14 @@ def page_stall(page: Page) -> str | None:
         return "페이지가 응답하지 않음 (탭이 멈춤?)"
     except PlaywrightError as e:
         return f"페이지가 응답하지 않음 ({str(e).splitlines()[0]})"
+
+
+def raise_if_stalled(page: Page, button: str, cause: Exception) -> None:
+    """버튼 클릭이 타임아웃한 뒤 부른다 - 버튼이 보이는데도 못 누르는 건 탭이 응답하지 않는 것일 수 있고, 그러면 재시도해도
+    소용없으니 바로 PageStalled 로 알린다 ([재입찰]은 탭을 닫고 새 탭에서 한 번 더 본다). 응답하면 그냥 돌아온다 (재시도)."""
+    stall = page_stall(page)
+    if stall:
+        raise PageStalled(f"{button} 를 누르지 못함 - {stall}") from cause
 
 
 @dataclass
@@ -162,7 +172,7 @@ def read_sales_stats(page: Page, lookback_days: int, need: int, option: str | No
 
 def open_sales_panel(page: Page) -> None:
     """'거래 내역 더보기' 패널을 연다 (이미 열려 있으면 그대로). 행이 그려질 때까지만 기다린다."""
-    if page.evaluate(_SALES_PANEL_VISIBLE_JS):
+    if eval_bounded(page, _SALES_PANEL_VISIBLE_JS, what="거래 내역 패널 상태"):
         return
     # 아직 리셀 거래(빠른배송)가 열리지 않은 상품은 체결 거래/입찰 표 자체가 없다.
     # 나중에 생길 수 있으므로 매 실행마다 확인은 하고, 없으면 기다리지 않고 바로 넘긴다.
@@ -180,7 +190,9 @@ def open_sales_panel(page: Page) -> None:
             # 패널 루트 클래스는 숨겨진 모바일 복제본에도 붙어 있어 locator 의 visible 판정을 쓸 수 없다
             page.wait_for_function(_SALES_PANEL_VISIBLE_JS, timeout=4000)
             break
-        except PlaywrightTimeout:
+        except PlaywrightTimeout as e:
+            # (2026-09-08 09:14 실측: 멈춘 탭에서 세 번 다 타임아웃 뒤 '패널이 열리지 않음' 확인필요, 스냅샷도 못 찍힘)
+            raise_if_stalled(page, "'거래 내역 더보기'", e)
             log.debug("거래 내역 패널 열기 재시도 %d", attempt + 1)
             page.wait_for_timeout(700)
     else:
@@ -278,7 +290,7 @@ def _wait_sales_state(page: Page, timeout_ms: int, option: str | None = None, wa
             arg=option, timeout=timeout_ms)
         return str(handle.json_value())
     except PlaywrightTimeout:
-        return str(page.evaluate(js, option))
+        return str(eval_bounded(page, js, option, what="체결 표 상태"))
 
 
 def _click_panel_retry(page: Page) -> None:
@@ -462,11 +474,11 @@ def _no_more_pages() -> None:
 def close_sales_panel(page: Page) -> None:
     """패널 제목('거래 및 입찰 내역') 옆의 이름 없는 X 버튼을 누른다. Escape 는 안 먹는다."""
     for _ in range(3):
-        if not page.evaluate(_SALES_PANEL_VISIBLE_JS):
+        if not eval_bounded(page, _SALES_PANEL_VISIBLE_JS, what="거래 내역 패널 상태"):
             return
-        page.evaluate(_CLICK_PANEL_CLOSE_JS)
+        eval_bounded(page, _CLICK_PANEL_CLOSE_JS, what="거래 내역 패널 닫기")
         page.wait_for_timeout(400)
-    if page.evaluate(_SALES_PANEL_VISIBLE_JS):
+    if eval_bounded(page, _SALES_PANEL_VISIBLE_JS, what="거래 내역 패널 상태"):
         raise SkipProduct("체결 내역 패널을 닫지 못함")
 
 
@@ -684,10 +696,7 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None =
             buy.click(timeout=BUY_CLICK_TIMEOUT_MS)
             modal.wait_for(state="visible", timeout=4000)
         except PlaywrightTimeout as e:
-            # 버튼이 보이는데도 못 누르는 건 탭이 응답하지 않는 것일 수 있다 - 그러면 재시도해도 소용없으니 바로 알린다
-            stall = page_stall(page)
-            if stall:
-                raise PageStalled(f"'구매하기' 를 누르지 못함 - {stall}") from e
+            raise_if_stalled(page, "'구매하기'", e)
             log.info("구매하기 모달 열기 재시도 %d/3: %s", attempt + 1, str(e).splitlines()[0])
             continue
         # 모달에 고를 옵션(ONE SIZE 또는 사이즈)이 그려질 때까지. 2초 안에 안 나오는데 내용은 있으면 옵션 구성이 다른 것
