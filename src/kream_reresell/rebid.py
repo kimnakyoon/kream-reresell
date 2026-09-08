@@ -17,8 +17,7 @@
      로 가서 처음 입찰과 같은 화면을 채운다: 희망가 = 최신 B, 마감기한, 구매 입찰 계속 → 창고보관 → 포인트 최대 사용
      → 입찰하기 → 동의 3항목 → 입찰하기 (bid.fill_bid_form / choose_warehouse_and_points / submit_bid 그대로).
   5. 목록 끝까지 가면 한 사이클. 정한 횟수(max_cycles, GUI '재입찰 횟수' 칸 / --cycles) 만큼 또는 중지할 때까지 사이클을 반복하되, 사이클 시작 간격(설정, 기본 5분)을 지키고
-     입찰 사이의 간격은 접속 예산을 창 안에 고르게 나눈 것(pacing.before_product, 이동 하나에 6초 - 보통 12초 간격으로 시작)으로 두고, 그 위에
-     0.5~1.5초만 무작위로 더 쉰다 (봇 탐지 대비. 예전 2~4초는 예산을 몰아 쓰고 몇 분씩 쉬던 때의 값 - 2026-09-08 사용자 요청으로 줄임).
+     입찰 사이의 간격은 접속 예산을 고르게 나눈 것으로 둔다 (pacing.before_product, 대응 5 - 무작위 폭도 거기 있다).
 
 즉시 판매가가 없을 때: 구매 페이지에 와 있는데 '즉시 판매가' 가 안 그려지면 (사용자 결정, 2026-09-05) 그 입찰을 지운다
 (입찰취소, 방식은 기준 미달 때와 같다). 단 지우기 전에 두 가지를 본다: (1) 상품 페이지의 체결 내역 패널이 그려지는지 - 안 그려지면
@@ -47,6 +46,7 @@ product.NoFastDelivery) 그 입찰도 지운다 (사용자 결정 2026-09-06 - �
 같은 방식으로 지운다 (사용자 결정 2026-09-06 - 밀린 채 두지 않음). 마지막 '입찰하기' 를 누른 뒤 결과가 불확실한 건은 지우지 않고 확인필요.
 사이클이 끝날 때마다 그 사이클에 나간 스로틀 대상 API 요청 수를 로그에 남긴다 (pacing.BUDGET).
 입찰 하나를 보기 전에 접속 예산(페이지 이동 수, pacing 대응 5)을 고르게 나눈 간격만큼 쉬고, 자리가 없으면 날 때까지 쉰다 (pacing.before_product).
+입찰 뒤에 따로 쉬는 시간은 없다 - 간격이 직전 입찰의 시작 시각 기준이라 그 안에 흡수돼 뜻이 없었다.
 상품 금액 상한은 새로 입찰할 때만 쓰는 규칙이라 ([입찰취소] 와 같음) 기준은 충족하는데 A 가 상한을 넘기만 하는 입찰은
 올리지도 지우지도 않고 그대로 둔다 (변경안함).
 """
@@ -54,7 +54,6 @@ product.NoFastDelivery) 그 입찰도 지운다 (사용자 결정 2026-09-06 - �
 from __future__ import annotations
 
 import logging
-import random
 import re
 import time
 from collections.abc import Callable
@@ -72,13 +71,13 @@ from .config import Settings
 from .debug import dump
 from .report import ProductResult
 from . import pacing
-from .sitewait import PROBE_SEC, TROUBLE_STREAK, sleep_with_stop, wait_until_site_back
+from .pacing import sleep_with_stop
+from .sitewait import PROBE_SEC, TROUBLE_STREAK, wait_until_site_back
 from .store import (ONE_SIZE, BidRecord, append_run_log, load_bid_products, load_bids, remove_bid, save_bid,
                     save_bid_products)
 
 log = logging.getLogger(__name__)
 
-ITEM_PAUSE_SEC = (0.5, 1.5)      # 입찰 하나를 보고 다음으로 가기 전 무작위로 쉬는 시간 (간격은 pacing.before_product 가 둔다 - 머리글)
 MIN_CYCLE_GAP_SEC = 30           # 사이클이 간격보다 오래 걸렸어도 다음 사이클 전에 최소 이만큼은 쉰다
 CHANGE_ATTEMPTS = 2              # [입찰 변경하기] 화면이 예상과 다르면 다시 열어 이만큼까지 시도하고, 그래도 안 되면 지운다
 CHANGE_RETRY_PAUSE_SEC = (2.0, 4.0)
@@ -525,7 +524,7 @@ def run(context: BrowserContext, page: Page, settings: Settings,
             if list_failures >= MAX_LIST_FAILURES:
                 raise RuntimeError(f"구매 입찰 목록을 {MAX_LIST_FAILURES}번 연달아 읽지 못해 멈춤: {e}") from e
             status(f"목록을 읽지 못해 {ERROR_BACKOFF_SEC // 60}분 뒤 다시 시도")
-            sleep_with_stop(stop, ERROR_BACKOFF_SEC)
+            sleep_with_stop(ERROR_BACKOFF_SEC, stop)
             continue
 
         known = load_bids()
@@ -548,7 +547,7 @@ def run(context: BrowserContext, page: Page, settings: Settings,
             if stop():
                 log.info("사용자 요청으로 중지 - 남은 입찰 %d건은 보지 않음", len(bids) - len(cycle_results))
                 break
-            if not pacing.before_product(stop, status):   # 접속 예산 (pacing 대응 5) - 고른 간격으로, 자리가 없으면 날 때까지 쉰다
+            if not pacing.before_product(stop, status):   # 접속 예산 (pacing 대응 5)
                 break
             status(f"재입찰 {cycle}회차: {bid.order}/{len(bids)} {bid.name[:24]}")
             r, trip = look(bid, cycle, trouble_streak)
@@ -583,9 +582,6 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                     auth.ensure_logged_in(page, settings)
                 except Exception:  # noqa: BLE001
                     log.exception("쉬고 나서 로그인 상태를 확인하지 못함 - 그대로 이어서 봄")
-            if stop():
-                break
-            sleep_with_stop(stop, random.uniform(*ITEM_PAUSE_SEC))
 
         counts: dict[str, int] = {}
         for r in cycle_results:
@@ -613,7 +609,7 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                  next_at.strftime("%H:%M:%S"))
         status(f"재입찰 {cycle}회차 끝({int(elapsed)}초): {summary} - {int(wait)}초 쉬고 {next_at:%H:%M} 에 다음 사이클 "
                f"(시작 간격 {settings.rebid_interval_min:g}분)")
-        sleep_with_stop(stop, wait)
+        sleep_with_stop(wait, stop)
     try:
         tab.close()
     except Exception:  # noqa: BLE001

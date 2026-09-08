@@ -14,20 +14,12 @@ import time
 from collections.abc import Callable
 
 from . import pacing
+from .pacing import sleep_with_stop
 
 log = logging.getLogger(__name__)
 
 TROUBLE_STREAK = 3     # 판단 불가(내역을 못 불러옴)·오류가 연달아 이만큼 나면 사이트가 응답을 안 주는 것으로 본다
 PROBE_SEC = 300        # 멈춘 동안 이만큼마다 한 번 확인한다 (더 자주 두드리면 풀리지 않는다 - 2분마다 두드리던 날은 20분 넘게 걸렸다)
-
-
-def sleep_with_stop(should_stop: Callable[[], bool], seconds: float) -> None:
-    """중지 요청을 1초마다 보며 쉰다."""
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        if should_stop():
-            return
-        time.sleep(min(1.0, deadline - time.monotonic()))
 
 
 def wait_until_site_back(probe: Callable[[], bool], should_stop: Callable[[], bool],
@@ -42,7 +34,7 @@ def wait_until_site_back(probe: Callable[[], bool], should_stop: Callable[[], bo
         waited = int(time.monotonic() - started)
         on_status(f"사이트가 {what}을 주지 않아 멈춤 - {waited // 60}분 {waited % 60}초 쉬는 중 "
                   f"({PROBE_SEC // 60}분마다 확인, 다시 주면 이어서 봄)")
-        sleep_with_stop(should_stop, PROBE_SEC)
+        sleep_with_stop(PROBE_SEC, should_stop)
         if should_stop():
             break
         tries += 1
