@@ -71,6 +71,30 @@ class PageStalled(SkipProduct):
     """
 
 
+class LoginNeeded(Exception):
+    """로그인이 풀려 로그인 화면(/login?returnUrl=...)으로 넘어갔다 - 상품·사이트 문제가 아니라 다시 로그인하고 같은 상품을 다시 본다.
+    건너뜀(SkipProduct)이 아니라 재시도 신호라 SkipProduct 의 자식이 아니다 - except SkipProduct 가 삼키면 안 된다.
+
+    세션은 로그인 뒤 24시간쯤에 끊기는 듯하다 (2026-09-07 23:08 자동 재로그인 → 2026-09-08 23:15 다시 끊김). 끊겨도 상품 페이지는
+    그대로 열리고, '거래 내역 더보기' 처럼 로그인이 필요한 동작만 SPA 라우팅으로 로그인 화면으로 넘어간다 - 문서 이동이 아니라
+    Playwright 대기는 오류 없이 타임아웃만 채운다 (2026-09-08 23:15 [입찰] 실측: 42건 연속 '패널이 열리지 않음' 으로 건너뜀).
+    """
+
+
+def on_login_page(page: Page) -> bool:
+    """로그인 화면인지. 주소의 returnUrl 에 /products/{id}·/buy/{id} 가 그대로 들어가므로 문자열 포함이 아니라 경로로 본다."""
+    return urlparse(page.url).path.startswith("/login")
+
+
+def raise_if_login_lost(page: Page, what: str, cause: Exception) -> None:
+    """어떤 단계가 실패한 뒤 부른다 - 페이지가 로그인 화면이면 상품 문제가 아니라 로그인이 풀린 것이니 LoginNeeded 로 바꿔 올린다.
+
+    로그인이 필요한 동작('거래 내역 더보기'·구매 페이지)은 풀리면 SPA 라우팅으로 /login 으로 가고 Playwright 는 타임아웃만 채우므로,
+    실패 시점의 주소를 보는 것이 가장 단순한 공통 판정이다 ([입찰]·[재입찰] 공용)."""
+    if on_login_page(page):
+        raise LoginNeeded(f"{what} 중 로그인 화면으로 넘어감 (로그인이 풀림): {page.url}") from cause
+
+
 # ---------------------------------------------------------------- 탭이 응답하는지 (멈춤 감지)
 
 PROBE_MS = 1500     # 늘 참인 JS 가 이 안에 안 돌아오면 멈춘 것으로 본다 (정상이면 20ms 안)
@@ -193,8 +217,6 @@ def open_sales_panel(page: Page) -> None:
     # 매번 타임아웃만 채우므로 바로 누른다. 하이드레이션 전이라 클릭이 안 먹으면 아래 재시도가 받아 준다.
     more = page.get_by_role("button", name="거래 내역 더보기").first
     for attempt in range(3):
-        if "/products/" not in page.url:
-            raise SkipProduct(f"'거래 내역 더보기' 를 누르자 다른 페이지로 넘어감: {page.url}")
         try:
             more.scroll_into_view_if_needed(timeout=3000)
             more.click(timeout=3000)
@@ -204,12 +226,21 @@ def open_sales_panel(page: Page) -> None:
         except PlaywrightTimeout as e:
             # (2026-09-08 09:14 실측: 멈춘 탭에서 세 번 다 타임아웃 뒤 '패널이 열리지 않음' 확인필요, 스냅샷도 못 찍힘)
             raise_if_stalled(page, "'거래 내역 더보기'", e)
+            # 로그인이 풀리면 누르는 순간 로그인 화면으로 넘어가고 (SPA 라우팅이라 예외 없이 타임아웃) 패널은 영영 안 뜬다 (LoginNeeded 참고)
+            _raise_if_left_product(page, e)
             log.debug("거래 내역 패널 열기 재시도 %d", attempt + 1)
             page.wait_for_timeout(700)
     else:
         raise SkipProduct("'거래 내역 더보기' 패널이 열리지 않음")
     # 패널이 뜬 뒤 표가 그려질 때까지 기다린다 (정상이면 0.3초쯤). 본문에 '체결 거래' 표가 있는 상품이니 행이 있어야 한다.
     _await_sales_table(page, SALES_LOAD_TIMEOUT_MS)
+
+
+def _raise_if_left_product(page: Page, cause: Exception) -> None:
+    """'거래 내역 더보기' 를 누른 뒤 상품 페이지를 벗어났으면 알린다 - 로그인 화면이면 LoginNeeded, 그 밖이면 SkipProduct."""
+    raise_if_login_lost(page, "'거래 내역 더보기'", cause)
+    if "/products/" not in urlparse(page.url).path:
+        raise SkipProduct(f"'거래 내역 더보기' 를 누르자 다른 페이지로 넘어감: {page.url}") from cause
 
 
 def sales_available(page: Page, url: str) -> tuple[bool, str]:

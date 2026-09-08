@@ -122,8 +122,7 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
     results: list[ProductResult] = []
 
     def new_result(option: str = "") -> ProductResult:
-        return ProductResult(rank=item.rank, product_id=pid, name=item.name, url=item.url, category=item.category,
-                             option=option)
+        return _item_result(item, option=option)
 
     try:
         log.info("[%s %d위] %s (%s)", item.category, item.rank, item.name, item.url)
@@ -145,6 +144,7 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
                 stats = product_mod.count_sales(page, settings.lookback_days, settings.min_fast_sales)
                 product_mod.close_sales_panel(page)
             except product_mod.SkipProduct as e:
+                product_mod.raise_if_login_lost(page, "체결 내역 확인", e)
                 r.status, r.detail = "건너뜀", _skip_detail(e)
                 return _done(results, r, item)
             _judge_and_bid(page, r, stats, item, settings, open_bids)
@@ -201,6 +201,14 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
                 _judge_and_bid(page, r, st, item, settings, open_bids)
             _done(results, r, item)
         return results
+    except product_mod.LoginNeeded as e:
+        if any(x.status == "입찰완료" for x in results):
+            # 이 상품에 이미 입찰을 넣은 뒤 풀렸다 - 다시 보면 같은 옵션에 또 입찰할 수 있어 (open_bids 는 실행 시작 때 목록) 여기서 끝냄.
+            # 다음 상품에서 다시 로그인한다
+            r = new_result()
+            r.status, r.detail = "오류", f"앞 옵션을 입찰한 뒤 {e} - 남은 옵션은 보지 않음"
+            return _done(results, r, item)
+        raise   # _process_with_relogin 이 다시 로그인하고 이 상품을 다시 본다 (결과를 남기지 않음)
     except Exception as e:  # noqa: BLE001
         dump(page, f"{pid}_error")
         log.exception("상품 %s 처리 중 오류", pid)
@@ -260,6 +268,7 @@ def _judge_and_bid(page: Page, r: ProductResult, stats: product_mod.SalesStats, 
             return
         _place_bid(page, r, settings)
     except product_mod.SkipProduct as e:
+        product_mod.raise_if_login_lost(page, "구매 페이지 확인", e)
         r.status, r.detail = "건너뜀", _skip_detail(e)
     except bid_mod.StoppedBeforeSubmit as e:
         r.status, r.detail = "중단", str(e)
@@ -319,9 +328,10 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
     `data/bids.json` 은 건너뛰기 기준이 아니라 목록의 입찰을 상품 ID 로 잇는 기록으로만 쓴다.
 
     사이트가 체결 내역을 안 주는 시간대: 상품이 연달아 TROUBLE_STREAK 개 판단 불가·오류로 끝나면 (옵션 상품은 모든 옵션이)
-    더 열지 않고 멈춘 채 5분마다 확인, 다시 주면 로그인 상태를 확인하고 그 상품들부터 다시 본다 (앞서 남긴 판단 불가 결과는
-    바꿔 넣는다). 사용자가 중지할 때까지 기다린다.
-    page: 로그인 확인용 메인 탭 (없으면 확인만 건너뜀). on_status: GUI 상태 한 줄.
+    더 열지 않고 멈춘 채 5분마다 확인, 다시 주면 그 상품들부터 다시 본다 (앞서 남긴 판단 불가 결과는 바꿔 넣는다. 확인이 패널을
+    열어 보는 것이라 로그인 확인을 겸한다). 사용자가 중지할 때까지 기다린다.
+    로그인이 풀리면 (product.LoginNeeded) 다시 로그인하고 그 상품을 한 번 더 본다 (_process_with_relogin). 또 풀리면 오류.
+    page: 다시 로그인할 때 쓰는 메인 탭 (없거나 닫혔으면 새 탭). on_status: GUI 상태 한 줄.
     """
     stop = should_stop or (lambda: False)
     status = on_status or (lambda _t: None)
@@ -338,10 +348,7 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
         ob = open_bids.find(item.product_id, ONE_SIZE) if open_bids is not None and not settings.force else None
         if ob is not None:
             log.info("[%d위] %s - 마이페이지에 이미 입찰 중, 건너뜀", item.rank, item.name)
-            results.append(ProductResult(
-                rank=item.rank, product_id=item.product_id, name=item.name, url=item.url,
-                category=item.category, status="건너뜀", detail=_open_bid_detail(ob), bid_price=ob.price,
-            ))
+            results.append(_item_result(item, status="건너뜀", detail=_open_bid_detail(ob), bid_price=ob.price))
             if on_result:
                 on_result(results[-1])
             continue
@@ -350,7 +357,7 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
         if not pacing.before_product(stop, status):        # 접속 예산 (pacing 대응 5)
             break
         status(f"[{item.category}] {item.rank}위 {item.name[:24]} 확인 중 ({done}/{len(items)})")
-        product_results = process_product(context, item, settings, open_bids, stop, status)
+        product_results = _process_with_relogin(context, page, item, settings, open_bids, stop, status)
         for r in product_results:
             results.append(r)
             if on_result:
@@ -365,13 +372,9 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
         log.warning("판단 불가·오류가 %d개 상품 연달아 남 - 사이트가 체결 내역을 안 주는 듯해 멈춤. 5분마다 확인하고 "
                     "다시 주면 이 %d개부터 이어서 봄", len(trouble_streak), len(trouble_streak))
         probe_item = trouble_streak[-1]
-        if not wait_until_site_back(lambda: _site_gives_sales(context, probe_item), stop, status):
+        # (_site_gives_sales 가 패널을 열었으면 로그인도 돼 있다 - 패널은 로그인이 필요한 동작, 풀렸으면 거기서 다시 로그인함)
+        if not wait_until_site_back(lambda: _site_gives_sales(context, probe_item, settings), stop, status):
             break
-        if page is not None:
-            try:
-                auth.ensure_logged_in(page, settings)
-            except Exception:  # noqa: BLE001
-                log.exception("멈췄다 이어가며 로그인 상태를 확인하지 못함 - 그대로 이어서 봄")
         # 판단 불가로 남긴 결과를 빼고 그 상품들을 맨 앞에 다시 넣는다
         retry_ids = {it.product_id for it in trouble_streak}
         results = [r for r in results if not (r.product_id in retry_ids and is_site_trouble(r))]
@@ -381,11 +384,47 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
     return results
 
 
-def _site_gives_sales(context: BrowserContext, item: RankedProduct) -> bool:
-    """사이트가 체결 내역을 다시 주는지 - 막혔던 상품의 페이지를 새 탭에 열고 패널 표가 그려지는지 본다."""
+def _item_result(item: RankedProduct, **fields) -> ProductResult:
+    return ProductResult(rank=item.rank, product_id=item.product_id, name=item.name, url=item.url,
+                         category=item.category, **fields)
+
+
+def _process_with_relogin(context: BrowserContext, page: Page | None, item: RankedProduct, settings: Settings,
+                          open_bids: "OpenBids | None", stop: Callable[[], bool],
+                          status: Callable[[str], None]) -> list[ProductResult]:
+    """process_product 를 부르되, 로그인이 풀린 것이 보이면 다시 로그인하고 한 번 더 본다 (rebid._rebid_with_relogin 과 같은 꼴)."""
+    try:
+        return process_product(context, item, settings, open_bids, stop, status)
+    except product_mod.LoginNeeded as e:
+        log.warning("[%d위] %s - 다시 로그인하고 한 번 더 봄", item.rank, e)
+        status("로그인이 풀려 다시 로그인하는 중")
+        tab = page if page is not None and not page.is_closed() else context.new_page()
+        try:
+            auth.ensure_logged_in(tab, settings)
+        except Exception as e2:  # noqa: BLE001
+            log.exception("다시 로그인하지 못함")
+            return _done([], _item_result(item, status="오류", detail=f"로그인이 풀렸는데 다시 로그인하지 못함: {e2}"), item)
+        finally:
+            if tab is not page:
+                tab.close()
+    try:
+        return process_product(context, item, settings, open_bids, stop, status)
+    except product_mod.LoginNeeded as e2:
+        return _done([], _item_result(item, status="오류", detail=f"다시 로그인했는데도 {e2}"), item)
+
+
+def _site_gives_sales(context: BrowserContext, item: RankedProduct, settings: Settings) -> bool:
+    """사이트가 체결 내역을 다시 주는지 - 막혔던 상품의 페이지를 새 탭에 열고 패널 표가 그려지는지 본다.
+
+    그 사이 로그인이 풀렸으면 (패널 대신 로그인 화면) 기다려도 소용없으니 여기서 다시 로그인하고 한 번 더 본다."""
     tab = context.new_page()
     try:
-        ok, note = product_mod.sales_available(tab, item.url)
+        try:
+            ok, note = product_mod.sales_available(tab, item.url)
+        except product_mod.LoginNeeded as e:
+            log.warning("확인 중 %s - 다시 로그인하고 한 번 더 확인", e)
+            auth.ensure_logged_in(tab, settings)
+            ok, note = product_mod.sales_available(tab, item.url)   # 또 풀리면 그대로 올라감 (wait_until_site_back 이 '아직 안 줌' 으로 봄)
         log.info("확인: %s", note)
         return ok
     finally:

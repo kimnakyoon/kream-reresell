@@ -59,7 +59,7 @@ import re
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus
 
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeout
 
@@ -88,14 +88,6 @@ MAX_LIST_FAILURES = 3            # 목록을 연달아 이만큼 못 읽으면 �
 ERROR_BACKOFF_SEC = 120          # 목록을 못 읽었을 때 다시 시도하기 전에 쉬는 시간
 NO_B_PREFIX = "즉시 판매가 없음"   # 즉시 판매가가 없어 지운(또는 지우려 한) 결과의 사유 머리 - 연달아 난 수를 셀 때 쓴다
 NO_FAST_PREFIX = "빠른배송 없음"    # 빠른배송(판매자)이 없어 지운 결과의 사유 머리 - 모달을 보고 판정한 것이라 연달아 난 수에는 넣지 않는다
-
-
-class LoginLost(Exception):
-    """로그인이 풀려 구매 페이지가 로그인 화면으로 넘어갔다."""
-
-
-def _on_login_page(page: Page) -> bool:
-    return urlparse(page.url).path.startswith("/login")
 
 
 def buy_page_url(product_id: int, size: str = ONE_SIZE) -> str:
@@ -154,8 +146,7 @@ def read_current_b(page: Page, product_id: int, size: str = ONE_SIZE, label: str
     except product_mod.NoPriceB:
         raise
     except product_mod.SkipProduct as e:
-        if _on_login_page(page):
-            raise LoginLost(f"구매 페이지가 로그인 화면으로 넘어감: {page.url}") from e
+        product_mod.raise_if_login_lost(page, "구매 페이지 확인", e)
         log.info("즉시 판매가가 그려지지 않음: %s", e)
         return None
 
@@ -257,7 +248,7 @@ def _rebid_with_relogin(page: Page, bid: OpenBid, settings: Settings, cycle: int
     """_rebid_one 을 부르되, 로그인이 풀린 것이 보이면 다시 로그인하고 한 번 더 본다."""
     try:
         _rebid_one(page, bid, settings, cycle, r, diagnose)
-    except LoginLost as e:
+    except product_mod.LoginNeeded as e:
         log.warning("[%d회차 %d번째] %s - 다시 로그인하고 한 번 더 봄", cycle, bid.order, e)
         try:
             auth.ensure_logged_in(page, settings)
@@ -266,7 +257,7 @@ def _rebid_with_relogin(page: Page, bid: OpenBid, settings: Settings, cycle: int
             raise
         try:
             _rebid_one(page, bid, settings, cycle, r, diagnose)
-        except LoginLost as e2:
+        except product_mod.LoginNeeded as e2:
             r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: 다시 로그인했는데도 {e2}"
 
 
@@ -413,24 +404,21 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
         r.status, r.detail = "변경완료", f"{old_price:,}원 → {new_price:,}원 / {settings.bid_days}일 / 창고보관"
         return
     except product_mod.NoPriceB as e:
-        if _on_login_page(page):
-            raise LoginLost(f"구매 페이지 확인 중 로그인 화면으로 넘어감: {page.url}") from e
+        product_mod.raise_if_login_lost(page, "구매 페이지 확인", e)
         _cancel_no_b(page, bid, settings, r, str(e), diagnose)
     except product_mod.NoFastDelivery as e:
-        if _on_login_page(page):
-            raise LoginLost(f"상품 페이지 확인 중 로그인 화면으로 넘어감: {page.url}") from e
+        product_mod.raise_if_login_lost(page, "상품 페이지 확인", e)
         _cancel_no_fast(page, bid, settings, r, str(e), diagnose)
     except product_mod.PageStalled:
         raise   # rebid_one 이 탭을 닫는다 (응답 없는 탭은 스냅샷도 못 찍는다)
     except product_mod.SkipProduct as e:
-        if _on_login_page(page):
-            raise LoginLost(f"상품 페이지 확인 중 로그인 화면으로 넘어감: {page.url}") from e
+        product_mod.raise_if_login_lost(page, "상품 페이지 확인", e)
         # 입찰 중인 상품(ONE SIZE, 체결 내역 있음)이 판단 불가가 되는 건 사이트가 응답을 안 준 것 - 화면을 남겨 원인을 볼 수 있게
         log.info("판단 불가 (지금 주소 %s)", page.url)
         if diagnose:
             dump(page, f"rebid{bid.bid_id}_skip")
         r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: {e}"
-    except LoginLost:
+    except product_mod.LoginNeeded:
         raise   # rebid_one 이 다시 로그인하고 한 번 더 본다 (아래 Exception 에 삼켜져 '오류' 로 끝나던 문제, 2026-09-05)
     except bid_mod.StoppedBeforeSubmit as e:
         r.status, r.detail = "중단", str(e)
