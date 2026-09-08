@@ -61,7 +61,7 @@ class SalesNotLoaded(SkipProduct):
 
 
 class PageStalled(SkipProduct):
-    """탭(렌더러)이 응답하지 않아 버튼을 누르지 못했다 - 상품·사이트 문제가 아니다.
+    """탭(렌더러)이 응답하지 않아 버튼을 누르지 못했다 (또는 상품 페이지로 가는 이동이 안 끝났다, open_product) - 상품·사이트 문제가 아니다.
 
     Playwright 의 클릭·보임 대기·스크린샷은 모두 화면이 한 번 그려지기를 기다리므로, 탭이 멈추면 전부 타임아웃만 채운다
     (2026-09-06 재입찰 실측: '구매하기' 가 보인 직후부터 80초쯤 아무 명령도 안 먹음 - 클릭 15초 × 3번 뒤 '모달이 뜨지 않음').
@@ -123,15 +123,26 @@ class SalesStats:
 
 
 def open_product(page: Page, url: str) -> str:
-    try:
-        page.goto(url, wait_until="domcontentloaded")
-    except PlaywrightTimeout:
-        raise
-    except PlaywrightError as e:
-        # 이동 중 끊김 (net::ERR_ABORTED, 2026-09-05 재입찰 중 실측) - 잠깐 뒤 한 번 더
-        log.info("상품 페이지 이동이 끊김 (%s) - 1.5초 뒤 다시 엶", str(e).splitlines()[0])
-        page.wait_for_timeout(1500)
-        page.goto(url, wait_until="domcontentloaded")
+    """상품 페이지로 이동해 '구매하기' 가 보일 때까지 기다리고 상품명(탭 제목)을 돌려준다.
+
+    이동이 15초 안에 안 끝나면 탭이 응답하는지 본다 - 응답하지 않으면 PageStalled ([재입찰]은 탭을 닫고 새 탭에서 한 번 더 본다.
+    2026-09-08 재입찰 123번째 실측: 구매 페이지에서 상품 페이지로 가는 이동이 안 끝나고 스냅샷도 못 찍혔는데 다음 입찰의 이동은 정상이라
+    같은 탭에서 다시 시도해도 소용없다). 응답하면 사이트·망이 느린 것 (2026-09-06 47번째: 스냅샷은 찍힘) - 잠깐 뒤 한 번 더 열고,
+    그래도 안 되면 그 오류를 그대로 올린다 (두 번 연속이면 사이트 문제 - 오류로 세어 연달아 나면 쉬게).
+    """
+    for attempt in range(2):
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+            break
+        except PlaywrightError as e:   # 시간 제한(PlaywrightTimeout) 또는 이동 중 끊김 (net::ERR_ABORTED, 2026-09-05 재입찰 실측)
+            timed_out = isinstance(e, PlaywrightTimeout)
+            stall = page_stall(page) if timed_out else None
+            if stall:
+                raise PageStalled(f"상품 페이지 이동이 안 끝남 - {stall}") from e
+            if attempt:
+                raise
+            log.info("상품 페이지 이동이 %s (%s) - 1.5초 뒤 다시 엶", "안 끝남" if timed_out else "끊김", str(e).splitlines()[0])
+            page.wait_for_timeout(1500)
     try:
         page.get_by_role("button", name="구매하기", exact=True).first.wait_for(state="visible", timeout=15_000)
     except PlaywrightTimeout as e:

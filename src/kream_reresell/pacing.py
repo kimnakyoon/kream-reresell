@@ -46,6 +46,8 @@ import time
 from collections import deque
 from collections.abc import Callable
 
+from . import hangwatch
+
 log = logging.getLogger(__name__)
 
 API_ORIGIN = "https://api.kream.co.kr"
@@ -184,12 +186,16 @@ def configure(limit: int, page_limit: int) -> None:
 
 
 def sleep_with_stop(seconds: float, should_stop: Callable[[], bool] | None = None) -> bool:
-    """중지 요청을 1초마다 보며 쉰다 (0 이하면 바로 돌아온다). 중지 요청이면 False. 기다리는 곳 공용 ([입찰]·[재입찰]·sitewait)."""
+    """중지 요청을 1초마다 보며 쉰다 (0 이하면 바로 돌아온다). 중지 요청이면 False. 기다리는 곳 공용 ([입찰]·[재입찰]·sitewait).
+
+    쉬는 동안은 멈춤 감시(hangwatch)를 쉬게 한다 - Playwright 호출 밖에서 자면 남아 있던 회신이 멈춘 것처럼 보여 멀쩡한 탭을 닫았다.
+    """
     deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        if should_stop and should_stop():
-            return False
-        time.sleep(min(1.0, max(0.05, deadline - time.monotonic())))
+    with hangwatch.idle():
+        while time.monotonic() < deadline:
+            if should_stop and should_stop():
+                return False
+            time.sleep(min(1.0, max(0.05, deadline - time.monotonic())))
     return True
 
 

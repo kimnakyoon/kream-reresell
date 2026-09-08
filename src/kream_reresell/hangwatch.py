@@ -5,13 +5,19 @@ CPU 0, 브라우저 프로세스와 다른 탭은 정상) product._pass_model_nu
 '즉시 판매가' locator.wait_for(10초 제한)가 47분 동안 돌아오지 않았다. Playwright 의 시간 제한은 드라이버(node)가 재는데,
 렌더러가 이렇게 멈추면 그 제한마저 돌아오지 않는 경우가 있어 python 은 응답을 기다리며 서 있고 [중지]도 (입찰 사이에서만
 확인하므로) 듣지 않았다. 디버깅 포트로 그 탭을 닫자 (/json/close) 걸린 호출이 바로 TargetClosedError 로 돌아왔고 다음 입찰부터 정상.
-(호출이 제때 타임아웃으로 돌아오는 멈춤은 product.PageStalled 로 따로 다룬다 - 상품 페이지로 다시 이동해 탭을 되살린다.)
+(호출이 제때 타임아웃으로 돌아오는 멈춤은 product.PageStalled 로 따로 다룬다 - [재입찰]은 그 탭을 닫고 새 탭에서 한 번 더 본다.)
 
 방식: 작업 스레드와 별개의 스레드가 TICK_SEC 마다 Playwright 연결의 '응답을 기다리는 요청' 목록을 보고, 같은 요청이
 LIMIT_SEC 넘게 남아 있으면 (코드의 시간 제한은 길어야 20초라 정상이면 있을 수 없음) 크롬 디버깅 포트의 HTTP 끝점
 (/json/close/{탭 ID} - 브라우저 프로세스가 처리하므로 렌더러가 멈춰도 답한다) 로 지금 보는 탭을 닫는다. 탭이 닫히면
 걸려 있던 호출이 '탭이 닫힘' 오류로 돌아오고, 부른 쪽([재입찰] rebid.run)은 새 탭을 열어 그 입찰을 한 번 더 본다.
 닫을 탭은 watching()/set_page() 로 알려 준 '지금 쓰는 탭' 을 주소로 찾는다 (알려 주지 않았으면 닫지 않고 로그만 남긴다).
+
+작업 스레드가 Playwright 호출 밖에서 쉬는 동안(time.sleep)은 세지 않는다 (idle()): 동기 Playwright 는 호출 안에서만 이벤트 루프를
+돌리므로, 호출이 끝나는 순간 route 응답(이미지 차단 abort·API continue 의 회신)이 하나 남아 있으면 그 회신은 다음 호출 때까지
+'기다리는 중' 으로 보인다 (헤드리스 크롬 실험 2026-09-08: 1초 sleep 10번 중 3번). 그래서 접속 예산·요청 예산으로 90초 넘게 쉬면
+멀쩡한 탭을 닫거나 (2026-09-08 17:41 [입찰] 아이웨어 31위: 97초 쉬는 사이 탭을 닫아 오류) '크롬 전체가 멈춘 듯함' 을 잘못
+띄웠다 (같은 날 08:24 [재입찰] 509초 쉼). 쉬는 곳은 pacing.sleep_with_stop 하나라 거기서 idle() 로 감싼다.
 
 Playwright 의 내부 속성(_connection._callbacks)을 읽으므로 버전이 바뀌어 속성이 없으면 감시를 끄고 경고만 남긴다.
 """
@@ -56,6 +62,7 @@ _port: int | None = None
 _pages: list[Page] = []          # 지금 쓰는 탭 (안쪽이 마지막)
 _trip: Trip | None = None
 _disabled = False
+_idle = 0                        # 작업 스레드가 Playwright 호출 밖에서 쉬는 중 (idle() 중첩 수) - 이 동안은 세지 않는다
 
 
 def start(context: BrowserContext, port: int) -> None:
@@ -100,6 +107,19 @@ def watching(page: Page):
         clear_page(page)
 
 
+@contextlib.contextmanager
+def idle():
+    """작업 스레드가 Playwright 호출 밖에서 쉬는 동안 감싼다 - 쉬는 사이에는 회신이 처리되지 않아 멈춘 것처럼 보인다 (머리글)."""
+    global _idle
+    with _lock:
+        _idle += 1
+    try:
+        yield
+    finally:
+        with _lock:
+            _idle -= 1
+
+
 def tripped() -> Trip | None:
     """탭을 닫은 기록이 있으면 그것 (지우지 않음)."""
     return _trip
@@ -135,8 +155,9 @@ def _loop() -> None:
     closed_for: tuple[int, float] | None = None     # (요청 ID, 닫은 시각)
     while not _stop.wait(TICK_SEC):
         with _lock:
-            context, port, page = _context, _port, (_pages[-1] if _pages else None)
-        if context is None or port is None:
+            context, port, page, idle = _context, _port, (_pages[-1] if _pages else None), _idle > 0
+        if context is None or port is None or idle:
+            # 쉬는 동안 남아 있던 회신은 다음 호출 때 바로 처리되므로 기록을 비우고 다시 세기 시작한다
             first_seen.clear()
             continue
         pending = _pending_ids(context)
