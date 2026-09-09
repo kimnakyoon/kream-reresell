@@ -46,7 +46,7 @@ class NoPriceB(SkipProduct):
 
 
 class NoFastDelivery(SkipProduct):
-    """구매하기 모달은 떴는데 빠른배송이 없거나(일반배송만 그려짐) 빠른배송 가격이 없다 = 지금 빠른배송 판매자가 없어 A 를 정할 수 없다.
+    """구매하기 모달은 떴는데 빠른배송이 없거나(일반배송만, 또는 판매자 없음 안내만 그려짐) 빠른배송 가격이 없다 = 지금 빠른배송 판매자가 없다.
 
     [재입찰]은 이 경우 입찰을 지운다 (사용자 결정 2026-09-06). [입찰]·[입찰취소]는 SkipProduct 와 같이 건너뜀·확인필요.
     """
@@ -760,18 +760,22 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None =
     if not page.evaluate(_CLICK_MODAL_OPTION_JS, want):
         raise SkipProduct(f"구매하기 모달에서 '{want}' 을 누르지 못함")
     try:
-        page.wait_for_function(f"() => {{ const m = document.querySelector('{MODAL_SELECTOR}');"
-                               " return !!m && m.innerText.includes('빠른배송') && m.innerText.includes('일반배송'); }",
-                               timeout=4000)
+        # 배송 방법 두 줄이 그려지거나, 판매자가 없다는 안내가 그려지면 끝 (안내는 끝 상태라 4초를 다 채우지 않게 조건에 넣는다)
+        page.wait_for_function(_MODAL_DELIVERY_SHOWN_JS, arg=NO_SELLER_TEXT, timeout=4000)
     except PlaywrightTimeout:
         text = modal.inner_text()
-        if "일반배송" in text and "빠른배송" not in text:
-            # 일반배송만 있다 - 지금 빠른배송 판매자가 없는 것 (2026-09-06 실측, 마뗑킴 카드 월렛) → A 를 정할 수 없어 판단 불가
-            raise NoFastDelivery(f"'{want}' 에 빠른배송이 없음 (일반배송만 그려짐 - 지금 빠른배송 판매자 없음)") from None
-        raise SkipProduct(f"'{want}' 을 골랐는데 배송 방법(빠른배송/일반배송)이 그려지지 않음") from None
+        if "일반배송" not in text or "빠른배송" in text:
+            raise SkipProduct(f"'{want}' 을 골랐는데 배송 방법(빠른배송/일반배송)이 그려지지 않음") from None
+        # 일반배송만 있다 - 지금 빠른배송 판매자가 없는 것 (2026-09-06 실측, 마뗑킴 카드 월렛) → A 를 정할 수 없어 판단 불가
+        raise NoFastDelivery(f"'{want}' 에 빠른배송이 없음 (일반배송만 그려짐 - 지금 빠른배송 판매자 없음)") from None
     page.wait_for_timeout(300)
 
-    price_a = _parse_fast_price(modal.inner_text())
+    text = modal.inner_text()
+    if NO_SELLER_TEXT in text:
+        # 판매 입찰이 하나도 없는 옵션 - 배송 방법 자리에 안내와 [구매 입찰하기] 만 그려진다 (2026-09-09 재입찰 139번째 실측,
+        # 스와로브스키 네클리스 'ONE SIZE (쇼핑백 포함)'). 빠른배송 판매자도 없는 것이니 일반배송만 그려진 경우와 같이 다룬다
+        raise NoFastDelivery(f"'{want}' 에 판매자가 없음 (지금 빠른배송 판매자 없음)")
+    price_a = _parse_fast_price(text)
     if price_a is None:
         # 빠른배송 줄은 있는데 가격이 없다 - 지금 빠른배송 판매자가 없는 것
         raise NoFastDelivery(f"'{want}' 에 빠른배송 가격이 없음 (지금 빠른배송 판매자 없음)")
@@ -896,6 +900,17 @@ _BUY_PAGE_OR_MODEL_CHECK_JS = r"""
 
 
 MODAL_SELECTOR = ".bottom-sheet__layer--open.layer-option-picker"
+NO_SELLER_TEXT = "즉시 구매 가능한 상품이 없습니다"   # 판매 입찰이 없는 옵션을 고르면 배송 방법 대신 그려지는 안내 (2026-09-09 실측)
+
+# 옵션을 고른 뒤 모달에 배송 방법 두 줄이 그려졌는지 (또는 판매자가 없다는 안내가 그려졌는지 - 그 옵션의 끝 상태)
+_MODAL_DELIVERY_SHOWN_JS = r"""
+(noSeller) => {
+  const m = document.querySelector('.bottom-sheet__layer--open.layer-option-picker');
+  if (!m) return false;
+  const t = m.innerText;
+  return (t.includes('빠른배송') && t.includes('일반배송')) || t.includes(noSeller);
+}
+"""
 BUY_CLICK_TIMEOUT_MS = 5000   # '구매하기' 는 이미 보이는 버튼이라 정상이면 1초 안에 눌린다 (기본 15초를 세 번 채우지 않게)
 
 _CLOSE_BUY_MODAL_JS = r"""

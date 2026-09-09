@@ -16,6 +16,7 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
 from .config import Settings
 from .debug import dump
+from .product import eval_bounded
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +82,8 @@ def choose_warehouse_and_points(page: Page, settings: Settings, pid: int) -> Non
 
     keep.locator(".radio-element").first.click()
     page.wait_for_timeout(800)
-    if not page.evaluate(_WAREHOUSE_SELECTED_JS):
+    # 탭이 멈추면 evaluate 는 영영 안 돌아온다 - 시간 제한 있는 평가로 (2026-09-09 재입찰 173번째: 창고보관 확인 직후 탭이 멈춤)
+    if not eval_bounded(page, _WAREHOUSE_SELECTED_JS, what="창고보관 선택 상태"):
         dump(page, f"{pid}_warehouse_not_selected")
         raise BidAborted("'창고보관' 이 선택된 것을 확인하지 못함")
     log.info("배송방법: 창고보관 선택 확인")
@@ -111,7 +113,7 @@ def submit_bid(page: Page, price: int, settings: Settings, pid: int) -> None:
     first.wait_for(state="visible", timeout=10_000)
     if first.is_disabled():
         raise BidAborted("'입찰하기' 버튼이 비활성")
-    if not page.evaluate(_WAREHOUSE_SELECTED_JS):
+    if not eval_bounded(page, _WAREHOUSE_SELECTED_JS, what="창고보관 선택 상태"):
         raise BidAborted("입찰 직전 재확인: '창고보관' 이 선택돼 있지 않음")
     body = page.locator("body").inner_text()
     if not re.search(rf"구매 희망가\s*{price:,}\s*원", body):
@@ -136,7 +138,7 @@ def submit_bid(page: Page, price: int, settings: Settings, pid: int) -> None:
     log.info("확인 항목 %d개 체크", checked)
     if settings.inspect:
         dump(page, f"{pid}_5_confirm")
-    unchecked = page.evaluate(_UNCHECKED_REQUIRED_JS)
+    unchecked = eval_bounded(page, _UNCHECKED_REQUIRED_JS, what="확인 항목 체크 상태")
     if unchecked:
         raise BidAborted(f"체크되지 않은 확인 항목: {unchecked}")
 
