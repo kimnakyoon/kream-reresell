@@ -141,8 +141,8 @@ def read_current_b(page: Page, product_id: int, size: str = ONE_SIZE, label: str
             break
         except (PlaywrightTimeout, PlaywrightError) as e:
             if attempt:
-                raise product_mod.SkipProduct(f"구매 페이지를 열지 못함 (두 번 시도): {str(e).splitlines()[0]}") from e
-            log.info("구매 페이지 이동이 안 끝남 (%s) - 1.5초 뒤 다시 엶", str(e).splitlines()[0])
+                raise product_mod.SkipProduct(f"구매 페이지를 열지 못함 (두 번 시도): {product_mod.timeout_why(e)}") from e
+            log.info("구매 페이지 이동이 안 끝남 (%s) - 1.5초 뒤 다시 엶", product_mod.timeout_why(e))
             page.wait_for_timeout(1500)
     try:
         return product_mod.wait_buy_page_loaded(page, product_id, label).price_b
@@ -435,7 +435,7 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
         trip = hangwatch.tripped()
         if trip is not None and page.is_closed():
             # 감시 스레드가 멈춘 탭을 닫아 걸려 있던 호출이 오류로 끝난 것 - 상품·사이트 문제가 아니다 (run 이 새 탭으로 한 번 더 봄)
-            log.warning("[%d회차 %d번째] %s - 걸려 있던 호출: %s", cycle, bid.order, trip.describe(), str(e).splitlines()[0])
+            log.warning("[%d회차 %d번째] %s - 걸려 있던 호출: %s", cycle, bid.order, trip.describe(), product_mod.timeout_why(e))
             r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: {trip.describe()}"
             return
         stall = product_mod.page_stall(page)
@@ -444,7 +444,7 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
             # 한 번 더) - 여기서 한 번에 판정하므로 단계마다 클릭을 감쌀 필요가 없다. 스냅샷은 찍히지도 않으니 10초 낭비 없이 건너뛴다
             # (2026-09-09 173번째 실측: 창고보관 확인 뒤 '최대 사용' 클릭이 15초 안에 안 눌리고 스냅샷도 못 찍힘 - '오류' 로 남고 재시도 없었음.
             # 마지막 '입찰하기' 뒤는 BidUncertain 으로 따로 잡히므로 여기 오는 예외는 아직 입찰을 바꾸기 전이라 다시 봐도 안전하다)
-            raise product_mod.PageStalled(f"{str(e).splitlines()[0]} - {stall}") from e
+            raise product_mod.PageStalled(f"{product_mod.timeout_why(e)} - {stall}") from e
         dump(page, f"rebid{bid.bid_id}_error")
         log.exception("입찰 #%d 재입찰 처리 중 오류", bid.bid_id)
         r.status, r.detail = "오류", f"{type(e).__name__}: {e}"

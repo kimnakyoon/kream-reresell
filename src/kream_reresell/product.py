@@ -130,6 +130,29 @@ def page_stall(page: Page) -> str | None:
         return f"페이지가 응답하지 않음 ({str(e).splitlines()[0]})"
 
 
+_CALL_LOG_NOISE = re.compile(r"^(Call log|retrying|\d+ × |waiting \d+ms|attempting)")
+
+
+def timeout_why(e: Exception) -> str:
+    """Playwright 시간 제한 오류를 한 줄로: 첫 줄 + 호출 기록에서 마지막으로 하던 일. 첫 줄만으로는 버튼을 다른 요소가
+    덮은 것('… intercepts pointer events')과 눌렀는데 응답이 없는 것('performing click action')을 가릴 수 없다."""
+    lines = [ln.strip().lstrip("- ") for ln in str(e).splitlines()]
+    lines = [ln for ln in lines if ln]
+    if not lines:
+        return str(e)
+    tail = [ln for ln in lines[1:] if not _CALL_LOG_NOISE.match(ln)]
+    return lines[0] if not tail else f"{lines[0]} 마지막 기록: {' / '.join(tail[-2:])}"
+
+
+def shown_within(page: Page, js: str, timeout_ms: int, arg=None) -> bool:
+    """js(인자 하나를 받는 함수)가 timeout_ms 안에 참이 되면 True, 아니면 False. 시간 제한은 드라이버가 재므로 탭이 멈춰도 제때 돌아온다."""
+    try:
+        page.wait_for_function(js, arg=arg, timeout=timeout_ms)
+        return True
+    except PlaywrightTimeout:
+        return False
+
+
 def raise_if_stalled(page: Page, button: str, cause: Exception) -> None:
     """버튼 클릭이 타임아웃한 뒤 부른다 - 버튼이 보이는데도 못 누르는 건 탭이 응답하지 않는 것일 수 있고, 그러면 재시도해도
     소용없으니 바로 PageStalled 로 알린다 ([재입찰]은 탭을 닫고 새 탭에서 한 번 더 본다). 응답하면 그냥 돌아온다 (재시도)."""
@@ -165,7 +188,7 @@ def open_product(page: Page, url: str) -> str:
                 raise PageStalled(f"상품 페이지 이동이 안 끝남 - {stall}") from e
             if attempt:
                 raise
-            log.info("상품 페이지 이동이 %s (%s) - 1.5초 뒤 다시 엶", "안 끝남" if timed_out else "끊김", str(e).splitlines()[0])
+            log.info("상품 페이지 이동이 %s (%s) - 1.5초 뒤 다시 엶", "안 끝남" if timed_out else "끊김", timeout_why(e))
             page.wait_for_timeout(1500)
     try:
         page.get_by_role("button", name="구매하기", exact=True).first.wait_for(state="visible", timeout=15_000)
@@ -228,8 +251,10 @@ def open_sales_panel(page: Page) -> None:
             raise_if_stalled(page, "'거래 내역 더보기'", e)
             # 로그인이 풀리면 누르는 순간 로그인 화면으로 넘어가고 (SPA 라우팅이라 예외 없이 타임아웃) 패널은 영영 안 뜬다 (LoginNeeded 참고)
             _raise_if_left_product(page, e)
-            log.debug("거래 내역 패널 열기 재시도 %d", attempt + 1)
-            page.wait_for_timeout(700)
+            log.info("거래 내역 패널 열기 재시도 %d/3: %s", attempt + 1, timeout_why(e))
+            # 0.7초 쉬되, 그새 패널이 열리면 (느린 탭에 클릭이 늦게 전달됨 - 구매하기 모달과 같은 이유) 다시 누르지 않는다
+            if shown_within(page, _SALES_PANEL_VISIBLE_JS, 700):
+                break
     else:
         raise SkipProduct("'거래 내역 더보기' 패널이 열리지 않음")
     # 패널이 뜬 뒤 표가 그려질 때까지 기다린다 (정상이면 0.3초쯤). 본문에 '체결 거래' 표가 있는 상품이니 행이 있어야 한다.
@@ -258,7 +283,7 @@ def sales_available(page: Page, url: str) -> tuple[bool, str]:
             return True, "체결 거래 표가 없는 상품"   # 리셀 거래가 없는 상품 - 사이트 문제가 아니다
         return False, str(e)
     except (PlaywrightTimeout, PlaywrightError) as e:
-        return False, f"상품 페이지를 열지 못함: {str(e).splitlines()[0]}"
+        return False, f"상품 페이지를 열지 못함: {timeout_why(e)}"
     try:
         close_sales_panel(page)
     except SkipProduct:
@@ -733,14 +758,21 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None =
     # 클릭이 15초씩 세 번 막히다 '모달이 뜨지 않음' 으로 끝나던 것 (2026-09-06 실측, 옵션 5개 지갑의 마지막 옵션)
     _close_buy_modal_if_open(page, modal)
     for attempt in range(3):
-        try:
-            buy.scroll_into_view_if_needed(timeout=BUY_CLICK_TIMEOUT_MS)
-            buy.click(timeout=BUY_CLICK_TIMEOUT_MS)
-            modal.wait_for(state="visible", timeout=4000)
-        except PlaywrightTimeout as e:
-            raise_if_stalled(page, "'구매하기'", e)
-            log.info("구매하기 모달 열기 재시도 %d/3: %s", attempt + 1, str(e).splitlines()[0])
-            continue
+        # 재시도에서는 모달이 이미 열렸는지 먼저 본다 - 앞 시도의 클릭이 느린 탭에 늦게 전달돼 열렸거나 (2026-09-09 재입찰 95번째 실측:
+        # 클릭이 5초씩 세 번 시간을 다 썼는데 스냅샷에는 모달이 열려 있었음) 아래 옵션 항목만 늦게 그려지는 중이면, 열린 모달이
+        # '구매하기' 를 덮고 있어 다시 누르면 또 막히고 '모달이 뜨지 않음' 으로 끝난다
+        opened = attempt > 0 and eval_bounded(page, _BUY_MODAL_OPEN_JS, what="구매하기 모달 상태")
+        if not opened:
+            why = ""
+            try:
+                buy.scroll_into_view_if_needed(timeout=BUY_CLICK_TIMEOUT_MS)
+                buy.click(timeout=BUY_CLICK_TIMEOUT_MS)
+            except PlaywrightTimeout as e:
+                raise_if_stalled(page, "'구매하기'", e)
+                why = f" ({timeout_why(e)})"   # 시간 안에 안 눌렸어도 늦게 전달될 수 있으니 모달은 기다려 본다
+            if not shown_within(page, _BUY_MODAL_OPEN_JS, 4000):
+                log.info("구매하기 모달 열기 재시도 %d/3%s", attempt + 1, why)
+                continue
         # 모달에 고를 옵션(ONE SIZE 또는 사이즈)이 그려질 때까지. 2초 안에 안 나오는데 내용은 있으면 옵션 구성이 다른 것
         try:
             page.wait_for_function(_MODAL_HAS_OPTION_JS, arg=want, timeout=2000)
@@ -913,27 +945,34 @@ _MODAL_DELIVERY_SHOWN_JS = r"""
 """
 BUY_CLICK_TIMEOUT_MS = 5000   # '구매하기' 는 이미 보이는 버튼이라 정상이면 1초 안에 눌린다 (기본 15초를 세 번 채우지 않게)
 
-_CLOSE_BUY_MODAL_JS = r"""
+_BUY_MODAL_OPEN_JS = r"""
 () => {
   const m = document.querySelector('.bottom-sheet__layer--open.layer-option-picker');
-  if (!m) return 'none';
+  if (!m) return false;
   const r = m.getBoundingClientRect();
-  if (r.width === 0 || r.height === 0) return 'none';
-  const btn = m.querySelector('a[aria-label="닫기"], button[aria-label="닫기"]');
-  if (!btn) return 'no-button';
+  return r.width > 0 && r.height > 0;
+}
+"""
+
+# 열린 구매하기 모달의 닫기 버튼을 누른다 (있으면 true). 열려 있는지는 _BUY_MODAL_OPEN_JS 로 먼저 본다
+_CLOSE_BUY_MODAL_JS = r"""
+() => {
+  const btn = document.querySelector('.bottom-sheet__layer--open.layer-option-picker a[aria-label="닫기"], '
+                                   + '.bottom-sheet__layer--open.layer-option-picker button[aria-label="닫기"]');
+  if (!btn) return false;
   btn.click();
-  return 'clicked';
+  return true;
 }
 """
 
 
 def _close_buy_modal_if_open(page: Page, modal) -> None:
     """구매하기 모달이 열려 있으면 닫기 버튼으로 닫는다. 닫히지 않으면 상품 페이지를 다시 연다 (그래야 '구매하기' 를 누를 수 있다)."""
-    state = eval_bounded(page, _CLOSE_BUY_MODAL_JS, what="구매하기 모달 상태")
-    if state == "none":
+    if not eval_bounded(page, _BUY_MODAL_OPEN_JS, what="구매하기 모달 상태"):
         return
-    log.info("구매하기 모달이 이미 열려 있음 - 닫고 다시 엶 (%s)", state)
-    if state == "clicked":
+    clicked = eval_bounded(page, _CLOSE_BUY_MODAL_JS, what="구매하기 모달 닫기")
+    log.info("구매하기 모달이 이미 열려 있음 - 닫고 다시 엶 (%s)", "닫기 버튼 누름" if clicked else "닫기 버튼 없음")
+    if clicked:
         try:
             modal.wait_for(state="hidden", timeout=3000)
             page.wait_for_timeout(300)
