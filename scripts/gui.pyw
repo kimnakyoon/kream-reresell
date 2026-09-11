@@ -44,7 +44,7 @@ from kream_reresell.report import REPORT_DIR  # noqa: E402
 from kream_reresell.shop import ALL_SHOP_CATEGORIES, DEFAULT_SHOP_CATEGORY  # noqa: E402
 from kream_reresell.rules import BidRules, Tier  # noqa: E402
 
-WINDOW_WIDTH = 660
+WINDOW_WIDTH = 720  # '상품 고르기' 라디오 세 개(약 670px)가 한 줄에 다 보이는 폭
 WINDOW_HEIGHT = 900
 RIGHT_MARGIN = 40
 
@@ -73,7 +73,7 @@ class App:
         self.root = root
         root.title("KREAM 리리셀")
         _place_right_center(root)
-        root.minsize(560, 620)
+        root.minsize(700, 620)  # 세 화면(랭킹·검색·SHOP) 모두 700px 을 요구 - 더 좁히면 라디오·버튼 행이 잘림
 
         self.q: queue.Queue = queue.Queue()
         self.stop_flag = threading.Event()
@@ -93,12 +93,11 @@ class App:
         src_row.pack(fill="x", padx=12, pady=(8, 0))
         tk.Label(src_row, text="상품 고르기:", font=("맑은 고딕", 9, "bold")).pack(side="left")
         self.source = tk.StringVar(value="ranking")
-        tk.Radiobutton(src_row, text="랭킹 (랭킹 탭의 순위대로)", variable=self.source, value="ranking",
-                       command=self._show_source).pack(side="left", padx=(10, 0))
-        tk.Radiobutton(src_row, text="검색 (검색 결과 순서대로)", variable=self.source, value="search",
-                       command=self._show_source).pack(side="left", padx=(10, 0))
-        tk.Radiobutton(src_row, text="SHOP (카테고리 목록 순서대로)", variable=self.source, value="shop",
-                       command=self._show_source).pack(side="left", padx=(10, 0))
+        for text, value in (("랭킹 (랭킹 탭의 순위대로)", "ranking"), ("검색 (검색 결과 순서대로)", "search"),
+                            ("SHOP (카테고리 목록 순서대로)", "shop")):
+            # anchor="w": 창이 좁아 잘려도 동그라미는 남고 글자 끝만 잘리게 (기본 center 는 양끝이 함께 잘림)
+            tk.Radiobutton(src_row, text=text, variable=self.source, value=value, command=self._show_source,
+                           anchor="w").pack(side="left", padx=(10, 0))
         self.source_area = tk.Frame(frame)
         self.source_area.pack(fill="x")
 
@@ -121,7 +120,7 @@ class App:
         tk.Button(sel, text="전체 선택", command=lambda: self._set_all_categories(True)).pack(side="left")
         tk.Button(sel, text="전체 해제", command=lambda: self._set_all_categories(False)).pack(side="left", padx=(6, 0))
         tk.Label(sel, text="※ 신발·의류처럼 사이즈 옵션이 있는 상품은 옵션마다 따로 판정해 입찰합니다 (보고서에 옵션마다 한 줄)",
-                 fg="#888").pack(side="left", padx=(12, 0))
+                 fg="#888", anchor="w", justify="left", wraplength=500).pack(side="left", padx=(12, 0))
 
         row1 = tk.Frame(self.ranking_frame)
         row1.pack(fill="x", **pad)
@@ -236,26 +235,20 @@ class App:
         # ---- 버튼
         buttons = tk.Frame(root)
         buttons.pack(fill="x", padx=12, pady=4)
-        self.run_button = tk.Button(buttons, text="입찰", width=12, height=2, font=("맑은 고딕", 11, "bold"),
-                                    bg="#222", fg="white", activebackground="#444", activeforeground="white",
-                                    command=self.start)
-        self.run_button.pack(side="left")
-        self.cancel_button = tk.Button(buttons, text="입찰취소", width=12, height=2, font=("맑은 고딕", 11, "bold"),
-                                       bg="#8B0000", fg="white", activebackground="#B22222", activeforeground="white",
-                                       command=self.start_cancel)
-        self.cancel_button.pack(side="left", padx=(8, 0))
-        self.rebid_button = tk.Button(buttons, text="재입찰", width=12, height=2, font=("맑은 고딕", 11, "bold"),
-                                      bg="#B36B00", fg="white", activebackground="#D98C1F", activeforeground="white",
-                                      command=self.start_rebid)
-        self.rebid_button.pack(side="left", padx=(8, 0))
-        self.history_button = tk.Button(buttons, text="내역", width=12, height=2, font=("맑은 고딕", 11, "bold"),
-                                        bg="#1F4E79", fg="white", activebackground="#2E75B6", activeforeground="white",
-                                        command=self.start_history)
-        self.history_button.pack(side="left", padx=(8, 0))
+        def big_button(text: str, bg: str, active_bg: str, command, first: bool = False) -> tk.Button:
+            b = tk.Button(buttons, text=text, width=10, height=2, font=("맑은 고딕", 11, "bold"),
+                          bg=bg, fg="white", activebackground=active_bg, activeforeground="white", command=command)
+            b.pack(side="left", padx=(0 if first else 8, 0))
+            return b
+
+        self.run_button = big_button("입찰", "#222", "#444", self.start, first=True)
+        self.cancel_button = big_button("입찰취소", "#8B0000", "#B22222", self.start_cancel)
+        self.rebid_button = big_button("재입찰", "#B36B00", "#D98C1F", self.start_rebid)
+        self.history_button = big_button("내역", "#1F4E79", "#2E75B6", self.start_history)
         self.stop_button = tk.Button(buttons, text="중지 (지금 것까지만)", width=18, height=2, state="disabled",
                                      command=self.request_stop)
         self.stop_button.pack(side="left", padx=(8, 0))
-        self.status = tk.Label(buttons, text="대기 중", fg="#333")
+        self.status = tk.Label(buttons, text="대기 중", fg="#333", anchor="w")  # 긴 문구는 뒤쪽만 잘리게
         self.status.pack(side="left", padx=(16, 0))
 
         # ---- 로그
