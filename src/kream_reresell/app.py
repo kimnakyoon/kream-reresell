@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from playwright.sync_api import Page, sync_playwright
@@ -30,6 +30,7 @@ class JobResult:
     results: list[ProductResult]
     report_path: Path
     mode: str
+    section_lines: list[str] = field(default_factory=list)   # [재입찰] 회차별 요약 한 줄씩 (GUI 완료 창·로그에 표시)
 
 
 @dataclass
@@ -391,8 +392,7 @@ def run_rebid_job(settings: Settings,
         except Exception:  # noqa: BLE001
             log.exception("보고서 저장 실패")
 
-    counts: dict[str, int] = {}
-    for r in results:
-        counts[r.status] = counts.get(r.status, 0) + 1
-    log.info("==== 재입찰 결과: %s ====", ", ".join(f"{k} {v}건" for k, v in sorted(counts.items())) or "처리한 입찰 없음")
-    return JobResult(results=results, report_path=path, mode=mode)
+    lines = report.section_lines(results)
+    log.info("==== 재입찰 결과: %s ====%s", report.summarize(results, empty="처리한 입찰 없음"),
+             "".join(f"\n  {line}" for line in lines))
+    return JobResult(results=results, report_path=path, mode=mode, section_lines=lines)

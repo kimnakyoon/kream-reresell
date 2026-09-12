@@ -40,13 +40,15 @@ from kream_reresell import browser  # noqa: E402
 from kream_reresell.app import normalize_keywords, run_cancel_job, run_history_job, run_job, run_rebid_job  # noqa: E402
 from kream_reresell.config import LOG_DIR, RULES_PATH, Settings  # noqa: E402
 from kream_reresell.ranking import ALL_CATEGORIES, DEFAULT_CATEGORY  # noqa: E402
-from kream_reresell.report import REPORT_DIR  # noqa: E402
+from kream_reresell.report import REPORT_DIR, summarize  # noqa: E402
 from kream_reresell.shop import ALL_SHOP_CATEGORIES, DEFAULT_SHOP_CATEGORY  # noqa: E402
 from kream_reresell.rules import BidRules, Tier  # noqa: E402
 
 WINDOW_WIDTH = 720  # '상품 고르기' 라디오 세 개(약 670px)가 한 줄에 다 보이는 폭
 WINDOW_HEIGHT = 900
 RIGHT_MARGIN = 40
+
+MAX_CYCLE_LINES_IN_POPUP = 20   # [재입찰] 완료 창에 보여줄 회차별 요약 줄 수 (100회면 창이 화면을 넘어감 - 나머지는 로그에)
 
 # 랭킹 체크박스는 랭킹 칩 순서(ALL_CATEGORIES)대로 나열하고, 체크한 것을 그 순서대로 실행한다.
 CATEGORY_COLUMNS = 6
@@ -691,13 +693,18 @@ class App:
     def _finish(self, job) -> None:
         self.last_report = job.report_path
         self.open_report_button.configure(state="normal")
-        counts: dict[str, int] = {}
-        for r in job.results:
-            counts[r.status] = counts.get(r.status, 0) + 1
-        summary = ", ".join(f"{k} {v}개" for k, v in sorted(counts.items())) or "처리한 상품 없음"
+        summary = summarize(job.results, unit="개")
         self._set_busy(False, f"완료: {summary}")
-        self._log(f"===== 완료 ({job.mode}) - {summary}\n보고서: {job.report_path}")
-        messagebox.showinfo("완료", f"{job.mode}\n{summary}\n\n보고서가 저장되었습니다:\n{job.report_path}")
+        # [재입찰]은 회차별로도 나눠 보여준다 (사용자 요청 2026-09-13). 회차가 많으면 완료 창에는 마지막 몇 회차만, 로그에는 전부
+        by_cycle = "".join(f"\n  {line}" for line in job.section_lines)
+        self._log(f"===== 완료 ({job.mode}) - 전체: {summary}{by_cycle}\n보고서: {job.report_path}")
+        shown = job.section_lines[-MAX_CYCLE_LINES_IN_POPUP:]
+        popup = "".join(f"\n{line}" for line in shown)
+        if len(shown) < len(job.section_lines):
+            popup = f"\n... (앞 {len(job.section_lines) - len(shown)}회차는 아래 로그와 엑셀 참고)" + popup
+        if job.section_lines:
+            popup = f"\n\n회차별:{popup}"
+        messagebox.showinfo("완료", f"{job.mode}\n전체: {summary}{popup}\n\n보고서가 저장되었습니다:\n{job.report_path}")
 
     # ------------------------------------------------------------ 파일 열기
     def open_report_dir(self) -> None:
