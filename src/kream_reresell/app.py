@@ -334,7 +334,7 @@ def describe_rebid_settings(settings: Settings) -> str:
 
 
 def _write_rebid_report(results: list[ProductResult], settings_line: str, mode: str, path: Path) -> Path:
-    """사이클마다 같은 파일에 덮어쓴다. 사용자가 엑셀로 열어 둔 상태면 시각을 붙인 다른 이름으로 저장."""
+    """회차마다 파일 하나. 같은 이름의 파일을 엑셀로 열어 둔 상태면 시각을 붙인 다른 이름으로 저장."""
     try:
         return report.write_report(results, settings_line, mode, path=path, kind="재입찰")
     except PermissionError:
@@ -352,7 +352,8 @@ def run_rebid_job(settings: Settings,
 
     max_cycles: 이만큼 돌고 끝. None 이면 settings.rebid_cycles (GUI '재입찰 횟수' 칸 / .env REBID_CYCLES) 를 쓰고,
     그것도 0 이면 중지할 때까지 돈다.
-    보고서는 사이클이 끝날 때마다 같은 파일에 덮어써서, 중간에 프로그램이 죽어도 그때까지의 결과가 남는다.
+    보고서는 회차마다 파일 하나 (`KREAM 재입찰결과 날짜 시각 N회차.xlsx`, 사용자 요청 2026-09-12) - 사이클이 끝날 때마다
+    그 회차 결과만 담아 저장하고, 중간에 프로그램이 죽으면 아직 저장 안 된 회차분을 마지막에 저장해 그때까지의 결과가 남는다.
     """
     settings.validate()
     if max_cycles is None:
@@ -363,17 +364,29 @@ def run_rebid_job(settings: Settings,
     settings_line = describe_rebid_settings(settings)
     log.info("%s | %s", mode, settings_line)
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    path = REPORT_DIR / f"KREAM 재입찰결과 {datetime.now():%Y-%m-%d %H%M}.xlsx"
+    stamp = f"{datetime.now():%Y-%m-%d %H%M}"      # 한 실행의 파일들이 같은 접두어로 모이게 실행 시작 시각
     results: list[ProductResult] = []
+    written = 0          # results 중 보고서로 저장한 수 (그 앞까지는 어느 회차 파일엔가 들어 있음)
+    last_cycle = 0
+    path = REPORT_DIR / f"KREAM 재입찰결과 {stamp} 1회차.xlsx"    # 저장이 한 번도 안 됐을 때 돌려줄 이름
 
     def collect(r: ProductResult) -> None:
         results.append(r)
         if on_result:
             on_result(r)
 
+    def write_cycle(cycle: int) -> None:
+        """아직 저장 안 된 결과를 이 회차의 파일로 저장한다."""
+        nonlocal path, written, last_cycle
+        pending = results[written:]
+        path = _write_rebid_report(pending, f"{settings_line} | 이 파일은 {cycle}회차 결과", mode,
+                                   REPORT_DIR / f"KREAM 재입찰결과 {stamp} {cycle}회차.xlsx")
+        written = len(results)
+        last_cycle = cycle
+        log.info("%d회차 엑셀 보고서 (%d줄): %s", cycle, len(pending), path)
+
     def cycle_done(cycle: int, _cycle_results: list[ProductResult]) -> None:
-        nonlocal path
-        path = _write_rebid_report(results, settings_line, mode, path)
+        write_cycle(cycle)
 
     try:
         with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images, trim_api=settings.trim_api,
@@ -385,11 +398,13 @@ def run_rebid_job(settings: Settings,
     except KeyboardInterrupt:
         log.info("Ctrl+C 로 중지")
     finally:
-        try:
-            path = _write_rebid_report(results, settings_line, mode, path)
-            log.info("엑셀 보고서: %s", path)
-        except Exception:  # noqa: BLE001
-            log.exception("보고서 저장 실패")
+        # 회차 도중에 끊겼으면 (Ctrl+C·오류) 그 회차분을 따로 저장하고, 한 회차도 못 끝낸 실행도 빈 보고서 하나는 남긴다 (전과 같음).
+        # 정상 종료면 이미 회차마다 저장됐다
+        if len(results) > written or last_cycle == 0:
+            try:
+                write_cycle(last_cycle + 1)
+            except Exception:  # noqa: BLE001
+                log.exception("보고서 저장 실패")
 
     counts: dict[str, int] = {}
     for r in results:
