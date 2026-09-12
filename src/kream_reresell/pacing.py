@@ -34,6 +34,11 @@
      막혔다 풀리면(sitewait) 남은 실행은 한도를 반으로 줄인다 - 한 번 막힌 뒤에는 더 적은 양으로 또 막힌다.
   (패널을 열 때 사이트가 페이지 로드 때와 똑같은 sales 요청을 한 번 더 보내는데, 이를 브라우저에서 캐시해 돌려주는 것은
    실패했다 - browser._api_route 참고. 그래서 패널 열기는 sales 2건이다.)
+  6. 시세 API 틱 (2026-09-13, No1 Seller Center 조사 뒤 사용자 결정): A·B 는 페이지를 열지 않고 상품 상세 API 한 번(market.fetch_market)으로
+     읽는다. 그 호출은 고정 간격(ApiPacer, 기본 6초)으로 하나씩 보내고, 분당 상한(20건)을 넘지 않으며, 차단 신호(무응답·5xx 등)를 맞으면
+     간격을 두 배로 늘렸다가 조용해지면 되돌린다. 근거: 시간당 페이지 이동 600번(이동 하나가 API 수십 건)이 안 막혔고, No1 이 같은 호출을
+     시간당 200~230건씩 5일 연속 이 PC 에서 보내는 동안 우리 실행도 같이 돌았는데 막힘이 없었다. 3초(시간당 1,200건)는 실측 밖이라 하한을 3초로 둔다.
+     [재입찰]은 이 틱이 곧 속도다 (밀리지 않은 입찰 = 호출 1건, 페이지 이동 0번). [입찰]은 이 호출로 가격을 먼저 걸러 체결 내역 조회를 줄인다.
 """
 
 from __future__ import annotations
@@ -179,10 +184,103 @@ BUDGET = RequestBudget()
 PAGE_BUDGET = RequestBudget(limit=DEFAULT_PAGE_LIMIT, what="접속")
 
 
-def configure(limit: int, page_limit: int) -> None:
+# ---------------------------------------------------------------- 시세 API 틱 (대응 6)
+
+API_TICK_SEC = 6.0          # 시세 API(market) 호출 사이의 기본 간격. .env API_TICK_SEC / GUI '시세 조회 간격' 으로 바꾼다
+API_TICK_MIN_SEC = 3.0      # 이보다 짧게는 못 잡는다 - 시간당 1,200건은 어떤 실측도 넘어서는 값 (2026-09-13)
+API_TICK_MAX_SEC = 60.0     # 차단 신호로 늘려도 이보다 길어지지 않는다 (No1 Seller Center 의 상한과 같음)
+API_MAX_PER_MINUTE = 20     # 어떤 경우에도 시세 API 를 1분에 이만큼 넘게 보내지 않는다 (틱 3초 = 분당 20건이 딱 상한)
+API_CALM_TICKS = 3          # 차단 신호 뒤 이만큼 연달아 정상이면 간격을 한 계단 되돌린다
+API_STEP = 2.0              # 차단 신호 하나에 간격을 이 배수로 늘리고, 조용하면 같은 배수로 되돌린다
+
+
+class ApiPacer:
+    """시세 API 호출의 고정 틱 + 안전장치 - No1 Seller Center 의 자동 경쟁 페이스 조절을 본뜬 것 (2026-09-13 조사).
+
+    - 호출 사이에 tick 초를 지킨다 (직전 호출 시작 시각 기준 - 호출에 걸린 시간은 빠진다). 상품(입찰) 하나 = 호출 하나라 이 값이 곧 속도다.
+    - 1분에 API_MAX_PER_MINUTE 건을 넘기지 않는다 (설정을 잘못 넣거나 재시도가 몰려도 이 위로는 못 간다).
+    - 차단 신호(무응답 · 망 오류 · 429 · 403 · 5xx, api.ApiError.is_block_signal)를 맞으면 간격을 API_STEP 배로 늘린다 (최대 API_TICK_MAX_SEC).
+      연달아 API_CALM_TICKS 번 정상이면 한 계단 되돌리고, 설정값까지 내려간다. 몇 분씩 멈추는 대신 한 계단씩 물러났다 돌아오는 방식이다.
+    - 연달아 몇 건이나 막혔는지(streak)는 부르는 쪽이 보고 sitewait(5분마다 확인)로 넘어간다 - 여기서는 간격만 다룬다.
+    스레드 안전하지 않다 (작업 스레드 하나에서만 쓴다).
+    """
+
+    def __init__(self, tick_sec: float = API_TICK_SEC) -> None:
+        self.configured = tick_sec
+        self.current = tick_sec
+        self.calm = 0
+        self.streak = 0
+        self.total = 0
+        self.blocks = 0
+        self._last_started = 0.0
+        self._minute: deque[float] = deque()
+
+    def configure(self, tick_sec: float) -> None:
+        """실행 시작마다 (Settings.validate) 틱을 설정값으로 둔다. 늘어나 있던 간격도 되돌린다."""
+        self.configured = self.current = max(API_TICK_MIN_SEC, min(API_TICK_MAX_SEC, tick_sec))
+        self.calm = self.streak = 0
+
+    def describe(self) -> str:
+        return f"틱 {self.current:g}초" + (f" (설정 {self.configured:g}초, 차단 신호로 늘림)" if self.current > self.configured else "")
+
+    def _minute_room(self, now: float) -> float:
+        while self._minute and now - self._minute[0] > 60:
+            self._minute.popleft()
+        if len(self._minute) < API_MAX_PER_MINUTE:
+            return 0.0
+        return max(0.0, self._minute[0] + 60 - now)
+
+    def wait_turn(self, should_stop: Callable[[], bool] | None = None,
+                  on_status: Callable[[str], None] | None = None) -> bool:
+        """다음 시세 API 호출 직전에 부른다 - 틱과 분당 상한을 지켜 쉰다. 중지 요청이면 False."""
+        now = time.monotonic()
+        wait = max(self._last_started + self.current - now, self._minute_room(now))
+        if wait >= ANNOUNCE_SEC:
+            log.info("시세 API %s에 맞춰 %d초 쉼", self.describe(), int(wait) + 1)
+            if on_status:
+                on_status(f"사이트 차단 방지: 시세 조회 {self.describe()}에 맞춰 {int(wait) + 1}초 쉬는 중")
+        ok = sleep_with_stop(wait, should_stop)
+        now = time.monotonic()
+        self._last_started = now
+        self._minute.append(now)
+        self.total += 1
+        return ok
+
+    def report_ok(self) -> None:
+        """호출이 정상으로 끝났다. 늘어나 있던 간격은 조용한 틱 API_CALM_TICKS 번마다 한 계단 되돌린다."""
+        self.streak = 0
+        if self.current <= self.configured:
+            self.calm = 0
+            return
+        self.calm += 1
+        if self.calm >= API_CALM_TICKS:
+            self.calm = 0
+            self.current = max(self.configured, self.current / API_STEP)
+            log.info("시세 API %d번 연달아 정상 - 간격을 %g초로 되돌림 (설정 %g초)", API_CALM_TICKS, self.current, self.configured)
+
+    def report_block(self, why: str) -> int:
+        """차단 신호를 맞았다 - 간격을 한 계단 늘린다. 연달아 몇 번째인지 돌려준다 (부르는 쪽이 sitewait 판단)."""
+        self.streak += 1
+        self.blocks += 1
+        self.calm = 0
+        before = self.current
+        self.current = min(API_TICK_MAX_SEC, self.current * API_STEP)
+        log.warning("시세 API 차단 신호 (%d번 연달아): %s - 간격 %g초 → %g초", self.streak, why, before, self.current)
+        return self.streak
+
+    def reset_streak(self) -> None:
+        """쉬었다 돌아온 뒤 (sitewait) 연달아 센 수만 지운다. 간격은 늘어난 채로 두고 정상 틱이 쌓이면 되돌린다."""
+        self.streak = 0
+
+
+API_PACER = ApiPacer()
+
+
+def configure(limit: int, page_limit: int, tick_sec: float = API_TICK_SEC) -> None:
     """실행 시작마다 (Settings.validate) 한도를 설정값으로 둔다 - tighten 으로 줄였던 것도 되돌린다. 창 안의 기록은 남긴다."""
     BUDGET.limit = limit
     PAGE_BUDGET.limit = page_limit
+    API_PACER.configure(tick_sec)
 
 
 def sleep_with_stop(seconds: float, should_stop: Callable[[], bool] | None = None) -> bool:

@@ -17,7 +17,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 from playwright.sync_api import Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeout
 
@@ -1022,6 +1022,15 @@ def _parse_fast_price(modal_text: str) -> int | None:
         if not m.group(1):
             return int(m.group(2).replace(",", ""))
     return None
+
+
+def buy_page_url(product_id: int, size: str = ONE_SIZE) -> str:
+    """구매 페이지 직접 주소. size 없이 /buy/{id} 만 열면 상품 페이지로 돌려보낸다 (2026-09-04 실측).
+
+    size 는 옵션의 값 (ONE SIZE / 240 ...) - 화면 표기(W240)가 아니라 상세 API 의 product_option.key (2026-09-05 실측).
+    [재입찰]의 변경 화면과 [입찰]의 구매 페이지가 같이 쓴다 (2026-09-13 부터 [입찰]도 구매하기 모달을 거치지 않고 바로 연다).
+    """
+    return f"https://kream.co.kr/buy/{product_id}?size={quote_plus(size or ONE_SIZE)}"
 
 
 def size_from_url(url: str) -> str:

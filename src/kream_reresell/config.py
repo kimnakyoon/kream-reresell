@@ -55,8 +55,9 @@ class Settings:
     search_quick_only: bool = field(default_factory=lambda: _bool("SEARCH_QUICK_ONLY", True))
     # [입찰] SHOP 모드: SHOP 탭의 카테고리 목록에도 같은 '빠른배송' 필터를 건다 (기본 켬, 사용자 결정 2026-09-06)
     shop_quick_only: bool = field(default_factory=lambda: _bool("SHOP_QUICK_ONLY", True))
-    # [재입찰] 사이클 시작 간격(분). 구매 입찰 목록을 한 바퀴 돈 뒤 다음 바퀴를 이 간격으로 시작한다 (봇 탐지 대비, 1분 이상)
-    rebid_interval_min: float = field(default_factory=lambda: _float("REBID_INTERVAL_MIN", 5))
+    # 시세 API(상품 상세) 호출 간격(초) - [재입찰]은 입찰 하나에 호출 하나라 이 값이 곧 속도, [입찰]은 상품 하나에 호출 하나 (pacing 대응 6).
+    # 기본 6초. 3초 아래로는 못 내리고(실측 밖) 60초까지. 차단 신호를 맞으면 프로그램이 알아서 늘렸다 되돌린다
+    api_tick_sec: float = field(default_factory=lambda: _float("API_TICK_SEC", pacing.API_TICK_SEC))
     # [재입찰] 몇 사이클 돌고 끝낼지 (GUI "재입찰 횟수" 칸의 기본값). 0 이면 [중지]/Ctrl+C 까지 계속
     rebid_cycles: int = field(default_factory=lambda: _int("REBID_CYCLES", 1))
     # 이미지/동영상/폰트를 받지 않아 페이지를 빨리 띄운다. 화면 확인이 필요하면 .env 에 BLOCK_IMAGES=0
@@ -79,15 +80,16 @@ class Settings:
     options: tuple[str, ...] = ()  # 옵션(사이즈) 상품에서 이 옵션들만 본다 (점검용, 화면 표기: W240 / M ...). 비우면 전부
 
     def validate(self) -> None:
-        pacing.configure(self.api_budget_per_10min, self.page_budget_per_10min)
+        pacing.configure(self.api_budget_per_10min, self.page_budget_per_10min, self.api_tick_sec)
         if self.stop_before_submit:
             self.show_chrome = True  # 마지막 버튼 직전에 멈추는 점검은 사람이 화면을 보는 게 목적
         if self.bid_days not in BID_DAY_CHOICES:
             raise ValueError(f"BID_DAYS 는 {BID_DAY_CHOICES} 중 하나여야 합니다: {self.bid_days}")
         if not 0 <= self.min_margin_rate < 1:
             raise ValueError(f"MIN_MARGIN_RATE 는 0 이상 1 미만이어야 합니다: {self.min_margin_rate}")
-        if self.rebid_interval_min < 1:
-            raise ValueError(f"재입찰 사이클 간격은 1분 이상이어야 합니다 (사이트 차단 방지): {self.rebid_interval_min}")
+        if not pacing.API_TICK_MIN_SEC <= self.api_tick_sec <= pacing.API_TICK_MAX_SEC:
+            raise ValueError(f"시세 조회 간격은 {pacing.API_TICK_MIN_SEC:g}~{pacing.API_TICK_MAX_SEC:g}초 사이여야 합니다 "
+                             f"(사이트 차단 방지): {self.api_tick_sec:g}")
         if self.rebid_cycles < 0:
             raise ValueError(f"재입찰 횟수는 0(계속) 또는 1 이상이어야 합니다: {self.rebid_cycles}")
         self.rules.validate()

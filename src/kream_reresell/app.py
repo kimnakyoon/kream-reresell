@@ -16,6 +16,7 @@ from playwright.sync_api import Page, sync_playwright
 from datetime import datetime
 
 from . import auth, cancel, history, history_report, pacing, pipeline, ranking, rebid, report, search, shop
+from .api import ApiClient
 from .browser import real_chrome_context
 from .config import Settings
 from .history import HistoryResult
@@ -73,7 +74,7 @@ def describe_settings(settings: Settings, categories: list[str], keywords: list[
         source = f"랭킹 {' → '.join(categories)} (랭킹마다 {settings.max_products}개)"
     return (f"조건: 최근 {settings.lookback_days}일 빠른배송 {settings.min_fast_sales}건 이상, "
             f"{settings.rules.describe()}, 입찰기한 {settings.bid_days}일, {source}, "
-            f"접속 예산 10분 {settings.page_budget_per_10min}번"
+            f"시세 조회 간격 {settings.api_tick_sec:g}초, 접속 예산 10분 {settings.page_budget_per_10min}번"
             + (", 조건 무시(--force)" if settings.force else ""))
 
 
@@ -240,13 +241,16 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
         # 마이페이지에 이미 입찰 중인 상품은 건너뛴다 (bids.json 과 별개로 실제 목록을 본다)
         log.info("마이페이지 구매 입찰 목록 확인 중...")
         open_bids = cancel.open_bid_products(context, page)
+        api = ApiClient(page)   # 시세 API (상품 상세) - 상품마다 한 번, 가격을 먼저 거른다 (pipeline 머리글). 헤더는 첫 호출 때 잡는다
+        log.info("시세 API 틱 %g초 (분당 최대 %d건, 차단 신호면 두 배씩 늘려 최대 %g초, 조용하면 되돌림)",
+                 pacing.API_PACER.configured, pacing.API_MAX_PER_MINUTE, pacing.API_TICK_MAX_SEC)
 
         if product_ids:
             items = [ranking.RankedProduct(rank=i + 1, product_id=pid, name=str(pid), price=None,
                                            url=f"https://kream.co.kr/products/{pid}", category="지정")
                      for i, pid in enumerate(product_ids)]
             results = pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
-                                   open_bids=open_bids, page=page, on_status=on_status)
+                                   open_bids=open_bids, page=page, on_status=on_status, api=api)
         else:
             sources = _product_sources(settings, categories, keywords, shop_categories)
             seen: dict[int, str] = {}   # 이 실행에서 이미 판정한 상품 ID -> 어디서 봤는지
@@ -282,7 +286,7 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
                 items, skipped = skip_low_trades(items, settings, on_result)
                 results.extend(skipped)
                 results.extend(pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
-                                            open_bids=open_bids, page=page, on_status=on_status))
+                                            open_bids=open_bids, page=page, on_status=on_status, api=api))
 
     log.info("==== 결과 ====")
     for r in results:
@@ -325,12 +329,12 @@ def run_cancel_job(settings: Settings,
 
 
 def describe_rebid_settings(settings: Settings) -> str:
-    return (f"재입찰 기준: 마이페이지 > 구매 내역 > 구매 입찰 순서대로, 즉시 판매가(B) 가 내 희망가보다 높은(밀린) 입찰만 "
-            f"상품 페이지에서 처음 입찰 때와 같은 기준으로 다시 판정 (최근 {settings.lookback_days}일 빠른배송 "
-            f"{settings.min_fast_sales}건 이상, {settings.rules.describe()}) 하고, 충족하면 [입찰 변경하기] 로 희망가를 "
-            f"최신 B 로 올림 (마감 {settings.bid_days}일, 창고보관). 기준 미달이거나 빠른배송(판매자)이 없으면 입찰을 지움 "
-            f"(상한만 넘는 것은 그대로 둠). "
-            f"사이클 간격 {settings.rebid_interval_min:g}분, 접속 예산 10분 {settings.page_budget_per_10min}번, "
+    return (f"재입찰 기준: 마이페이지 > 구매 내역 > 구매 입찰 순서대로, 입찰마다 시세 API 로 최신 A·B 를 읽어 (페이지 이동 없음) "
+            f"즉시 판매가(B) 가 내 희망가보다 높은(밀린) 입찰만 상품 페이지에서 처음 입찰 때와 같은 기준으로 다시 판정 "
+            f"(최근 {settings.lookback_days}일 빠른배송 {settings.min_fast_sales}건 이상, {settings.rules.describe()}) 하고, "
+            f"충족하면 [입찰 변경하기] 로 희망가를 최신 B 로 올림 (마감 {settings.bid_days}일, 창고보관). "
+            f"기준 미달이거나 빠른배송(판매자)이 없으면 입찰을 지움 (상한만 넘는 것은 그대로 둠). "
+            f"시세 조회 간격 {settings.api_tick_sec:g}초 (회차 사이 쉼 없음), 접속 예산 10분 {settings.page_budget_per_10min}번, "
             f"{'중지할 때까지 반복' if not settings.rebid_cycles else f'{settings.rebid_cycles}회 돌고 끝'}")
 
 

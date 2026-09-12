@@ -7,7 +7,9 @@
 [입찰취소] 는 마이페이지 > 구매 내역 > 구매 입찰 목록을 순서대로 다시 판정해 기준 미달 입찰을 지운다.
 [재입찰] 은 같은 목록을 설정칸에 정한 횟수만큼 돌며(기본 1회, 0 이면 [중지] 까지 계속), 즉시 판매가가 내 희망가보다
 높아진(밀린) 입찰을 상품 페이지에서 처음 입찰 때 기준으로 다시 판정하고 충족하면 [입찰 변경하기] 로 희망가를 최신 B 로
-올리며, 기준 미달이라 올릴 수 없으면 그 입찰을 지운다 (사이클 간격은 설정칸, 기본 5분 - 너무 빠르면 사이트가 막을 수 있다).
+올리며, 기준 미달이라 올릴 수 없으면 그 입찰을 지운다. A·B 는 페이지를 열지 않고 시세 API 로 읽으며(입찰 하나에 호출 하나),
+호출 간격은 설정칸의 '시세 조회 간격' (기본 6초, 3~60초) - 회차 사이에 따로 쉬지 않는다. [입찰]도 같은 API 로 가격을 먼저 걸러
+체결 내역 조회를 줄인다.
 [입찰 기준] 표에서 A(빠른배송 가격) 금액 구간별 최소 마진율과 상품 금액 상한(A 가 넘으면 바로 건너뜀)을 정한다.
 [입찰]/[입찰취소]/[기준 저장] 을 누르면 data/bid_rules.json 에 저장돼 다음 실행과 명령행에도 쓰인다.
 끝나면 바탕화면\\KREAM 결과\\ 에 엑셀 보고서가 저장된다 (자동으로 열지는 않는다).
@@ -36,7 +38,7 @@ if sys.platform == "win32" and sys.stdout is not None:
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from kream_reresell import browser  # noqa: E402
+from kream_reresell import browser, pacing  # noqa: E402
 from kream_reresell.app import normalize_keywords, run_cancel_job, run_history_job, run_job, run_rebid_job  # noqa: E402
 from kream_reresell.config import LOG_DIR, RULES_PATH, Settings  # noqa: E402
 from kream_reresell.ranking import ALL_CATEGORIES, DEFAULT_CATEGORY  # noqa: E402
@@ -207,12 +209,13 @@ class App:
         self.rebid_cycles.insert(0, str(self.base.rebid_cycles))
         self.rebid_cycles.pack(side="left", padx=(6, 0))
         tk.Label(row_rebid, text="(0 = [중지]까지 계속)", fg="#888").pack(side="left", padx=(6, 0))
-        tk.Label(row_rebid, text="사이클 시작 간격(분)").pack(side="left", padx=(18, 0))
-        self.rebid_interval = tk.Spinbox(row_rebid, from_=1, to=120, width=5)
-        self.rebid_interval.delete(0, "end")
-        self.rebid_interval.insert(0, f"{self.base.rebid_interval_min:g}")
-        self.rebid_interval.pack(side="left", padx=(6, 0))
-        tk.Label(row_rebid, text="(1분 이상)", fg="#888").pack(side="left", padx=(6, 0))
+        tk.Label(row_rebid, text="시세 조회 간격(초)").pack(side="left", padx=(18, 0))
+        self.api_tick = tk.Spinbox(row_rebid, from_=int(pacing.API_TICK_MIN_SEC), to=int(pacing.API_TICK_MAX_SEC), width=5)
+        self.api_tick.delete(0, "end")
+        self.api_tick.insert(0, f"{self.base.api_tick_sec:g}")
+        self.api_tick.pack(side="left", padx=(6, 0))
+        tk.Label(row_rebid, text=f"({pacing.API_TICK_MIN_SEC:g}~{pacing.API_TICK_MAX_SEC:g}초, 상품·입찰 하나에 호출 하나)",
+                 fg="#888").pack(side="left", padx=(6, 0))
 
         row2 = tk.Frame(frame)
         row2.pack(fill="x", **pad)
@@ -227,7 +230,7 @@ class App:
                 f"마진 (A−B) > A×[아래 입찰 기준의 구간별 %] · 입찰 {self.base.bid_days}일 · 창고보관 · 포인트 최대 사용")
         tk.Label(frame, text=cond, fg="#555", anchor="w", justify="left", wraplength=580).pack(fill="x", padx=12, pady=(0, 6))
         tk.Label(frame, text="(거래량·기간·입찰기한은 프로젝트 폴더의 .env 에서 바꿉니다. 랭킹·검색어·SHOP 카테고리·상품 수는 [입찰]에만, "
-                             "재입찰 횟수·사이클 간격은 [재입찰]에만 쓰입니다)",
+                             "재입찰 횟수는 [재입찰]에만, 시세 조회 간격은 [입찰]·[재입찰]에 쓰입니다)",
                  fg="#888", anchor="w", justify="left", wraplength=600).pack(fill="x", padx=12, pady=(0, 6))
 
         # ---- 입찰 기준 (금액 구간별 마진율 + 입찰가 상한)
@@ -469,6 +472,9 @@ class App:
             src_text = " → ".join(categories)
             what = f"랭킹 {len(categories)}개를 순서대로 돌며 각각 상위 {limit}개 중 조건에 맞는 상품에"
             log_head = f"{src_text} / 랭킹마다 상위 {limit}개"
+        tick = self._read_tick_sec()
+        if tick is None:
+            return
         rules = self._apply_rules()
         if rules is None:
             return
@@ -478,7 +484,7 @@ class App:
                              "배송방법은 창고보관, 포인트는 최대 사용입니다.\n\n진행할까요?"):
             return
 
-        settings = self._make_settings(dry, rules)
+        settings = self._make_settings(dry, rules, tick)
         settings.max_products = limit
         if searching:
             settings.search_quick_only = self.search_quick.get()
@@ -549,34 +555,28 @@ class App:
         if cycles < 0:
             messagebox.showerror("입력 오류", "재입찰 횟수는 0(계속) 또는 1 이상이어야 합니다.")
             return
-        try:
-            interval = float(self.rebid_interval.get())
-        except ValueError:
-            messagebox.showerror("입력 오류", "재입찰 사이클 간격은 숫자(분)로 넣어주세요.")
-            return
-        if interval < 1:
-            messagebox.showerror("입력 오류", "재입찰 사이클 간격은 1분 이상이어야 합니다 (너무 빠르면 사이트가 막을 수 있습니다).")
+        tick = self._read_tick_sec()
+        if tick is None:
             return
         rules = self._apply_rules()
         if rules is None:
             return
         dry = self.mode.get() == "dry"
         if cycles == 0:
-            repeat = f"[중지] 를 누를 때까지 {interval:g}분 간격으로 계속 반복"
+            repeat = f"[중지] 를 누를 때까지 계속 반복 (입찰 하나에 {tick:g}초, 회차 사이 쉼 없음)"
         elif cycles == 1:
-            repeat = "구매 입찰 목록을 한 바퀴만 돌고 끝"
+            repeat = f"구매 입찰 목록을 한 바퀴만 돌고 끝 (입찰 하나에 {tick:g}초)"
         else:
-            repeat = f"{interval:g}분 간격으로 {cycles}회 돌고 끝"
+            repeat = f"{cycles}회 돌고 끝 (입찰 하나에 {tick:g}초, 회차 사이 쉼 없음)"
         if not dry and not messagebox.askyesno(
-                "재입찰", "마이페이지 > 구매 내역 > 구매 입찰 목록을 순서대로 보며, 즉시 판매가가 내 희망가보다 높아진(밀린) 입찰을\n"
-                        "상품 페이지에서 처음 입찰 때와 같은 기준으로 다시 판정하고\n"
+                "재입찰", "마이페이지 > 구매 내역 > 구매 입찰 목록을 순서대로 보며, 입찰마다 시세 API 로 최신 A·B 를 읽어\n"
+                        "즉시 판매가가 내 희망가보다 높아진(밀린) 입찰을 상품 페이지에서 처음 입찰 때와 같은 기준으로 다시 판정하고\n"
                         f"(최근 {self.base.lookback_days}일 빠른배송 {self.base.min_fast_sales}건 이상, {rules.describe()}),\n"
                         f"충족하면 [입찰 변경하기] 로 희망가를 최신 즉시 판매가로 올립니다 (마감 {self.base.bid_days}일, 창고보관).\n"
                         "기준에 못 미쳐 올릴 수 없는 입찰과, 밀렸는데 변경 화면이 예상과 달라 못 올린 입찰은 실제로 지웁니다 (되돌릴 수 없음).\n\n"
                         f"{repeat}합니다 (횟수는 설정의 '재입찰 횟수' 칸, 도는 중에도 [중지] 로 멈출 수 있음).\n\n진행할까요?"):
             return
-        settings = self._make_settings(dry, rules)
-        settings.rebid_interval_min = interval
+        settings = self._make_settings(dry, rules, tick)
         settings.rebid_cycles = cycles
         self.stop_flag.clear()
         self.last_report = None
@@ -633,8 +633,24 @@ class App:
         self._log(f"===== 완료 - {summary}\n엑셀: {job.report_path}")
         messagebox.showinfo("내역 정리 완료", f"{summary}\n\n엑셀이 저장되었습니다:\n{job.report_path}")
 
-    def _make_settings(self, dry: bool, rules: BidRules) -> Settings:
-        return Settings(dry_run=dry, show_chrome=self.show_chrome.get(), rules=rules)
+    def _make_settings(self, dry: bool, rules: BidRules, tick_sec: float | None = None) -> Settings:
+        settings = Settings(dry_run=dry, show_chrome=self.show_chrome.get(), rules=rules)
+        if tick_sec is not None:
+            settings.api_tick_sec = tick_sec
+        return settings
+
+    def _read_tick_sec(self) -> float | None:
+        """설정칸의 시세 조회 간격(초). 잘못 넣었으면 알리고 None."""
+        try:
+            tick = float(self.api_tick.get())
+        except ValueError:
+            messagebox.showerror("입력 오류", "시세 조회 간격은 숫자(초)로 넣어주세요.")
+            return None
+        if not pacing.API_TICK_MIN_SEC <= tick <= pacing.API_TICK_MAX_SEC:
+            messagebox.showerror("입력 오류", f"시세 조회 간격은 {pacing.API_TICK_MIN_SEC:g}~{pacing.API_TICK_MAX_SEC:g}초 사이여야 합니다 "
+                                          "(너무 빠르면 사이트가 막을 수 있습니다).")
+            return None
+        return tick
 
     def toggle_chrome_window(self) -> None:
         """실행 중이면 크롬 창을 바로 불러오거나 치운다. 대기 중이면 다음 실행에만 반영된다."""

@@ -10,8 +10,7 @@
     창고보관 링크 /my/inventory?…&id=보관번호). 이 보관번호가 보관 판매의 id 와 같다 → 매입-판매를 정확히 잇는 열쇠.
   - 구매 상세 : GET api/m/bids/입찰번호 → oid(매입 주문번호 B-SW…), price(매입가 = 즉시 구매가), keep.ask_id(보관번호)
 
-API 는 브라우저 밖에서 부르면 막히지만(요청 서명), 페이지 안에서 사이트가 보낸 헤더(authorization, x-kream-*)를
-그대로 붙여 fetch 하면 된다 (credentials 는 omit 이어야 CORS 를 통과한다).
+API 는 페이지 안에서 fetch 로 부른다 (api.ApiClient - 브라우저 밖에서 부르면 막힌다).
 """
 
 from __future__ import annotations
@@ -22,45 +21,19 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import Page
+
+from .api import KST, ApiClient, ApiError
 
 log = logging.getLogger(__name__)
 
-API_BASE = "https://api.kream.co.kr"
-INVENTORY_FINISHED_URL = "https://kream.co.kr/my/inventory?tab=finished"
-KST = timezone(timedelta(hours=9))
 PER_PAGE = 50                   # 서버가 허용하는 최대 (100 을 줘도 50 으로 잘린다, 2026-09-04 실측)
 MAX_PAGES = 200                 # 목록 한 종류에 이보다 많은 페이지는 읽지 않는다
-PARALLEL_FETCH = 10             # 구매 상세를 한 번에 이만큼 동시에 받는다 (순차보다 5배쯤 빠르다)
 # 판매 목록은 보관번호 순(최신 우선)이라 거래일시가 딱 정렬돼 있지는 않다. 한 페이지가 통째로
 # 정리하는 달보다 이만큼 오래된 거래뿐이면 그 뒤는 더 읽지 않는다.
 SALES_STOP_MARGIN_DAYS = 90
 
-_FETCH_JS = """
-async ([url, headers]) => {
-  const r = await fetch(url, { credentials: 'omit', headers });
-  const text = await r.text();
-  let body = null;
-  try { body = JSON.parse(text); } catch (e) { body = null; }
-  return { status: r.status, body, text: body === null ? text.slice(0, 300) : '' };
-}
-"""
-
-_FETCH_MANY_JS = """
-async ([urls, headers]) => Promise.all(urls.map(async (url) => {
-  try {
-    const r = await fetch(url, { credentials: 'omit', headers });
-    const text = await r.text();
-    let body = null;
-    try { body = JSON.parse(text); } catch (e) { body = null; }
-    return { status: r.status, body, text: body === null ? text.slice(0, 300) : '' };
-  } catch (e) { return { status: -1, body: null, text: String(e) }; }
-}))
-"""
-
-
-class HistoryError(Exception):
-    pass
+HistoryError = ApiError   # 예전 이름 - 이 모듈 안의 오류는 전부 API 오류다
 
 
 # ---------------------------------------------------------------- 자료
@@ -146,78 +119,6 @@ def month_range(year: int, month: int) -> tuple[datetime, datetime]:
 
 
 # ---------------------------------------------------------------- API
-
-class ApiClient:
-    """페이지 안에서 fetch 로 KREAM API 를 부른다. 헤더는 사이트가 실제로 보낸 요청에서 복사한다."""
-
-    HEADER_KEEP = ("authorization", "accept")
-
-    def __init__(self, page: Page) -> None:
-        self.page = page
-        self.headers: dict[str, str] = {}
-
-    def capture_headers(self, url: str = INVENTORY_FINISHED_URL) -> None:
-        """url 로 이동하면서 사이트가 API 에 보내는 헤더(authorization, x-kream-*)를 잡아 둔다."""
-        try:
-            with self.page.expect_request(
-                    lambda r: r.url.startswith(API_BASE) and "authorization" in r.headers
-                    and "notification" not in r.url, timeout=20_000) as req:
-                self.page.goto(url, wait_until="domcontentloaded")
-            headers = req.value.headers
-        except PlaywrightTimeout as e:
-            raise HistoryError("KREAM API 요청 헤더를 잡지 못했습니다 (로그인 상태와 페이지를 확인)") from e
-        self.headers = {k: v for k, v in headers.items()
-                        if k.lower().startswith("x-kream") or k.lower() in self.HEADER_KEEP}
-        log.debug("API 헤더 %d개 확보", len(self.headers))
-
-    def _request_headers(self) -> dict[str, str]:
-        if not self.headers:
-            self.capture_headers()
-        headers = dict(self.headers)
-        headers["x-kream-client-datetime"] = datetime.now(KST).strftime("%Y%m%d%H%M%S+0900")
-        return headers
-
-    @staticmethod
-    def _url(path: str) -> str:
-        return path if path.startswith("http") else API_BASE + path
-
-    def get(self, path: str, retry: bool = True) -> dict:
-        try:
-            res = self.page.evaluate(_FETCH_JS, [self._url(path), self._request_headers()])
-        except Exception as e:  # noqa: BLE001
-            raise HistoryError(f"API 호출 실패 ({path}): {e}") from e
-        if res["status"] in (401, 403) and retry:
-            log.info("API 인증이 끊겨 헤더를 다시 잡습니다 (%s)", res["status"])
-            self.capture_headers()
-            return self.get(path, retry=False)
-        if res["status"] != 200 or not isinstance(res.get("body"), dict):
-            raise HistoryError(f"API 응답 오류 {res['status']} ({path}): {res.get('text', '')[:200]}")
-        return res["body"]
-
-    def get_many(self, paths: list[str]) -> list[dict | HistoryError]:
-        """여러 경로를 PARALLEL_FETCH 개씩 동시에 받는다. 항목마다 응답 dict 또는 HistoryError."""
-        out: list[dict | HistoryError] = []
-        for i in range(0, len(paths), PARALLEL_FETCH):
-            chunk = paths[i:i + PARALLEL_FETCH]
-            try:
-                results = self.page.evaluate(_FETCH_MANY_JS, [[self._url(p) for p in chunk], self._request_headers()])
-            except Exception as e:  # noqa: BLE001
-                out.extend(HistoryError(f"API 호출 실패 ({p}): {e}") for p in chunk)
-                continue
-            for path, res in zip(chunk, results):
-                if res["status"] == 200 and isinstance(res.get("body"), dict):
-                    out.append(res["body"])
-                elif res["status"] in (401, 403):
-                    # 토큰이 끊긴 것 - 헤더를 다시 잡고 하나씩 다시 시도
-                    self.capture_headers()
-                    try:
-                        out.append(self.get(path, retry=False))
-                    except HistoryError as e:
-                        out.append(e)
-                else:
-                    out.append(HistoryError(f"API 응답 오류 {res['status']} ({path}): {res.get('text', '')[:200]}"))
-        return out
-
 
 # ---------------------------------------------------------------- 보관 판매
 

@@ -3,14 +3,15 @@
 마이페이지 > 구매 내역 > 구매 입찰 목록을 순서대로 보며, 즉시 판매가(B) 가 내 희망가보다 높아진(누가 더 비싸게 입찰한)
 입찰은 상품 페이지에서 처음 입찰 때와 같은 기준으로 다시 판정하고, 충족하면 희망가를 최신 B 로 올린다.
 밀리지 않은 입찰도 최신 A(빠른배송 가격)·B 로 마진을 다시 판정해 기준 미달이면 지운다. 빠른배송(판매자)이 없는 상품의 입찰도 지운다.
-횟수는 --cycles (기본: .env REBID_CYCLES, 기본 1회. 0 이면 Ctrl+C 까지 계속), 사이클 간격은 .env REBID_INTERVAL_MIN 또는 --interval.
+횟수는 --cycles (기본: .env REBID_CYCLES, 기본 1회. 0 이면 Ctrl+C 까지 계속). 입찰 하나마다 시세 API 한 번을 고정 간격(--tick, 기본 6초,
+.env API_TICK_SEC)으로 부르며 회차 사이에 따로 쉬지 않는다.
 
 예)
   python scripts/rebid.py --dry-run                 # 판단만 (올리지 않음), 설정한 횟수만큼
   python scripts/rebid.py --once --dry-run          # 한 바퀴만 판단
   python scripts/rebid.py --cycles 5                # 실제로 올림, 5회 돌고 끝
   python scripts/rebid.py --cycles 0                # Ctrl+C 로 중지할 때까지 계속
-  python scripts/rebid.py --interval 3              # 사이클 간격 3분
+  python scripts/rebid.py --tick 9                  # 시세 조회 간격 9초 (3~60)
   python scripts/rebid.py --once --stop-before-submit   # 마지막 '입찰하기' 직전에 멈춤 (점검용)
 """
 
@@ -49,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true", help="판단만 하고 희망가는 올리지 않음")
     p.add_argument("--once", action="store_true", help="구매 입찰 목록을 한 바퀴만 돌고 끝")
     p.add_argument("--cycles", type=int, help="이만큼 돌고 끝 (기본: .env REBID_CYCLES 또는 1. 0 이면 Ctrl+C 까지 계속, --once 는 1)")
-    p.add_argument("--interval", type=float, help="사이클 시작 간격(분, 1 이상. 기본: .env REBID_INTERVAL_MIN 또는 5)")
+    p.add_argument("--tick", type=float, help="시세 API 조회 간격(초, 3~60. 기본: .env API_TICK_SEC 또는 6)")
     p.add_argument("--stop-before-submit", action="store_true", help="마지막 '입찰하기' 직전에 멈춤 (점검용)")
     p.add_argument("--inspect", action="store_true", help="화면마다 dumps/ 에 스냅샷 저장")
     p.add_argument("--show-chrome", action="store_true",
@@ -64,8 +65,8 @@ def main() -> int:
     settings = Settings(dry_run=args.dry_run, stop_before_submit=args.stop_before_submit, inspect=args.inspect)
     if args.show_chrome:
         settings.show_chrome = True
-    if args.interval:
-        settings.rebid_interval_min = args.interval
+    if args.tick:
+        settings.api_tick_sec = args.tick
     if args.once:
         settings.rebid_cycles = 1
     elif args.cycles is not None:
