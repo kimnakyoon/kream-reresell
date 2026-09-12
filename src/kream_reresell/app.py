@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from playwright.sync_api import Page, sync_playwright
@@ -30,7 +30,7 @@ class JobResult:
     results: list[ProductResult]
     report_path: Path
     mode: str
-    section_lines: list[str] = field(default_factory=list)   # [재입찰] 회차별 요약 한 줄씩 (GUI 완료 창·로그에 표시)
+    section_label: str | None = None   # [재입찰] '회차': 결과가 랭킹 열 값(N회차)으로 나뉘어 있다는 표시 - GUI 완료 창이 회차별 요약을 붙임
 
 
 @dataclass
@@ -337,11 +337,11 @@ def describe_rebid_settings(settings: Settings) -> str:
 def _write_rebid_report(results: list[ProductResult], settings_line: str, mode: str, path: Path) -> Path:
     """사이클마다 같은 파일에 덮어쓴다. 사용자가 엑셀로 열어 둔 상태면 시각을 붙인 다른 이름으로 저장."""
     try:
-        return report.write_report(results, settings_line, mode, path=path, kind="재입찰")
+        return report.write_report(results, settings_line, mode, path=path, kind="재입찰", section_label="회차")
     except PermissionError:
         alt = path.with_name(f"{path.stem} ({datetime.now():%H%M%S}){path.suffix}")
         log.warning("보고서가 열려 있어 다른 이름으로 저장: %s", alt)
-        return report.write_report(results, settings_line, mode, path=alt, kind="재입찰")
+        return report.write_report(results, settings_line, mode, path=alt, kind="재입찰", section_label="회차")
 
 
 def run_rebid_job(settings: Settings,
@@ -392,7 +392,6 @@ def run_rebid_job(settings: Settings,
         except Exception:  # noqa: BLE001
             log.exception("보고서 저장 실패")
 
-    lines = report.section_lines(results)
     log.info("==== 재입찰 결과: %s ====%s", report.summarize(results, empty="처리한 입찰 없음"),
-             "".join(f"\n  {line}" for line in lines))
-    return JobResult(results=results, report_path=path, mode=mode, section_lines=lines)
+             "".join(f"\n  {line}" for line in report.section_lines(results)))
+    return JobResult(results=results, report_path=path, mode=mode, section_label="회차")

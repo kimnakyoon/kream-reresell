@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -100,9 +101,7 @@ LEGENDS = {"입찰": BID_LEGEND, "입찰취소": CANCEL_LEGEND, "재입찰": REB
 
 def summarize(results: list[ProductResult], unit: str = "건", empty: str = "처리한 상품 없음") -> str:
     """판정별 개수 한 줄: '변경완료 1건, 순위유지 5건'."""
-    counts: dict[str, int] = {}
-    for r in results:
-        counts[r.status] = counts.get(r.status, 0) + 1
+    counts = Counter(r.status for r in results)
     return ", ".join(f"{k} {v}{unit}" for k, v in sorted(counts.items())) or empty
 
 
@@ -117,17 +116,17 @@ def sections(results: list[ProductResult]) -> list[tuple[str, list[ProductResult
 
 
 def section_title(name: str, rs: list[ProductResult], unit: str = "건") -> str:
-    """구간 한 줄 요약: '1회차 (10:05~10:13): 변경완료 1건, 순위유지 5건 - 6건'."""
-    span = f" ({rs[0].time[11:16]}~{rs[-1].time[11:16]})" if rs else ""
-    return f"{name}{span}: {summarize(rs, unit)} - {len(rs)}{unit}"
+    """구간(비어 있지 않음) 한 줄 요약: '1회차 (10:05~10:13): 변경완료 1건, 순위유지 5건 - 6건'."""
+    return f"{name} ({rs[0].time[11:16]}~{rs[-1].time[11:16]}): {summarize(rs, unit)} - {len(rs)}{unit}"
 
 
 def section_lines(results: list[ProductResult], unit: str = "건") -> list[str]:
     return [section_title(name, rs, unit) for name, rs in sections(results)]
 
 
+_BOLD = Font(bold=True)
 _SECTION_FILL = PatternFill("solid", fgColor="BDD7EE")
-_SECTION_LABEL = {"재입찰": "회차"}     # 요약 시트의 구간 표 머리글 (기본 '랭킹')
+_STATUS_FILLS = {st: PatternFill("solid", fgColor=color) for st, color in STATUS_FILL.items()}   # 셀마다 새로 만들지 않게
 
 
 def _write_row(ws, i: int, r: ProductResult) -> None:
@@ -146,19 +145,19 @@ def _write_row(ws, i: int, r: ProductResult) -> None:
     link = ws.cell(row=i, column=_COL["링크"])
     link.hyperlink = r.url
     link.font = Font(color="0563C1", underline="single")
-    fill = STATUS_FILL.get(r.status)
+    fill = _STATUS_FILLS.get(r.status)
     if fill:
         for col in range(1, len(COLUMNS) + 1):
-            ws.cell(row=i, column=col).fill = PatternFill("solid", fgColor=fill)
+            ws.cell(row=i, column=col).fill = fill
 
 
 def write_report(results: list[ProductResult], settings_line: str, mode: str,
-                 path: Path | None = None, kind: str = "입찰") -> Path:
+                 path: Path | None = None, kind: str = "입찰", section_label: str | None = None) -> Path:
     """kind 는 파일 이름과 판정 설명에 쓴다: '입찰' / '입찰취소' / '재입찰'.
-    '재입찰' 은 한 파일에 여러 회차가 쌓이므로 결과 시트에서 회차가 바뀌는 곳마다 구분 줄(회차·시각·요약)을 넣는다 (사용자 요청 2026-09-13)."""
+    section_label 을 주면 (재입찰: '회차') 결과 시트에서 랭킹 열 값이 바뀌는 곳마다 구분 줄(이름·시각·요약)을 넣고
+    요약 시트의 구간 표 머리글에 쓴다 - 한 파일에 여러 회차가 쌓이는 재입찰용 (사용자 요청 2026-09-13)."""
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     path = path or REPORT_DIR / f"KREAM {kind}결과 {datetime.now():%Y-%m-%d %H%M}.xlsx"
-    separators = kind == "재입찰"
 
     wb = Workbook()
     ws = wb.active
@@ -183,11 +182,11 @@ def write_report(results: list[ProductResult], settings_line: str, mode: str,
     ws.freeze_panes = ws.cell(row=header_row + 1, column=1)
 
     i = header_row
-    for name, rs in (sections(results) if separators else [("", results)]):
-        if separators:
+    for name, rs in (sections(results) if section_label else [(None, results)]):
+        if name is not None:
             # 구분 줄: 셀을 합치지 않는다 (합치면 엑셀에서 필터 정렬이 막힘). 오른쪽 셀이 비어 있어 글이 그대로 넘쳐 보인다
             i += 1
-            ws.cell(row=i, column=1, value=f"▶ {section_title(name, rs)}").font = Font(bold=True)
+            ws.cell(row=i, column=1, value=f"▶ {section_title(name, rs)}").font = _BOLD
             for col in range(1, len(COLUMNS) + 1):
                 ws.cell(row=i, column=col).fill = _SECTION_FILL
         for r in rs:
@@ -195,35 +194,33 @@ def write_report(results: list[ProductResult], settings_line: str, mode: str,
             _write_row(ws, i, r)
     ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(COLUMNS))}{max(i, header_row + 1)}"
 
-    # 요약 시트: 판정별 합계 + 랭킹(재입찰은 회차)별 판정 수
+    # 요약 시트: 판정별 합계 + 랭킹(재입찰은 회차)별 판정 수. 한 번 세어 두고 조회만 한다 (100회차 재입찰이면 수천 줄)
     ss = wb.create_sheet("요약")
-    counts: dict[str, int] = {}
-    for r in results:
-        counts[r.status] = counts.get(r.status, 0) + 1
+    by_cat_status = Counter((r.category, r.status) for r in results)
+    counts: Counter[str] = Counter()
+    for (_, st), n in by_cat_status.items():
+        counts[st] += n
     ss["A1"] = "판정"
     ss["B1"] = "상품 수"
-    ss["A1"].font = ss["B1"].font = Font(bold=True)
+    ss["A1"].font = ss["B1"].font = _BOLD
     row = 2
     for k, v in sorted(counts.items()):
         ss.cell(row=row, column=1, value=k)
         ss.cell(row=row, column=2, value=v)
         row += 1
 
-    categories: list[str] = []
-    for r in results:
-        if r.category and r.category not in categories:
-            categories.append(r.category)
+    categories = list(dict.fromkeys(cat for cat, _ in by_cat_status if cat))   # 나온 순서대로, 중복 없이
     if len(categories) > 1:
         row += 1
         statuses = sorted(counts)
-        ss.cell(row=row, column=1, value=_SECTION_LABEL.get(kind, "랭킹")).font = Font(bold=True)
+        ss.cell(row=row, column=1, value=section_label or "랭킹").font = _BOLD
         for j, st in enumerate(statuses, start=2):
-            ss.cell(row=row, column=j, value=st).font = Font(bold=True)
+            ss.cell(row=row, column=j, value=st).font = _BOLD
         for cat in categories:
             row += 1
             ss.cell(row=row, column=1, value=cat)
             for j, st in enumerate(statuses, start=2):
-                ss.cell(row=row, column=j, value=sum(1 for r in results if r.category == cat and r.status == st))
+                ss.cell(row=row, column=j, value=by_cat_status.get((cat, st), 0))
     ss.column_dimensions["A"].width = 14
 
     wb.save(path)

@@ -73,7 +73,7 @@ from .cancel import (CancelAborted, CancelUncertain, OpenBid, apply_known, delet
                      list_open_bids, match_known_bid, read_bid_info)
 from .config import Settings
 from .debug import dump
-from .report import ProductResult
+from .report import ProductResult, summarize
 from . import pacing
 from .pacing import sleep_with_stop
 from .sitewait import PROBE_SEC, TROUBLE_STREAK, wait_until_site_back
@@ -582,10 +582,7 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                 except Exception:  # noqa: BLE001
                     log.exception("쉬고 나서 로그인 상태를 확인하지 못함 - 그대로 이어서 봄")
 
-        counts: dict[str, int] = {}
-        for r in cycle_results:
-            counts[r.status] = counts.get(r.status, 0) + 1
-        summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "처리한 입찰 없음"
+        summary = summarize(cycle_results, unit="", empty="처리한 입찰 없음")
         elapsed = time.monotonic() - started
         api_calls = pacing.BUDGET.total - api_calls_before
         log.info("===== 재입찰 %d회차 끝 (%d초): %s | 스로틀 대상 API 요청 %d건 (지금 10분 창 %d/%d건), 페이지 이동 %d/%d번 =====",
