@@ -186,6 +186,14 @@ def read_bid_info(page: Page, bid: OpenBid) -> dict | None:
     except Exception as e:  # noqa: BLE001
         log.debug("입찰 상세 API 응답을 못 잡음 (%s)", e)
         return None
+    return apply_bid_info(bid, data)
+
+
+def apply_bid_info(bid: OpenBid, data) -> dict | None:
+    """상세 API(api/m/bids/{입찰번호}) 응답으로 bid 의 상품 ID · 희망가 · 마감 · 옵션 값을 채운다. 응답 모양이 아니면 None.
+
+    [재입찰]은 2026-09-13 부터 이 응답을 페이지 이동 없이 api.ApiClient 로 받아 여기로 넘긴다.
+    """
     if not isinstance(data, dict) or not data.get("product_id"):
         return None
     bid.product_id = int(data["product_id"])

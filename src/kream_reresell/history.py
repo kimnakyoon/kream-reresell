@@ -33,8 +33,6 @@ MAX_PAGES = 200                 # 목록 한 종류에 이보다 많은 페이�
 # 정리하는 달보다 이만큼 오래된 거래뿐이면 그 뒤는 더 읽지 않는다.
 SALES_STOP_MARGIN_DAYS = 90
 
-HistoryError = ApiError   # 예전 이름 - 이 모듈 안의 오류는 전부 API 오류다
-
 
 # ---------------------------------------------------------------- 자료
 
@@ -117,8 +115,6 @@ def month_range(year: int, month: int) -> tuple[datetime, datetime]:
     end = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
     return start, end
 
-
-# ---------------------------------------------------------------- API
 
 # ---------------------------------------------------------------- 보관 판매
 
@@ -313,7 +309,7 @@ def load_purchase_details(client: ApiClient, purchases: list[PurchaseRecord]) ->
     if not todo:
         return
     for p, body in zip(todo, client.get_many([f"/api/m/bids/{p.bid_id}" for p in todo])):
-        if isinstance(body, HistoryError):
+        if isinstance(body, ApiError):
             log.warning("구매 #%d 상세를 읽지 못함: %s", p.bid_id, body)
             continue
         apply_purchase_detail(p, body)

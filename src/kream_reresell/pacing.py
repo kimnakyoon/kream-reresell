@@ -166,9 +166,7 @@ class RequestBudget:
         return ok
 
     def _announce_wait(self, wait: float, on_status: Callable[[str], None] | None) -> None:
-        log.info("%s 예산(%s)에 맞춰 %d초 쉼", self.what, self._span(), int(wait) + 1)
-        if on_status:
-            on_status(f"사이트 차단 방지: {self.what} 예산({self._span()})에 맞춰 {int(wait) + 1}초 쉬는 중")
+        _announce(f"{self.what} 예산({self._span()})", wait, on_status)
 
     def tighten(self) -> None:
         """막혔다 풀린 뒤 부른다 - 남은 실행 동안 한도를 반으로 줄인다 (configure 가 다음 실행에 되돌린다)."""
@@ -198,57 +196,47 @@ class ApiPacer:
     """시세 API 호출의 고정 틱 + 안전장치 - No1 Seller Center 의 자동 경쟁 페이스 조절을 본뜬 것 (2026-09-13 조사).
 
     - 호출 사이에 tick 초를 지킨다 (직전 호출 시작 시각 기준 - 호출에 걸린 시간은 빠진다). 상품(입찰) 하나 = 호출 하나라 이 값이 곧 속도다.
-    - 1분에 API_MAX_PER_MINUTE 건을 넘기지 않는다 (설정을 잘못 넣거나 재시도가 몰려도 이 위로는 못 간다).
+    - 1분에 API_MAX_PER_MINUTE 건을 넘기지 않는다 (설정을 잘못 넣거나 재시도가 몰려도 이 위로는 못 간다) - RequestBudget 의 1분 창.
     - 차단 신호(무응답 · 망 오류 · 429 · 403 · 5xx, api.ApiError.is_block_signal)를 맞으면 간격을 API_STEP 배로 늘린다 (최대 API_TICK_MAX_SEC).
       연달아 API_CALM_TICKS 번 정상이면 한 계단 되돌리고, 설정값까지 내려간다. 몇 분씩 멈추는 대신 한 계단씩 물러났다 돌아오는 방식이다.
-    - 연달아 몇 건이나 막혔는지(streak)는 부르는 쪽이 보고 sitewait(5분마다 확인)로 넘어간다 - 여기서는 간격만 다룬다.
-    스레드 안전하지 않다 (작업 스레드 하나에서만 쓴다).
+    - 연달아 몇 건이나 막혔는지는 부르는 쪽이 결과(판단 불가)로 세어 sitewait(5분마다 확인)로 넘어간다 - 여기서는 간격만 다룬다.
+    틱 값의 범위(API_TICK_MIN_SEC~MAX)는 Settings.validate 가 지킨다.
     """
 
     def __init__(self, tick_sec: float = API_TICK_SEC) -> None:
         self.configured = tick_sec
         self.current = tick_sec
         self.calm = 0
-        self.streak = 0
-        self.total = 0
         self.blocks = 0
         self._last_started = 0.0
-        self._minute: deque[float] = deque()
+        self._minute = RequestBudget(limit=API_MAX_PER_MINUTE, window_sec=60, what="시세 조회")
 
     def configure(self, tick_sec: float) -> None:
         """실행 시작마다 (Settings.validate) 틱을 설정값으로 둔다. 늘어나 있던 간격도 되돌린다."""
-        self.configured = self.current = max(API_TICK_MIN_SEC, min(API_TICK_MAX_SEC, tick_sec))
-        self.calm = self.streak = 0
+        self.configured = self.current = tick_sec
+        self.calm = 0
 
     def describe(self) -> str:
         return f"틱 {self.current:g}초" + (f" (설정 {self.configured:g}초, 차단 신호로 늘림)" if self.current > self.configured else "")
 
-    def _minute_room(self, now: float) -> float:
-        while self._minute and now - self._minute[0] > 60:
-            self._minute.popleft()
-        if len(self._minute) < API_MAX_PER_MINUTE:
-            return 0.0
-        return max(0.0, self._minute[0] + 60 - now)
+    def describe_setup(self) -> str:
+        """실행 시작 로그용 - 설정과 안전장치 요약."""
+        return (f"시세 API 틱 {self.configured:g}초 (분당 최대 {API_MAX_PER_MINUTE}건, 차단 신호면 {API_STEP:g}배씩 늘려 "
+                f"최대 {API_TICK_MAX_SEC:g}초, {API_CALM_TICKS}번 조용하면 되돌림)")
 
     def wait_turn(self, should_stop: Callable[[], bool] | None = None,
                   on_status: Callable[[str], None] | None = None) -> bool:
         """다음 시세 API 호출 직전에 부른다 - 틱과 분당 상한을 지켜 쉰다. 중지 요청이면 False."""
-        now = time.monotonic()
-        wait = max(self._last_started + self.current - now, self._minute_room(now))
+        wait = max(self._last_started + self.current - time.monotonic(), self._minute.seconds_until_room())
         if wait >= ANNOUNCE_SEC:
-            log.info("시세 API %s에 맞춰 %d초 쉼", self.describe(), int(wait) + 1)
-            if on_status:
-                on_status(f"사이트 차단 방지: 시세 조회 {self.describe()}에 맞춰 {int(wait) + 1}초 쉬는 중")
+            _announce(f"시세 조회 {self.describe()}", wait, on_status)
         ok = sleep_with_stop(wait, should_stop)
-        now = time.monotonic()
-        self._last_started = now
-        self._minute.append(now)
-        self.total += 1
+        self._last_started = time.monotonic()
+        self._minute.count()
         return ok
 
     def report_ok(self) -> None:
         """호출이 정상으로 끝났다. 늘어나 있던 간격은 조용한 틱 API_CALM_TICKS 번마다 한 계단 되돌린다."""
-        self.streak = 0
         if self.current <= self.configured:
             self.calm = 0
             return
@@ -258,22 +246,23 @@ class ApiPacer:
             self.current = max(self.configured, self.current / API_STEP)
             log.info("시세 API %d번 연달아 정상 - 간격을 %g초로 되돌림 (설정 %g초)", API_CALM_TICKS, self.current, self.configured)
 
-    def report_block(self, why: str) -> int:
-        """차단 신호를 맞았다 - 간격을 한 계단 늘린다. 연달아 몇 번째인지 돌려준다 (부르는 쪽이 sitewait 판단)."""
-        self.streak += 1
+    def report_block(self, why: str) -> None:
+        """차단 신호를 맞았다 - 간격을 한 계단 늘린다."""
         self.blocks += 1
         self.calm = 0
         before = self.current
         self.current = min(API_TICK_MAX_SEC, self.current * API_STEP)
-        log.warning("시세 API 차단 신호 (%d번 연달아): %s - 간격 %g초 → %g초", self.streak, why, before, self.current)
-        return self.streak
-
-    def reset_streak(self) -> None:
-        """쉬었다 돌아온 뒤 (sitewait) 연달아 센 수만 지운다. 간격은 늘어난 채로 두고 정상 틱이 쌓이면 되돌린다."""
-        self.streak = 0
+        log.warning("시세 API 차단 신호 (이 실행 %d번째): %s - 간격 %g초 → %g초", self.blocks, why, before, self.current)
 
 
 API_PACER = ApiPacer()
+
+
+def _announce(what: str, wait: float, on_status: Callable[[str], None] | None) -> None:
+    """예산·틱에 맞춘 쉼을 로그와 상태창에 알린다 (RequestBudget · ApiPacer 공용)."""
+    log.info("%s에 맞춰 %d초 쉼", what, int(wait) + 1)
+    if on_status:
+        on_status(f"사이트 차단 방지: {what}에 맞춰 {int(wait) + 1}초 쉬는 중")
 
 
 def configure(limit: int, page_limit: int, tick_sec: float = API_TICK_SEC) -> None:
@@ -312,3 +301,12 @@ def before_product(should_stop: Callable[[], bool] | None = None,
                    on_status: Callable[[str], None] | None = None) -> bool:
     """상품(입찰) 하나를 보기 직전에 부른다 - 접속 예산을 고르게 나눈 간격을 지키고, 자리가 없으면 날 때까지 쉰다 (대응 5). 중지 요청이면 False."""
     return PAGE_BUDGET.pace(should_stop, VISITS_PER_PRODUCT, on_status)
+
+
+def before_page_visit(should_stop: Callable[[], bool] | None = None,
+                      on_status: Callable[[str], None] | None = None, need: int = 1) -> bool:
+    """페이지 이동이 있는 단계(거래량 확인 · 변경 · 지우기) 직전에 부른다 - 접속 예산에 자리가 없으면 날 때까지 쉰다. 중지 요청이면 False.
+
+    시세 API 방식([재입찰])에서는 페이지 이동이 밀린 입찰과 지우는 입찰에만 생겨 보통은 자리가 있다 - 그때는 바로 돌아온다.
+    """
+    return PAGE_BUDGET.wait_for_room(should_stop, need, on_status)

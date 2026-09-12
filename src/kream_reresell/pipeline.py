@@ -17,7 +17,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page
 
 from . import auth, hangwatch
 from . import bid as bid_mod
@@ -119,10 +119,7 @@ def judge_prices(page: Page, r: ProductResult, settings: Settings, price_limit: 
     r.size = product_mod.size_from_url(page.url) or (ONE_SIZE if not option else "")
     if settings.inspect:
         dump(page, f"{pid}_1_buy_page")
-    reason = judge_margin(r, settings, price_limit)
-    if price_limit and settings.rules.over_limit(r.price_a):
-        return reason   # 상한 초과는 거래량 사유보다 앞선다 (예전과 같은 순서)
-    return sales_reason or reason
+    return sales_reason or judge_margin(r, settings, price_limit)
 
 
 def _prefilter(market: market_mod.ProductMarket, item: RankedProduct, settings: Settings,
@@ -170,13 +167,13 @@ def _prefilter(market: market_mod.ProductMarket, item: RankedProduct, settings: 
     return candidates
 
 
-def process_product(context: BrowserContext, item: RankedProduct, settings: Settings,
+def process_product(context: BrowserContext, item: RankedProduct, settings: Settings, api: ApiClient,
                     open_bids: "OpenBids | None" = None, should_stop: Callable[[], bool] | None = None,
-                    on_status: Callable[[str], None] | None = None, api: ApiClient | None = None) -> list[ProductResult]:
+                    on_status: Callable[[str], None] | None = None) -> list[ProductResult]:
     """상품 하나를 처리한다 (머리글의 순서). ONE SIZE 상품은 결과 한 줄, 옵션 상품은 옵션마다 한 줄.
 
-    시세로 다 걸러지면 탭을 열지 않는다. 남는 옵션이 있으면 새 탭에서 체결 내역을 세고 구매 페이지에서 입찰한다.
-    기준에 맞으면 입찰을 시도하고, 시도 중 안전장치에 걸리거나 화면이 예상과 다르면 그 상품(옵션)은 건너뛰고 다음으로 간다.
+    시세로 다 걸러지면 탭을 열지 않는다 (상품 사이 간격·접속 예산도 쓰지 않는다). 남는 옵션이 있으면 새 탭에서 체결 내역을 세고
+    구매 페이지에서 입찰한다. 기준에 맞으면 입찰을 시도하고, 시도 중 안전장치에 걸리거나 화면이 예상과 다르면 그 상품(옵션)은 건너뛰고 다음으로 간다.
     open_bids 에 상품 ID 를 못 읽은 입찰이 있으면 상품 페이지 제목(= 마이페이지 표기)으로 대조해 이미 입찰 중이면 건너뛴다.
     """
     pid = item.product_id
@@ -188,13 +185,7 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
     try:
         market = market_mod.fetch_market_paced(api, pid, should_stop, on_status)
     except market_mod.MarketUnavailable as e:
-        if e.stopped:
-            r.status, r.detail = "중단", str(e)
-        elif e.gone:
-            r.status, r.detail = "건너뜀", f"시세를 읽지 못함: {e}"
-        else:
-            # 차단 신호 - 연달아 나면 run 이 sitewait 로 멈춘다. 간격은 fetch_market_paced 가 이미 늘렸다
-            r.status, r.detail = "건너뜀", f"{NOT_LOADED_PREFIX}: {e}"
+        r.status, r.detail = market_mod.unavailable_result(e, "건너뜀", NOT_LOADED_PREFIX)
         return _done(results, r, item)
     if not market.options:
         r.status, r.detail = "건너뜀", "시세 응답에 옵션이 하나도 없음"
@@ -203,7 +194,13 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
     if not candidates:
         return results
 
-    # 2. 거래량 - 상품 페이지의 체결 내역 패널 (남은 옵션만)
+    # 2. 거래량 - 상품 페이지의 체결 내역 패널 (남은 옵션만). 페이지를 여는 상품에만 사람 속도 간격과 접속 예산(pacing 대응 2·5)을 쓴다
+    pacing.pause(pacing.PRODUCT_PAUSE_SEC, should_stop)
+    if not pacing.before_product(should_stop, on_status):
+        for _, cr in candidates:
+            cr.status, cr.detail = "중단", "중지 요청 - 상품 페이지를 열지 않음"
+            _done(results, cr, item)
+        return results
     page: Page = context.new_page()
     hangwatch.set_page(page)   # 탭이 아예 멈추면 감시 스레드가 닫는다 (이 상품은 오류로 끝나고 다음 상품은 새 탭) - hangwatch 참고
     try:
@@ -352,20 +349,10 @@ def _open_buy_page(page: Page, r: ProductResult, label: str, settings: Settings)
     구매하기 모달을 거치지 않는다 (2026-09-13 - 옵션 값은 시세 API 의 product_option.key 로 이미 안다). 이동이 15초 안에 안 끝나거나
     끊기면(net::ERR_ABORTED) 1.5초 뒤 한 번 더 열고, 그래도 안 되면 SkipProduct. 옵션 상품은 상단의 옵션 표기가 고른 것과 같아야 한다.
     """
-    url = product_mod.buy_page_url(r.product_id, r.size or ONE_SIZE)
-    for attempt in range(2):
-        try:
-            page.goto(url, wait_until="domcontentloaded")
-            break
-        except PlaywrightError as e:   # 시간 제한 또는 이동 중 끊김
-            timed_out = isinstance(e, PlaywrightTimeout)
-            stall = product_mod.page_stall(page) if timed_out else None
-            if stall:
-                raise product_mod.PageStalled(f"구매 페이지 이동이 안 끝남 - {stall}") from e
-            if attempt:
-                raise product_mod.SkipProduct(f"구매 페이지를 열지 못함 (두 번 시도): {product_mod.timeout_why(e)}") from e
-            log.info("구매 페이지 이동이 안 끝남 (%s) - 1.5초 뒤 다시 엶", product_mod.timeout_why(e))
-            page.wait_for_timeout(1500)
+    try:
+        product_mod.goto_with_retry(page, product_mod.buy_page_url(r.product_id, r.size or ONE_SIZE), "구매 페이지")
+    except PlaywrightError as e:
+        raise product_mod.SkipProduct(f"구매 페이지를 열지 못함 (두 번 시도): {product_mod.timeout_why(e)}") from e
     loaded = product_mod.wait_buy_page_loaded(page, r.product_id, label)
     if r.option and not loaded.option_shown:
         # 구매 페이지 상단의 옵션 표기가 고른 것과 같아야 한다 (다른 사이즈에 입찰하지 않도록)
@@ -414,13 +401,12 @@ def _open_bid_detail(ob: "OpenBid") -> str:
     return f"마이페이지에 이미 입찰 중 (입찰 #{ob.bid_id}{opt})"
 
 
-def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
+def run(context: BrowserContext, items: list[RankedProduct], settings: Settings, api: ApiClient,
         should_stop: Callable[[], bool] | None = None,
         on_result: Callable[[ProductResult], None] | None = None,
         open_bids: "OpenBids | None" = None,
         page: Page | None = None,
-        on_status: Callable[[str], None] | None = None,
-        api: ApiClient | None = None) -> list[ProductResult]:
+        on_status: Callable[[str], None] | None = None) -> list[ProductResult]:
     """open_bids: 마이페이지 구매 입찰 탭에 지금 살아 있는 입찰 (cancel.OpenBids).
 
     거기에 있는 상품(옵션)만 건너뛴다. 그 밖의 상품은 (예전에 입찰했다가 체결·만료로 사라진 것도) 기준에 따라 다시 판정해
@@ -432,12 +418,10 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
     더 열지 않고 멈춘 채 5분마다 확인, 다시 주면 그 상품들부터 다시 본다 (앞서 남긴 판단 불가 결과는 바꿔 넣는다. 확인이 패널을
     열어 보는 것이라 로그인 확인을 겸한다). 사용자가 중지할 때까지 기다린다.
     로그인이 풀리면 (product.LoginNeeded) 다시 로그인하고 그 상품을 한 번 더 본다 (_process_with_relogin). 또 풀리면 오류.
-    page: 다시 로그인할 때 쓰는 메인 탭 (없거나 닫혔으면 새 탭). api: 시세 API 클라이언트 (없으면 page 로 만든다). on_status: GUI 상태 한 줄.
+    api: 시세·입찰 상세 API 클라이언트 (app.run_job 이 만든다). page: 다시 로그인할 때 쓰는 메인 탭 (없거나 닫혔으면 새 탭). on_status: GUI 상태 한 줄.
     """
     stop = should_stop or (lambda: False)
     status = on_status or (lambda _t: None)
-    if api is None:
-        api = ApiClient(page if page is not None and not page.is_closed() else context.new_page())
     results: list[ProductResult] = []
     queue = list(items)
     done = 0
@@ -455,10 +439,6 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
             if on_result:
                 on_result(results[-1])
             continue
-        if done > 1:
-            pacing.pause(pacing.PRODUCT_PAUSE_SEC, stop)   # 상품 사이 간격 (사이트 스로틀 대응)
-        if not pacing.before_product(stop, status):        # 접속 예산 (pacing 대응 5)
-            break
         status(f"[{item.category}] {item.rank}위 {item.name[:24]} 확인 중 ({done}/{len(items)}, 시세 {pacing.API_PACER.describe()})")
         product_results = _process_with_relogin(context, page, item, settings, open_bids, stop, status, api)
         for r in product_results:
@@ -480,7 +460,6 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
         # (_site_gives_sales 가 패널을 열었으면 로그인도 돼 있다 - 패널은 로그인이 필요한 동작, 풀렸으면 거기서 다시 로그인함)
         if not wait_until_site_back(lambda: _site_gives_sales(context, probe_item, settings, api), stop, status):
             break
-        pacing.API_PACER.reset_streak()
         # 판단 불가로 남긴 결과를 빼고 그 상품들을 맨 앞에 다시 넣는다
         retry_ids = {it.product_id for it in trouble_streak}
         results = [r for r in results if not (r.product_id in retry_ids and is_site_trouble(r))]
@@ -500,7 +479,7 @@ def _process_with_relogin(context: BrowserContext, page: Page | None, item: Rank
                           status: Callable[[str], None], api: ApiClient) -> list[ProductResult]:
     """process_product 를 부르되, 로그인이 풀린 것이 보이면 다시 로그인하고 한 번 더 본다 (rebid._rebid_with_relogin 과 같은 꼴)."""
     try:
-        return process_product(context, item, settings, open_bids, stop, status, api)
+        return process_product(context, item, settings, api, open_bids, stop, status)
     except product_mod.LoginNeeded as e:
         log.warning("[%d위] %s - 다시 로그인하고 한 번 더 봄", item.rank, e)
         status("로그인이 풀려 다시 로그인하는 중")
@@ -513,9 +492,9 @@ def _process_with_relogin(context: BrowserContext, page: Page | None, item: Rank
         finally:
             if tab is not page:
                 tab.close()
-        api.headers = {}   # 새 세션의 헤더를 다시 잡는다
+        api.invalidate()
     try:
-        return process_product(context, item, settings, open_bids, stop, status, api)
+        return process_product(context, item, settings, api, open_bids, stop, status)
     except product_mod.LoginNeeded as e2:
         return _done([], _item_result(item, status="오류", detail=f"다시 로그인했는데도 {e2}"), item)
 
@@ -537,7 +516,7 @@ def _site_gives_sales(context: BrowserContext, item: RankedProduct, settings: Se
         except product_mod.LoginNeeded as e:
             log.warning("확인 중 %s - 다시 로그인하고 한 번 더 확인", e)
             auth.ensure_logged_in(tab, settings)
-            api.headers = {}
+            api.invalidate()
             ok, note = product_mod.sales_available(tab, item.url)   # 또 풀리면 그대로 올라감 (wait_until_site_back 이 '아직 안 줌' 으로 봄)
         log.info("확인: %s", note)
         return ok

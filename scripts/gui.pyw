@@ -515,6 +515,9 @@ class App:
         """마이페이지 구매 입찰 목록을 순서대로 다시 판정해 기준 미달 입찰을 지운다."""
         if self.worker and self.worker.is_alive():
             return
+        tick = self._read_tick_sec()
+        if tick is None:
+            return
         rules = self._apply_rules()
         if rules is None:
             return
@@ -525,7 +528,7 @@ class App:
                           f"{rules.describe()}).\n\n"
                           "기준에 못 미치는 입찰은 실제로 지웁니다 (되돌릴 수 없음).\n\n진행할까요?"):
             return
-        settings = self._make_settings(dry, rules)
+        settings = self._make_settings(dry, rules, tick)
         self.stop_flag.clear()
         self.last_report = None
         self.open_report_button.configure(state="disabled")
@@ -633,10 +636,9 @@ class App:
         self._log(f"===== 완료 - {summary}\n엑셀: {job.report_path}")
         messagebox.showinfo("내역 정리 완료", f"{summary}\n\n엑셀이 저장되었습니다:\n{job.report_path}")
 
-    def _make_settings(self, dry: bool, rules: BidRules, tick_sec: float | None = None) -> Settings:
+    def _make_settings(self, dry: bool, rules: BidRules, tick_sec: float) -> Settings:
         settings = Settings(dry_run=dry, show_chrome=self.show_chrome.get(), rules=rules)
-        if tick_sec is not None:
-            settings.api_tick_sec = tick_sec
+        settings.api_tick_sec = tick_sec
         return settings
 
     def _read_tick_sec(self) -> float | None:

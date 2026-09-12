@@ -239,11 +239,11 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
         page = context.pages[0] if context.pages else context.new_page()
         auth.ensure_logged_in(page, settings)
         # 마이페이지에 이미 입찰 중인 상품은 건너뛴다 (bids.json 과 별개로 실제 목록을 본다)
+        # 시세 API (상품 상세) - 상품마다 한 번, 가격을 먼저 거른다 (pipeline 머리글). 헤더는 아래 목록 페이지가 보내는 요청에서 받아 둔다
+        api = ApiClient(page, context)
+        log.info(pacing.API_PACER.describe_setup())
         log.info("마이페이지 구매 입찰 목록 확인 중...")
         open_bids = cancel.open_bid_products(context, page)
-        api = ApiClient(page)   # 시세 API (상품 상세) - 상품마다 한 번, 가격을 먼저 거른다 (pipeline 머리글). 헤더는 첫 호출 때 잡는다
-        log.info("시세 API 틱 %g초 (분당 최대 %d건, 차단 신호면 두 배씩 늘려 최대 %g초, 조용하면 되돌림)",
-                 pacing.API_PACER.configured, pacing.API_MAX_PER_MINUTE, pacing.API_TICK_MAX_SEC)
 
         if product_ids:
             items = [ranking.RankedProduct(rank=i + 1, product_id=pid, name=str(pid), price=None,

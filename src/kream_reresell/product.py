@@ -37,21 +37,6 @@ class SkipProduct(Exception):
     """이 상품은 건너뛴다 (사유를 메시지로)."""
 
 
-class NoPriceB(SkipProduct):
-    """구매 페이지가 상품 정보를 다 불러왔는데 '즉시 판매가'(B) 가 '-' 다 (구매 입찰 없음). [재입찰]은 이 경우 입찰을 지운다.
-
-    아직 불러오는 중('리스트 로딩중입니다.' 그림)에 '-' 인 것은 이게 아니다 - wait_buy_page_loaded 가 다 불러올 때까지 기다리고,
-    시간 안에 못 불러오면 SkipProduct(판단 불가)로 둔다 (2026-09-06~07 에 불러오는 중의 '-' 를 보고 멀쩡한 입찰 14건을 지웠음).
-    """
-
-
-class NoFastDelivery(SkipProduct):
-    """구매하기 모달은 떴는데 빠른배송이 없거나(일반배송만, 또는 판매자 없음 안내만 그려짐) 빠른배송 가격이 없다 = 지금 빠른배송 판매자가 없다.
-
-    [재입찰]은 이 경우 입찰을 지운다 (사용자 결정 2026-09-06). [입찰]·[입찰취소]는 SkipProduct 와 같이 건너뜀·확인필요.
-    """
-
-
 class SalesNotLoaded(SkipProduct):
     """체결 내역 패널이 열렸는데 사이트가 내역을 내려주지 않았다 (오류 표시 또는 끝까지 빈 채).
 
@@ -169,27 +154,33 @@ class SalesStats:
     reached_window_end: bool  # 기간 밖(더 오래된) 행까지 봤는지
 
 
-def open_product(page: Page, url: str) -> str:
-    """상품 페이지로 이동해 '구매하기' 가 보일 때까지 기다리고 상품명(탭 제목)을 돌려준다.
-
-    이동이 15초 안에 안 끝나면 탭이 응답하는지 본다 - 응답하지 않으면 PageStalled ([재입찰]은 탭을 닫고 새 탭에서 한 번 더 본다.
-    2026-09-08 재입찰 123번째 실측: 구매 페이지에서 상품 페이지로 가는 이동이 안 끝나고 스냅샷도 못 찍혔는데 다음 입찰의 이동은 정상이라
-    같은 탭에서 다시 시도해도 소용없다). 응답하면 사이트·망이 느린 것 (2026-09-06 47번째: 스냅샷은 찍힘) - 잠깐 뒤 한 번 더 열고,
-    그래도 안 되면 그 오류를 그대로 올린다 (두 번 연속이면 사이트 문제 - 오류로 세어 연달아 나면 쉬게).
+def goto_with_retry(page: Page, url: str, what: str) -> None:
+    """url 로 이동한다. 이동이 15초 안에 안 끝나면 탭이 응답하는지 본다 - 응답하지 않으면 PageStalled ([재입찰]은 탭을 닫고 새 탭에서
+    한 번 더 본다. 2026-09-08 재입찰 123번째 실측: 구매 페이지에서 상품 페이지로 가는 이동이 안 끝나고 스냅샷도 못 찍혔는데 다음 입찰의
+    이동은 정상이라 같은 탭에서 다시 시도해도 소용없다). 응답하면 사이트·망이 느린 것 (2026-09-06 47번째: 스냅샷은 찍힘) - 1.5초 뒤 한 번
+    더 열고, 그래도 안 되면 그 오류(PlaywrightError)를 그대로 올린다. what 은 로그용 이름 ('상품 페이지' / '구매 페이지').
     """
     for attempt in range(2):
         try:
             page.goto(url, wait_until="domcontentloaded")
-            break
+            return
         except PlaywrightError as e:   # 시간 제한(PlaywrightTimeout) 또는 이동 중 끊김 (net::ERR_ABORTED, 2026-09-05 재입찰 실측)
             timed_out = isinstance(e, PlaywrightTimeout)
             stall = page_stall(page) if timed_out else None
             if stall:
-                raise PageStalled(f"상품 페이지 이동이 안 끝남 - {stall}") from e
+                raise PageStalled(f"{what} 이동이 안 끝남 - {stall}") from e
             if attempt:
                 raise
-            log.info("상품 페이지 이동이 %s (%s) - 1.5초 뒤 다시 엶", "안 끝남" if timed_out else "끊김", timeout_why(e))
+            log.info("%s 이동이 %s (%s) - 1.5초 뒤 다시 엶", what, "안 끝남" if timed_out else "끊김", timeout_why(e))
             page.wait_for_timeout(1500)
+
+
+def open_product(page: Page, url: str) -> str:
+    """상품 페이지로 이동해 '구매하기' 가 보일 때까지 기다리고 상품명(탭 제목)을 돌려준다 (이동 재시도는 goto_with_retry).
+
+    두 번 연속 이동이 안 되면 그 오류를 그대로 올린다 (사이트 문제 - 오류로 세어 연달아 나면 쉬게).
+    """
+    goto_with_retry(page, url, "상품 페이지")
     try:
         page.get_by_role("button", name="구매하기", exact=True).first.wait_for(state="visible", timeout=15_000)
     except PlaywrightTimeout as e:
@@ -799,18 +790,18 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None =
         if "일반배송" not in text or "빠른배송" in text:
             raise SkipProduct(f"'{want}' 을 골랐는데 배송 방법(빠른배송/일반배송)이 그려지지 않음") from None
         # 일반배송만 있다 - 지금 빠른배송 판매자가 없는 것 (2026-09-06 실측, 마뗑킴 카드 월렛) → A 를 정할 수 없어 판단 불가
-        raise NoFastDelivery(f"'{want}' 에 빠른배송이 없음 (일반배송만 그려짐 - 지금 빠른배송 판매자 없음)") from None
+        raise SkipProduct(f"'{want}' 에 빠른배송이 없음 (일반배송만 그려짐 - 지금 빠른배송 판매자 없음)") from None
     page.wait_for_timeout(300)
 
     text = modal.inner_text()
     if NO_SELLER_TEXT in text:
         # 판매 입찰이 하나도 없는 옵션 - 배송 방법 자리에 안내와 [구매 입찰하기] 만 그려진다 (2026-09-09 재입찰 139번째 실측,
         # 스와로브스키 네클리스 'ONE SIZE (쇼핑백 포함)'). 빠른배송 판매자도 없는 것이니 일반배송만 그려진 경우와 같이 다룬다
-        raise NoFastDelivery(f"'{want}' 에 판매자가 없음 (지금 빠른배송 판매자 없음)")
+        raise SkipProduct(f"'{want}' 에 판매자가 없음 (지금 빠른배송 판매자 없음)")
     price_a = _parse_fast_price(text)
     if price_a is None:
         # 빠른배송 줄은 있는데 가격이 없다 - 지금 빠른배송 판매자가 없는 것
-        raise NoFastDelivery(f"'{want}' 에 빠른배송 가격이 없음 (지금 빠른배송 판매자 없음)")
+        raise SkipProduct(f"'{want}' 에 빠른배송 가격이 없음 (지금 빠른배송 판매자 없음)")
     log.info("A(빠른배송 가격)%s = %s원", f" [{option}]" if option else "", f"{price_a:,}")
 
     modal.get_by_text("일반배송", exact=False).first.click()
@@ -875,7 +866,8 @@ class BuyPageLoaded:
 def wait_buy_page_loaded(page: Page, product_id: int, label: str) -> BuyPageLoaded:
     """구매 페이지가 상품 정보를 다 불러올 때까지 기다린다. '즉시 판매가 N원' 이 그려지면 그 값(B)과 옵션 표기 여부를 돌려준다.
 
-    다 불러왔는데(로딩 그림 없음, 옵션 표기 label 그려짐) 즉시 판매가가 '-' 이면 구매 입찰이 없는 것 → NoPriceB ([재입찰]은 지운다).
+    다 불러왔는데(로딩 그림 없음, 옵션 표기 label 그려짐) 즉시 판매가가 '-' 이면 구매 입찰이 없는 것 → SkipProduct (건너뜀).
+    ([재입찰]은 2026-09-13 부터 시세 API 의 highest_bid 로 판정하므로 여기 오지 않는다.)
     시간 안에 다 불러오지 못하면 판단 불가(SkipProduct) - 아직 불러오는 중에 '-' 를 보고 지우지 않도록.
     구매 페이지가 아닌 곳으로 갔으면 SkipProduct, 페이지가 응답하지 않으면 PageStalled.
     """
@@ -891,7 +883,7 @@ def wait_buy_page_loaded(page: Page, product_id: int, label: str) -> BuyPageLoad
         return BuyPageLoaded(price_b=result["price"], option_shown=result["optionShown"])
     if state == "no-price":
         # 다 불러왔는데 즉시 판매가가 '-' (구매 입찰이 하나도 없음) - [재입찰]은 이 경우 입찰을 지운다
-        raise NoPriceB(f"구매 페이지를 다 불러왔는데 '즉시 판매가' 가 없음 ('-', 옵션 표기 '{label}' 은 그려짐)")
+        raise SkipProduct(f"구매 페이지를 다 불러왔는데 '즉시 판매가' 가 없음 ('-', 옵션 표기 '{label}' 은 그려짐)")
     if state == "loading":
         raise SkipProduct(f"구매 페이지가 {BUY_PAGE_LOAD_TIMEOUT_MS // 1000}초 넘게 상품 정보를 불러오는 중 "
                           f"('리스트 로딩중' 표시, 즉시 판매가 '-') - 사이트가 느림, 지우지 않음")

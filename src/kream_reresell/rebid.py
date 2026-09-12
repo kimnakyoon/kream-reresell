@@ -2,8 +2,9 @@
 
 흐름 (2026-09-13 시세 API 방식 - No1 Seller Center 의 최저가 경쟁을 본떠 사용자 결정. 그 전에는 입찰마다 상품 페이지·구매 페이지를 열었다):
   1. /my/buying?tab=bidding 목록을 읽는다 (cancel.list_open_bids). 상품 ID 는 bids.json 기록 → 이번 실행의 캐시 →
-     상세 API 응답(api/m/bids/{입찰번호}) 순으로 알아낸다. 옵션(사이즈) 상품은 구매 페이지 주소의 size 값(product_option.key,
-     화면 표기 W240 이 아니라 240) 도 같이 알아야 해서, 그 값을 모르면 상세를 연다. 판정은 그 옵션의 거래량·가격으로 한다.
+     상세 API(api/m/bids/{입찰번호}, 페이지 이동 없이 api.ApiClient 로 한꺼번에) 순으로 알아낸다. 옵션(사이즈) 상품은 구매 페이지 주소의
+     size 값(product_option.key, 화면 표기 W240 이 아니라 240) 도 같이 알아야 해서 그 값을 모르면 상세를 읽는다. API 로 못 읽은 입찰만
+     상세 페이지를 연다 (cancel.ensure_product_id). 판정은 그 옵션의 거래량·가격으로 한다.
   2. 입찰 하나마다 **상품 상세 API 한 번**(market.fetch_market, 페이지 이동 0번)으로 그 옵션의 최신 A(빠른배송 가격 = lowest_100)와
      B(즉시 판매가 = highest_bid)를 읽어 마진(A−B > A×구간별 마진율)을 판정한다 (pipeline.judge_margin). 밀리지 않은 입찰도 A 가 내려가
      마진이 기준 아래로 떨어졌을 수 있어 매번 본다 (사용자 결정 2026-09-06: A 변동도 항상 확인). 호출은 고정 틱(pacing.ApiPacer,
@@ -16,7 +17,8 @@
      로 가서 처음 입찰과 같은 화면을 채운다: 희망가 = 최신 B, 마감기한, 구매 입찰 계속 → 창고보관 → 포인트 최대 사용
      → 입찰하기 → 동의 3항목 → 입찰하기 (bid.fill_bid_form / choose_warehouse_and_points / submit_bid 그대로).
   5. 목록 끝까지 가면 한 사이클. 정한 횟수(max_cycles, GUI '재입찰 횟수' 칸 / --cycles) 만큼 또는 중지할 때까지 사이클을 반복한다.
-     페이지 이동은 밀린 입찰(거래량 확인·변경)과 지우는 입찰에만 생기므로 접속 예산(pacing.PAGE_BUDGET)은 그 직전에만 자리를 확인한다.
+     페이지 이동은 밀린 입찰(거래량 확인·변경)과 지우는 입찰에만 생기므로 접속 예산(pacing.before_page_visit)은 그 직전에만 자리를 확인한다.
+     그 대기 중에 중지 요청이 오면 그 단계로 들어가지 않고 그 입찰을 '중단' 으로 남긴다.
 
 시세에 즉시 판매가가 없을 때(highest_bid 없음 = 구매 입찰이 하나도 없음, 사용자 결정 2026-09-05): 그 입찰을 지운다 (입찰취소, 방식은 기준 미달 때와
 같다). 지우기 전에 상세 API 로 살아 있는 입찰인지 본다 - 이미 체결·삭제된 입찰이면 건너뜀. 지우지 못하면 확인필요. API 가 200 으로 준 값이라
@@ -33,7 +35,7 @@
 탭이 응답하지 않아 버튼이 눌리지 않거나 이동이 안 끝나면(product.PageStalled) 그 탭을 닫는다 - 같은 페이지에서 기다리는 건 소용없다
 (2026-09-07 실측 5건). 변경 화면의 어느 단계든 Playwright 시간 제한이 나면 탭이 응답하는지 한 번 보고, 안 하면 같은 경로로 탭을 닫는다.
 탭이 아예 멈춰 호출이 돌아오지 않으면 감시 스레드(hangwatch)가 그 탭을 닫아 호출을 오류로 끝낸다. 어느 쪽이든 탭이 닫혔으면
-새 탭을 열어 그 입찰을 한 번 더 본다 (시세 API 는 새 탭에서도 마이페이지로 한 번 이동해 헤더를 다시 잡는다). 새 탭에서도 또 멈추면 확인필요.
+새 탭을 열어 그 입찰을 한 번 더 본다 (시세 API 는 새 탭에서도 같이 쓴다 - 헤더는 컨텍스트에서 이미 받아 뒀다). 새 탭에서도 또 멈추면 확인필요.
 
 밀렸는데 기준(거래량 · 마진)에 못 미쳐 올릴 수 없는 입찰과, 밀리지 않았어도 마진(최신 A·B)이 기준에 못 미치는 입찰은 [입찰취소] 와 같은 방식으로 지운다
 (상세의 '입찰 지우기' → 확인창 → DELETE 204 확인, cancel.delete_bid). 판단할 수 없는 경우(시세 API 응답 없음 등)는 지우지 않는다.
@@ -59,9 +61,9 @@ from . import auth, hangwatch, pipeline
 from . import bid as bid_mod
 from . import market as market_mod
 from . import product as product_mod
-from .api import ApiClient
-from .cancel import (CancelAborted, CancelUncertain, OpenBid, apply_known, delete_bid, ensure_product_id,
-                     list_open_bids, match_known_bid, read_bid_info)
+from .api import ApiClient, ApiError
+from .cancel import (CancelAborted, CancelUncertain, OpenBid, apply_bid_info, apply_known, delete_bid, ensure_product_id,
+                     list_open_bids, match_known_bid)
 from .config import Settings
 from .debug import dump
 from .report import ProductResult, summarize
@@ -82,14 +84,16 @@ MAX_LIST_FAILURES = 3            # 목록을 연달아 이만큼 못 읽으면 �
 ERROR_BACKOFF_SEC = 120          # 목록을 못 읽었을 때 다시 시도하기 전에 쉬는 시간
 NO_B_PREFIX = "즉시 판매가 없음"   # 즉시 판매가가 없어 지운(또는 지우려 한) 결과의 사유 머리
 NO_FAST_PREFIX = "빠른배송 없음"    # 빠른배송(판매자)이 없어 지운 결과의 사유 머리
+NOT_LOADED_PREFIX = "판단 불가 - 올리지 않음"   # 사이트가 응답을 안 줘 판정하지 못한 결과의 사유 머리 (연달아 난 수를 셀 때 쓴다)
 
 
-buy_page_url = product_mod.buy_page_url   # 구매 페이지 직접 주소 ([입찰]과 공용)
+class _Stopped(Exception):
+    """접속 예산 대기 중 중지 요청 - 페이지를 여는 단계로 들어가지 않는다."""
 
 
 def change_bid_url(bid: OpenBid) -> str:
     """입찰 상세의 [입찰 변경하기] 버튼이 여는 주소 (2026-09-04 실측)."""
-    return (f"{buy_page_url(bid.product_id, bid.size_value)}&bid={bid.bid_id}"
+    return (f"{product_mod.buy_page_url(bid.product_id, bid.size_value)}&bid={bid.bid_id}"
             f"&from=changeBidding&type=bid&price={bid.price or ''}")
 
 
@@ -168,29 +172,26 @@ def _record(bid: OpenBid, r: ProductResult, new_price: int, settings: Settings, 
     ))
 
 
-def _page_room(should_stop: Callable[[], bool] | None = None) -> None:
-    """페이지 이동이 있는 단계(거래량 확인 · 변경 · 지우기) 직전 - 접속 예산에 자리가 없으면 날 때까지 쉰다 (pacing 대응 5).
-
-    시세 API 방식에서는 페이지 이동이 밀린 입찰과 지우는 입찰에만 생겨 보통은 자리가 있다 - 그때는 바로 돌아온다.
-    """
-    pacing.PAGE_BUDGET.wait_for_room(should_stop, pacing.VISITS_PER_PRODUCT)
+def _page_room(should_stop: Callable[[], bool] | None, on_status: Callable[[str], None] | None) -> None:
+    """페이지 이동이 있는 단계 직전 - 접속 예산 자리를 기다린다 (pacing 대응 5). 기다리는 중 중지 요청이면 _Stopped."""
+    if not pacing.before_page_visit(should_stop, on_status):
+        raise _Stopped("중지 요청 - 페이지를 열지 않음")
 
 
 # ---------------------------------------------------------------- 입찰 하나
 
-def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, api: ApiClient, diagnose: bool = True,
+def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, api: ApiClient,
               should_stop: Callable[[], bool] | None = None, on_status: Callable[[str], None] | None = None) -> ProductResult:
     """입찰 하나를 본다: 시세 API 로 A·B → 밀렸는지 → 처음 입찰 기준으로 다시 판정 → [입찰 변경하기] 로 희망가를 B 로 (또는 기준 미달이면 지움).
 
     page 는 실행 내내 같은 탭을 다시 쓴다 (입찰마다 탭을 열고 닫는 시간을 아낀다. 페이지가 필요한 단계마다 goto 로 시작하므로 앞 입찰의 화면이 남지 않는다).
-    api 는 같은 탭에서 시세 API 를 부르는 클라이언트. 로그인이 풀린 것이 보이면 다시 로그인하고 한 번 더 본다.
-    diagnose 가 True 면 판단 불가로 끝날 때 화면 스냅샷을 남긴다 (페이지를 연 단계에서만 뜻이 있다).
+    api 는 시세·입찰 상세 API 클라이언트. 로그인이 풀린 것이 보이면 다시 로그인하고 한 번 더 본다.
     """
     r = ProductResult(rank=bid.order, product_id=bid.product_id or 0, name=bid.name, url=bid.url,
                       category=f"{cycle}회차", bid_price=bid.price, option="" if bid.is_one_size else bid.option)
     try:
         try:
-            _rebid_with_relogin(page, bid, settings, cycle, r, api, diagnose, should_stop, on_status)
+            _rebid_with_relogin(page, bid, settings, cycle, r, api, should_stop, on_status)
         except product_mod.PageStalled as e:
             # 탭이 응답하지 않아 버튼을 못 누른 것 - 상품·사이트 문제가 아니다. 같은 페이지가 풀리길 기다려도 소용없어
             # (2026-09-07 실측 5건: 90초 안에 안 풀림) 탭을 닫는다 - run 이 새 탭을 열어 한 번 더 본다 (hangwatch 가 닫았을 때와 같은 경로)
@@ -199,7 +200,7 @@ def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, api: Api
                 page.close()
             except PlaywrightError as e2:
                 log.info("탭을 닫지 못함: %s", str(e2).splitlines()[0])
-            r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: {e} - 탭을 닫음"
+            r.status, r.detail = "확인필요", f"{NOT_LOADED_PREFIX}: {e} - 탭을 닫음"
     finally:
         r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log.info("[%d회차 %d번째] 결과: %s - %s", cycle, bid.order, r.status, r.detail)
@@ -213,10 +214,10 @@ def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, api: Api
 
 
 def _rebid_with_relogin(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: ProductResult, api: ApiClient,
-                        diagnose: bool, should_stop: Callable[[], bool] | None, on_status: Callable[[str], None] | None) -> None:
+                        should_stop: Callable[[], bool] | None, on_status: Callable[[str], None] | None) -> None:
     """_rebid_one 을 부르되, 로그인이 풀린 것이 보이면 다시 로그인하고 한 번 더 본다."""
     try:
-        _rebid_one(page, bid, settings, cycle, r, api, diagnose, should_stop, on_status)
+        _rebid_one(page, bid, settings, cycle, r, api, should_stop, on_status)
     except product_mod.LoginNeeded as e:
         log.warning("[%d회차 %d번째] %s - 다시 로그인하고 한 번 더 봄", cycle, bid.order, e)
         try:
@@ -224,11 +225,11 @@ def _rebid_with_relogin(page: Page, bid: OpenBid, settings: Settings, cycle: int
         except Exception as e3:
             r.status, r.detail = "오류", f"로그인이 풀렸는데 다시 로그인하지 못함: {e3}"
             raise
-        api.headers = {}   # 새 세션의 헤더를 다시 잡는다
+        api.invalidate()
         try:
-            _rebid_one(page, bid, settings, cycle, r, api, diagnose, should_stop, on_status)
+            _rebid_one(page, bid, settings, cycle, r, api, should_stop, on_status)
         except product_mod.LoginNeeded as e2:
-            r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: 다시 로그인했는데도 {e2}"
+            r.status, r.detail = "확인필요", f"{NOT_LOADED_PREFIX}: 다시 로그인했는데도 {e2}"
 
 
 def is_site_trouble(r: ProductResult) -> bool:
@@ -236,16 +237,16 @@ def is_site_trouble(r: ProductResult) -> bool:
 
     시세에 즉시 판매가가 없는 것(NO_B_PREFIX)은 API 가 200 으로 준 값이라 여기 넣지 않는다 (예전 구매 페이지의 '-' 는 사이트가 느릴 때도 나왔다).
     """
-    return r.status == "오류" or (r.status == "확인필요" and r.detail.startswith("판단 불가"))
+    return r.status == "오류" or (r.status == "확인필요" and r.detail.startswith(NOT_LOADED_PREFIX))
 
 
 def _delete_bid_and_report(page: Page, bid: OpenBid, settings: Settings, r: ProductResult, why: str,
-                           should_stop: Callable[[], bool] | None = None) -> None:
+                           should_stop: Callable[[], bool] | None, on_status: Callable[[str], None] | None) -> None:
     """입찰을 지우고 (dry-run 이면 취소대상으로만) 결과를 r 에 채운다. 기준 미달 · 즉시 판매가 없음 · 빠른배송 없음이 같이 쓴다."""
     if settings.dry_run:
         r.status, r.detail = "취소대상", f"dry-run: {why}"
         return
-    _page_room(should_stop)   # 지우기는 상세 페이지를 연다
+    _page_room(should_stop, on_status)   # 지우기는 상세 페이지를 연다
     try:
         delete_bid(page, bid, settings)
     except CancelAborted as e:
@@ -258,43 +259,35 @@ def _delete_bid_and_report(page: Page, bid: OpenBid, settings: Settings, r: Prod
     r.status, r.detail = "입찰취소", f"{why} -> 입찰 #{bid.bid_id} 지움"
 
 
-def _cancel_no_b(page: Page, bid: OpenBid, settings: Settings, r: ProductResult, why: str,
-                 should_stop: Callable[[], bool] | None = None) -> None:
+def _cancel_no_b(page: Page, bid: OpenBid, settings: Settings, r: ProductResult, why: str, api: ApiClient,
+                 should_stop: Callable[[], bool] | None, on_status: Callable[[str], None] | None) -> None:
     """즉시 판매가가 없는 입찰을 지운다 (사용자 결정: 즉시 판매가가 없으면 그냥 입찰 취소).
 
-    지우기 전에 상세 API 로 살아 있는 입찰인지 본다 - 체결·만료·이미 지운 입찰이면 즉시 판매가가 없는 게 당연하니 건너뜀.
+    지우기 전에 상세 API(페이지 이동 없음)로 살아 있는 입찰인지 본다 - 체결·만료·이미 지운 입찰이면 즉시 판매가가 없는 게 당연하니 건너뜀.
     시세 API 가 200 으로 준 값이라 사이트가 살아 있는지는 따로 확인하지 않는다 (예전에는 구매 페이지의 '-' 라 체결 내역 패널로 확인했다).
     """
     log.info("%s - 살아 있는 입찰인지 확인한 뒤 입찰 #%d 을 지움", why, bid.bid_id)
     head = f"{NO_B_PREFIX} ({why}, 내 희망가 {bid.price:,}원)"
     if not settings.dry_run:
-        _page_room(should_stop)   # 상세 페이지로 이동하며 API 응답을 받는다
-        data = read_bid_info(page, bid)
-        status = (data or {}).get("status")
-        if status and status != "live":
-            r.status, r.detail = "건너뜀", (f"입찰 상태가 '{(data or {}).get('status_display') or status}' 라 "
-                                          f"살아 있는 입찰이 아님 (그래서 {head})")
+        try:
+            data = api.get(f"/api/m/bids/{bid.bid_id}")
+        except ApiError as e:
+            r.status, r.detail = "확인필요", f"{head} - 그런데 입찰 상태를 읽지 못해 지우지 않음 ({e})"
             return
-    _delete_bid_and_report(page, bid, settings, r, head, should_stop)
-
-
-def _cancel_no_fast(page: Page, bid: OpenBid, settings: Settings, r: ProductResult, why: str,
-                    should_stop: Callable[[], bool] | None = None) -> None:
-    """빠른배송 판매자가 없는 상품의 입찰을 지운다 (사용자 결정 2026-09-06: 빠른배송으로 팔 수 없으면 둘 이유가 없음).
-
-    시세 API 의 lowest_100 이 없는 것으로 판정한다. 입찰 상태 확인은 하지 않는다 - 입찰이 체결·만료됐다고 빠른배송 유무가 달라지지 않고,
-    delete_bid 가 상세의 희망가를 대조한다.
-    """
-    log.info("%s - 입찰 #%d 을 지움", why, bid.bid_id)
-    _delete_bid_and_report(page, bid, settings, r, f"{NO_FAST_PREFIX} ({why}, 내 희망가 {bid.price:,}원)", should_stop)
+        status = data.get("status")
+        if status and status != "live":
+            r.status, r.detail = "건너뜀", f"입찰 상태가 '{data.get('status_display') or status}' 라 살아 있는 입찰이 아님 (그래서 {head})"
+            return
+    _delete_bid_and_report(page, bid, settings, r, head, should_stop, on_status)
 
 
 def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: ProductResult, api: ApiClient,
-               diagnose: bool, should_stop: Callable[[], bool] | None, on_status: Callable[[str], None] | None) -> None:
+               should_stop: Callable[[], bool] | None, on_status: Callable[[str], None] | None) -> None:
     old_price = bid.price
     try:
         if bid.needs_detail:
-            _page_room(should_stop)   # 상세 페이지를 연다 (처음 한 번 - 그 뒤는 캐시)
+            # 상세 API 로 못 읽은 입찰 (run 이 사이클 시작 때 한꺼번에 읽는다) - 상세 페이지를 연다
+            _page_room(should_stop, on_status)
             data = ensure_product_id(page, bid)
             status = (data or {}).get("status")
             if status and status != "live":
@@ -308,16 +301,7 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
         log.info("[%d회차 %d번째] %s - 내 희망가 %s원 (%s)", cycle, bid.order, bid.label, f"{bid.price:,}", bid.product_url)
 
         # 시세 API 한 번으로 이 옵션의 최신 A·B (페이지 이동 없음, 틱은 fetch_market_paced 가 지킨다 - pacing 대응 6)
-        try:
-            market = market_mod.fetch_market_paced(api, bid.product_id, should_stop, on_status)
-        except market_mod.MarketUnavailable as e:
-            if e.stopped:
-                r.status, r.detail = "중단", str(e)
-                return
-            if e.gone:
-                r.status, r.detail = "확인필요", f"시세를 읽지 못해 올리지 않음: {e} (상품이 내려갔거나 주소가 바뀌었는지 확인)"
-                return
-            raise
+        market = market_mod.fetch_market_paced(api, bid.product_id, should_stop, on_status)
         entry = market.find(bid.size_value, bid.option or ONE_SIZE)
         if entry is None:
             have = ", ".join(f"{o.label}(size={o.key})" for o in market.options[:8])
@@ -326,10 +310,12 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
             return
         r.price_a, r.price_b, r.size = entry.fast, entry.sell, entry.key
         if entry.fast is None:
-            _cancel_no_fast(page, bid, settings, r, f"시세에 빠른배송 가격이 없음 = 지금 빠른배송 판매자 없음 (옵션 {entry.label})", should_stop)
+            why = f"시세에 빠른배송 가격이 없음 = 지금 빠른배송 판매자 없음 (옵션 {entry.label})"
+            log.info("%s - 입찰 #%d 을 지움", why, bid.bid_id)
+            _delete_bid_and_report(page, bid, settings, r, f"{NO_FAST_PREFIX} ({why}, 내 희망가 {bid.price:,}원)", should_stop, on_status)
             return
         if entry.sell is None:
-            _cancel_no_b(page, bid, settings, r, f"시세에 즉시 판매가가 없음 = 구매 입찰 없음 (옵션 {entry.label})", should_stop)
+            _cancel_no_b(page, bid, settings, r, f"시세에 즉시 판매가가 없음 = 구매 입찰 없음 (옵션 {entry.label})", api, should_stop, on_status)
             return
         log.info("A(빠른배송 가격)%s = %s원, B(즉시 판매가) = %s원 (시세 API)", f" [{entry.label}]" if not bid.is_one_size else "",
                  f"{r.price_a:,}", f"{r.price_b:,}")
@@ -339,7 +325,7 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
             log.info("밀림: 즉시 판매가 %s원 > 내 희망가 %s원", f"{r.price_b:,}", f"{bid.price:,}")
             if reason is None:
                 # 올리려면 거래량 기준도 봐야 한다 - 이 기준은 시세 API 에 없어 상품 페이지를 열어 (sales 를 받아) 체결 내역을 센다
-                _page_room(should_stop)
+                _page_room(should_stop, on_status)
                 reason = pipeline.check_sales(page, bid.product_url, r, settings, bid.eval_option)
         else:
             log.info("밀리지 않음: 즉시 판매가 %s원 <= 내 희망가 %s원", f"{r.price_b:,}", f"{bid.price:,}")
@@ -347,7 +333,8 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
             # 기준 미달이면 밀렸든 아니든 둘 수 없으니 지운다 ([입찰취소] 와 같은 기준·방식). 판단 불가(예외)는 지우지 않는다
             head = "밀렸는데 기준 미달이라 올릴 수 없음" if pushed else "밀리진 않았지만 기준 미달이라 둘 수 없음"
             _delete_bid_and_report(page, bid, settings, r,
-                                   f"{head}: {reason} (내 {bid.price:,}원, 지금 A {_won(r.price_a)}, B {_won(r.price_b)})", should_stop)
+                                   f"{head}: {reason} (내 {bid.price:,}원, 지금 A {_won(r.price_a)}, B {_won(r.price_b)})",
+                                   should_stop, on_status)
             return
         if not pushed:
             r.status, r.detail = "순위유지", (f"즉시 판매가 {r.price_b:,}원 {'=' if r.price_b == bid.price else '<'} "
@@ -365,7 +352,7 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
             return
 
         for attempt in range(CHANGE_ATTEMPTS):
-            _page_room(should_stop)   # 변경 화면 + 완료 화면
+            _page_room(should_stop, on_status)   # 변경 화면 + 완료 화면
             try:
                 change_bid(page, bid, new_price, settings)
                 break
@@ -385,25 +372,25 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
                 log.warning("[%d번째] 입찰 변경 못 함 (%d번 시도): %s - 입찰을 지움", bid.order, CHANGE_ATTEMPTS, e)
                 _delete_bid_and_report(page, bid, settings, r,
                                        f"밀렸는데 {CHANGE_ATTEMPTS}번 시도해도 입찰 변경 못 함: {e} "
-                                       f"(내 {bid.price:,}원, 지금 B {new_price:,}원)", should_stop)
+                                       f"(내 {bid.price:,}원, 지금 B {new_price:,}원)", should_stop, on_status)
                 return
         _record(bid, r, new_price, settings)
         bid.price = new_price
         r.status, r.detail = "변경완료", f"{old_price:,}원 → {new_price:,}원 / {settings.bid_days}일 / 창고보관"
         return
     except market_mod.MarketUnavailable as e:
-        # 차단 신호(무응답·5xx 등) 또는 응답 모양이 다름 - 지우지 않고 판단 불가. 연달아 나면 run 이 sitewait 로 멈춘다.
-        # 간격은 fetch_market_paced 가 이미 늘렸다
-        r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: {e}"
+        # 중지 요청 → 중단, 상품 없음(404) → 확인필요, 차단 신호·응답 모양 다름 → 판단 불가 (연달아 나면 run 이 sitewait 로 멈춘다)
+        r.status, r.detail = market_mod.unavailable_result(e, "확인필요", NOT_LOADED_PREFIX)
+    except _Stopped as e:
+        r.status, r.detail = "중단", str(e)
     except product_mod.PageStalled:
         raise   # rebid_one 이 탭을 닫는다 (응답 없는 탭은 스냅샷도 못 찍는다)
     except product_mod.SkipProduct as e:
         product_mod.raise_if_login_lost(page, "상품 페이지 확인", e)
         # 밀린 입찰의 거래량 확인(상품 페이지)이 판단 불가가 되는 건 사이트가 응답을 안 준 것 - 화면을 남겨 원인을 볼 수 있게
         log.info("판단 불가 (지금 주소 %s)", page.url)
-        if diagnose:
-            dump(page, f"rebid{bid.bid_id}_skip")
-        r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: {e}"
+        dump(page, f"rebid{bid.bid_id}_skip")
+        r.status, r.detail = "확인필요", f"{NOT_LOADED_PREFIX}: {e}"
     except product_mod.LoginNeeded:
         raise   # rebid_one 이 다시 로그인하고 한 번 더 본다 (아래 Exception 에 삼켜져 '오류' 로 끝나던 문제, 2026-09-05)
     except bid_mod.StoppedBeforeSubmit as e:
@@ -419,7 +406,7 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
         if trip is not None and page.is_closed():
             # 감시 스레드가 멈춘 탭을 닫아 걸려 있던 호출이 오류로 끝난 것 - 상품·사이트 문제가 아니다 (run 이 새 탭으로 한 번 더 봄)
             log.warning("[%d회차 %d번째] %s - 걸려 있던 호출: %s", cycle, bid.order, trip.describe(), product_mod.timeout_why(e))
-            r.status, r.detail = "확인필요", f"판단 불가 - 올리지 않음: {trip.describe()}"
+            r.status, r.detail = "확인필요", f"{NOT_LOADED_PREFIX}: {trip.describe()}"
             return
         stall = product_mod.page_stall(page)
         if stall:
@@ -440,11 +427,10 @@ def _wait_for_site(api: ApiClient, probe: OpenBid, should_stop: Callable[[], boo
     """사이트가 응답을 안 줄 때 다시 줄 때까지 멈춘다. PROBE_SEC 마다 마지막에 막힌 입찰의 시세 API 를 한 번 불러 보고
     응답이 오면 돌아온다 (True). 중지 요청이면 False."""
     def check() -> bool:
-        if not probe.product_id:
-            # 확인할 상품을 모르면 (상세를 못 읽은 입찰) 한 번 쉰 뒤 그냥 이어서 본다 - 또 막히면 다시 멈춘다
-            return True
-        market = market_mod.fetch_market(api, probe.product_id)   # 틱 없이 한 번 (5분마다 한 번이라 예산에 뜻이 없다)
-        log.info("시세 API 가 다시 응답함 (상품 %d, 옵션 %d개)", probe.product_id, len(market.options))
+        # 확인할 상품을 모르면 (상세를 못 읽은 입찰) 한 번 쉰 뒤 그냥 이어서 본다 - 또 막히면 다시 멈춘다
+        if probe.product_id:
+            market = market_mod.fetch_market(api, probe.product_id)   # 틱 없이 한 번 (5분마다 한 번이라 예산에 뜻이 없다)
+            log.info("시세 API 가 다시 응답함 (상품 %d, 옵션 %d개)", probe.product_id, len(market.options))
         return True
 
     return wait_until_site_back(check, should_stop, on_status, what="시세")
@@ -458,6 +444,20 @@ def _list_bids(page: Page, settings: Settings) -> list[OpenBid]:
         log.info("구매 입찰 목록이 열리지 않음 - 로그인 상태 확인")
         auth.ensure_logged_in(page, settings)
         return list_open_bids(page)
+
+
+def _fill_details_via_api(bids: list[OpenBid], api: ApiClient) -> None:
+    """상품 ID·size 값을 모르는 입찰의 상세(api/m/bids/{입찰번호})를 페이지 이동 없이 한꺼번에 받아 채운다. 못 받은 것은 그대로 둔다
+    (_rebid_one 이 상세 페이지를 연다)."""
+    todo = [b for b in bids if b.needs_detail]
+    if not todo:
+        return
+    log.info("상세를 읽어야 하는 입찰 %d건 - 상세 API 로 한꺼번에 읽음", len(todo))
+    for bid, body in zip(todo, api.get_many([f"/api/m/bids/{b.bid_id}" for b in todo])):
+        if isinstance(body, ApiError):
+            log.info("입찰 #%d 상세 API 실패 (%s) - 상세 페이지로 읽음", bid.bid_id, body)
+        else:
+            apply_bid_info(bid, body)
 
 
 def run(context: BrowserContext, page: Page, settings: Settings,
@@ -474,24 +474,21 @@ def run(context: BrowserContext, page: Page, settings: Settings,
     stop = should_stop or (lambda: False)
     status = on_status or (lambda _t: None)
     results: list[ProductResult] = []
-    # 입찰번호 -> 상품 ID. 파일(data/bid_products.json)에 남겨 두어 프로그램이 넣지 않은 입찰도 상세는 처음 한 번만 연다
+    # 입찰번호 -> 상품 ID. 파일(data/bid_products.json)에 남겨 두어 프로그램이 넣지 않은 입찰도 상세는 처음 한 번만 읽는다
     pid_cache = load_bid_products()
     tab: Page = context.new_page()   # 입찰마다 탭을 열고 닫지 않고 실행 내내 이 탭을 다시 쓴다
-    api = ApiClient(tab)             # 시세 API 는 이 탭 안에서 부른다 (헤더는 처음 호출 때 마이페이지로 한 번 이동해 잡는다)
+    # 시세·입찰 상세 API 는 그때의 작업 탭 안에서 부른다 (탭이 멈춰 바뀌어도 따라감). 헤더는 목록 페이지가 보내는 요청에서 받아 둔다
+    api = ApiClient(lambda: tab, context)
     pacer = pacing.API_PACER
-    log.info("시세 API 틱 %g초 (분당 최대 %d건, 차단 신호면 두 배씩 늘려 최대 %g초, 조용하면 되돌림)",
-             pacer.configured, pacing.API_MAX_PER_MINUTE, pacing.API_TICK_MAX_SEC)
+    log.info(pacer.describe_setup())
 
-    def look(bid: OpenBid, cycle: int, trouble_streak: int) -> tuple[ProductResult, hangwatch.Trip | None]:
+    def look(bid: OpenBid, cycle: int) -> tuple[ProductResult, hangwatch.Trip | None]:
         """입찰 하나를 본다. 탭이 (멈춰서) 닫혀 있으면 새로 열고, 보는 동안 감시 스레드가 탭을 닫았으면 그 기록도 돌려준다."""
         nonlocal tab
         if tab.is_closed():
             tab = context.new_page()
-            api.page = tab
-        # 스냅샷은 연달아 난 처음 몇 건만 남긴다 (사이트가 안 줄 때 수십 장 쌓이지 않게)
         with hangwatch.watching(tab):
-            r = rebid_one(tab, bid, settings, cycle, api, diagnose=trouble_streak < TROUBLE_STREAK,
-                          should_stop=stop, on_status=status)
+            r = rebid_one(tab, bid, settings, cycle, api, should_stop=stop, on_status=status)
         return r, hangwatch.take_trip()
 
     cycle = 0
@@ -524,9 +521,13 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                 apply_known(b, match_known_bid(b, known))
         # 목록에서 사라진 입찰(체결·만료·지움)은 캐시에서 뺀다
         live_ids = {b.bid_id for b in bids}
+        cache_dirty = False
         for stale in [k for k in pid_cache if k not in live_ids]:
             del pid_cache[stale]
-        log.info("===== 재입찰 %d회차: 구매 입찰 %d건 (상세를 열어야 하는 입찰 %d건) =====",
+            cache_dirty = True
+        with hangwatch.watching(tab):
+            _fill_details_via_api(bids, api)
+        log.info("===== 재입찰 %d회차: 구매 입찰 %d건 (상세 페이지를 열어야 하는 입찰 %d건) =====",
                  cycle, len(bids), sum(1 for b in bids if b.needs_detail))
 
         cycle_results: list[ProductResult] = []
@@ -536,19 +537,19 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                 log.info("사용자 요청으로 중지 - 남은 입찰 %d건은 보지 않음", len(bids) - len(cycle_results))
                 break
             status(f"재입찰 {cycle}회차: {bid.order}/{len(bids)} {bid.name[:24]} ({pacer.describe()})")
-            r, trip = look(bid, cycle, trouble_streak)
+            r, trip = look(bid, cycle)
             if tab.is_closed():
                 # 탭이 멈춰 닫힌 것 (감시 스레드가 닫았거나 rebid_one 이 PageStalled 로 닫음) - 새 탭을 열어 그 입찰을 한 번 더 본다
                 log.warning("[%d회차 %d번째] 탭이 멈춰 닫힘 (%s) - 새 탭을 열어 한 번 더 봄",
                             cycle, bid.order, trip.describe() if trip else r.detail)
-                r, trip = look(bid, cycle, trouble_streak)
+                r, trip = look(bid, cycle)
                 if tab.is_closed():
                     log.warning("[%d회차 %d번째] 새 탭에서도 멈춤 - 이 입찰은 확인필요로 두고 다음으로 감", cycle, bid.order)
             if bid.product_id and bid.size_value:
                 entry = {"product_id": bid.product_id, "size": bid.size_value, "option": bid.option or ONE_SIZE}
                 if pid_cache.get(bid.bid_id) != entry:
                     pid_cache[bid.bid_id] = entry
-                    save_bid_products(pid_cache)
+                    cache_dirty = True
             cycle_results.append(r)
             results.append(r)
             if on_result:
@@ -562,21 +563,21 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                             "다시 주면 로그인 상태를 확인한 뒤 이어서 봄", TROUBLE_STREAK, PROBE_SEC // 60)
                 if tab.is_closed():
                     tab = context.new_page()
-                    api.page = tab
                 with hangwatch.watching(tab):
                     back = _wait_for_site(api, bid, stop, lambda t: status(f"재입찰 {cycle}회차 ({bid.order}/{len(bids)} 까지 봄): {t}"))
                 if not back:
                     break
-                pacer.reset_streak()
                 try:
                     auth.ensure_logged_in(page, settings)
                 except Exception:  # noqa: BLE001
                     log.exception("쉬고 나서 로그인 상태를 확인하지 못함 - 그대로 이어서 봄")
+        if cache_dirty:
+            save_bid_products(pid_cache)
 
         summary = summarize(cycle_results, unit="", empty="처리한 입찰 없음")
         elapsed = time.monotonic() - started
         api_calls = pacing.BUDGET.total - api_calls_before
-        log.info("===== 재입찰 %d회차 끝 (%d초): %s | 시세 API %d건 (%s, 차단 신호 %d번), 스로틀 대상 API 요청 %d건 (지금 10분 창 %d/%d건), "
+        log.info("===== 재입찰 %d회차 끝 (%d초): %s | 시세·상세 API %d건 (%s, 차단 신호 %d번), 스로틀 대상 API 요청 %d건 (지금 10분 창 %d/%d건), "
                  "페이지 이동 %d/%d번 =====",
                  cycle, int(elapsed), summary, api.calls - market_calls_before, pacer.describe(), pacer.blocks,
                  api_calls, pacing.BUDGET.used(), pacing.BUDGET.limit, pacing.PAGE_BUDGET.used(), pacing.PAGE_BUDGET.limit)
