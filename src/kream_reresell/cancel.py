@@ -5,7 +5,8 @@
      항목마다 /my/buying/{입찰번호} 링크 (상품명 / 옵션 / 창고보관 / 희망가 / 마감일).
   2. 상세 페이지를 열면 api.kream.co.kr/api/m/bids/{입찰번호} 응답에 product_id, price, expires_at 이 있다.
      (응답을 못 잡으면 '상품 상세' 버튼을 눌러 /products/{id} URL 에서 읽는다.)
-  3. 상품 페이지를 열어 입찰할 때와 똑같이 거래량 / A / B 를 읽어 판정한다 (pipeline.evaluate).
+  3. 상품 페이지를 열어 입찰할 때와 똑같이 거래량 / A / 즉시 판매가를 읽어 판정한다 (pipeline.evaluate). B 는 [재입찰] 과 같은 기준
+     (market.price_b_for_bid, 사용자 결정 2026-09-13): 밀렸으면(즉시 판매가 > 내 희망가) 즉시 판매가 + 1,000원, 아니면 즉시 판매가 원값(= 내 희망가).
   4. 조건 미달이면 상세 페이지의 '입찰 지우기' 링크 -> 확인창(alert-dialog) 의 [입찰 지우기] 버튼.
      DELETE /api/m/bids/{입찰번호} 가 204 로 끝나면 지워진 것. 목록으로 돌아온다.
 
@@ -351,7 +352,7 @@ def review_bid(context: BrowserContext, bid: OpenBid, settings: Settings) -> Pro
         # 거래량이 모자라도 A/B 까지 읽어 보고서에 남긴다 (지운 이유를 나중에 볼 수 있게)
         # 상품 금액 상한은 새로 입찰할 때만 쓰는 규칙이라 이미 넣은 입찰에는 적용하지 않는다
         reason = pipeline.evaluate(page, bid.product_url, r, settings, stop_early=False, price_limit=False,
-                                   option=bid.eval_option)
+                                   option=bid.eval_option, my_price=bid.price or None)
         when = f"마감 {bid.deadline or bid.expires_at[:10]}"
         if reason is None:
             r.status, r.detail = "입찰유지", f"조건 충족 ({when})"

@@ -11,9 +11,9 @@ GET api.kream.co.kr/api/p/products/{상품ID}?base_product_id={상품ID} 응답�
 
 **B = 즉시 판매가 + BID_STEP(1,000원)** (사용자 결정 2026-09-13). 즉시 판매가 그대로 입찰하면 같은 금액으로 먼저 넣은 남의 입찰 뒤에
 붙어 언제 체결될지 모르고, 1,000원을 얹으면 내가 1순위가 된다. 마진 판정(A − B)과 입찰가 모두 이 B 를 쓴다 ([입찰] 의 시세 거르기 ·
-구매 페이지 재판정, [재입찰] 의 밀린 입찰). 밀렸는지(남이 내 희망가보다 비싸게 넣었는지)는 즉시 판매가 원값과 내 희망가로 보고,
-밀리지 않은 입찰(즉시 판매가 = 내 희망가)은 이미 1순위라 얹지 않고 원값으로 마진을 본다 - 얹으면 입찰 때 통과한 마진이 재입찰 때
-1,000원 모자라 지웠다가 [입찰] 이 다시 넣는 일이 반복된다 (price_b 함수).
+구매 페이지 재판정, [재입찰]·[입찰취소] 의 밀린 입찰). 이미 넣은 입찰은 밀렸는지(남이 내 희망가보다 비싸게 넣었는지)를 즉시 판매가 원값과
+내 희망가로 보고, 밀리지 않은 입찰(즉시 판매가 = 내 희망가)은 이미 1순위라 얹지 않고 원값으로 마진을 본다 - 얹으면 입찰 때 통과한 마진이
+재입찰·입찰취소 때 1,000원 모자라 지웠다가 [입찰] 이 다시 넣는 일이 반복된다 (price_b · price_b_for_bid 함수, 사용자 확인 2026-09-13).
 
 아직 리셀 거래가 없는 상품(브랜드샵 직접 판매만 있는 것 - 상품 페이지에 체결 거래 표가 없다)은 sales_options 키 자체가 없다
 (2026-09-13 13시 [입찰] 실측: NICKEL·The North Face 등 31개 상품, 모두 sale_info 만 있고 market.total_sales 0). 상품 응답(release·product_options)은
@@ -45,6 +45,15 @@ BID_STEP = 1000   # B = 즉시 판매가 + 이 금액 (머리글). 시세·구�
 def price_b(highest_bid: int | None) -> int | None:
     """즉시 판매가(가장 높은 구매 입찰가)로 B 를 정한다: 1,000원을 얹어 1순위가 되는 금액. 즉시 판매가가 없으면 None."""
     return None if highest_bid is None else highest_bid + BID_STEP
+
+
+def price_b_for_bid(highest_bid: int | None, my_price: int) -> int | None:
+    """이미 넣은 내 입찰(희망가 my_price)을 다시 판정할 때의 B ([재입찰]·[입찰취소] 공용, 머리글).
+    밀렸으면(즉시 판매가 > 내 희망가) 즉시 판매가 + BID_STEP = 올려야 1순위가 되는 금액, 밀리지 않았으면 즉시 판매가 원값 (= 내 희망가, 이미 1순위).
+    즉시 판매가가 없으면 None."""
+    if highest_bid is None:
+        return None
+    return price_b(highest_bid) if highest_bid > my_price else highest_bid
 
 
 class MarketUnavailable(Exception):

@@ -322,7 +322,7 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
             return
         # 밀렸는지는 즉시 판매가 원값으로 본다. B 는 밀렸으면 즉시 판매가 + 1,000원(1순위가 되는 금액), 아니면 원값(이미 1순위 - 머리글·market 머리글)
         pushed = entry.sell > bid.price
-        r.price_b = market_mod.price_b(entry.sell) if pushed else entry.sell
+        r.price_b = market_mod.price_b_for_bid(entry.sell, bid.price)
         log.info("A(빠른배송 가격)%s = %s원, 즉시 판매가 = %s원, B = %s원 (시세 API)", f" [{entry.label}]" if not bid.is_one_size else "",
                  f"{r.price_a:,}", f"{entry.sell:,}", f"{r.price_b:,}")
         reason = pipeline.judge_margin(r, settings, price_limit=False)

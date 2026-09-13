@@ -54,18 +54,19 @@ def is_site_trouble(r: ProductResult) -> bool:
 
 
 def evaluate(page: Page, url: str, r: ProductResult, settings: Settings, stop_early: bool = True,
-             price_limit: bool = True, option: str | None = None) -> str | None:
+             price_limit: bool = True, option: str | None = None, my_price: int | None = None) -> str | None:
     """상품 페이지를 열어 거래량 / A / B 를 읽어 r 에 채우고 입찰 조건을 판정한다 ([입찰취소]가 쓴다).
 
     조건 미달이면 사유 문자열을, 충족이면 None 을 돌려준다.
     stop_early 가 True 면 거래량 미달에서 바로 돌아온다 (A/B 는 읽지 않음).
     price_limit 가 True 면 A 가 상품 금액 상한을 넘는 상품은 B 를 읽지 않고 바로 돌아온다 (입찰 전용 규칙).
     option 을 주면 (옵션 상품) 그 옵션의 거래량·가격으로 판정한다. 조건을 다 봤으면 page 는 구매 페이지(/buy/{id}) 에 있다.
+    my_price 는 이미 넣은 내 입찰의 희망가 - 있으면 B 를 market.price_b_for_bid 로 정한다 (judge_prices).
     """
     sales_reason = check_sales(page, url, r, settings, option)
     if sales_reason and stop_early:
         return sales_reason
-    return judge_prices(page, r, settings, price_limit, option, sales_reason)
+    return judge_prices(page, r, settings, price_limit, option, sales_reason, my_price)
 
 
 def check_sales(page: Page, url: str, r: ProductResult, settings: Settings, option: str | None = None) -> str | None:
@@ -110,13 +111,21 @@ def judge_margin(r: ProductResult, settings: Settings, price_limit: bool = True)
 
 
 def judge_prices(page: Page, r: ProductResult, settings: Settings, price_limit: bool = True,
-                 option: str | None = None, sales_reason: str | None = None) -> str | None:
-    """상품 페이지에 있는 상태에서 A (모달) → 구매 페이지 → B 를 읽고 마진을 판정한다. 미달이면 사유 ([입찰취소]가 쓴다).
+                 option: str | None = None, sales_reason: str | None = None, my_price: int | None = None) -> str | None:
+    """상품 페이지에 있는 상태에서 A (모달) → 구매 페이지 → 즉시 판매가를 읽어 B 를 정하고 마진을 판정한다. 미달이면 사유 ([입찰취소]가 쓴다).
 
     sales_reason 은 앞서 본 거래량 미달 사유 - 있으면 A·B 를 읽어 r 에 채운 뒤 그 사유를 돌려준다 (보고서에 A/B 를 남기려고).
+    my_price 가 있으면(이미 넣은 내 입찰) B 는 밀렸을 때만 즉시 판매가 + 1,000원 (market.price_b_for_bid - [재입찰] 과 같은 기준),
+    없으면(새 입찰) 늘 즉시 판매가 + 1,000원 (market.price_b).
     """
     pid = r.product_id
-    r.price_a, r.price_b = product_mod.read_price_a_and_go_to_buy(page, pid, option)
+    r.price_a, sell = product_mod.read_price_a_and_go_to_buy(page, pid, option)
+    r.price_b = market_mod.price_b_for_bid(sell, my_price) if my_price else market_mod.price_b(sell)
+    if r.price_b != sell:
+        log.info("B = %s원 (즉시 판매가 %s원 + %s%s)", f"{r.price_b:,}", f"{sell:,}", f"{market_mod.BID_STEP:,}",
+                 f" - 내 희망가 {my_price:,}원보다 높아 밀림" if my_price else "")
+    elif my_price:
+        log.info("B = 즉시 판매가 %s원 그대로 (내 희망가 %s원 이하 - 밀리지 않음)", f"{sell:,}", f"{my_price:,}")
     r.size = product_mod.size_from_url(page.url) or (ONE_SIZE if not option else "")
     if settings.inspect:
         dump(page, f"{pid}_1_buy_page")
