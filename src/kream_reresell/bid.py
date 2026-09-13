@@ -5,15 +5,21 @@
       -> '구매 입찰이 완료되었습니다' 확인.
 
 '창고 보관' 이 선택된 것을 확인하지 못하면 어떤 경우에도 입찰하지 않는다.
+
+마지막 '입찰하기' 는 POST api.kream.co.kr/api/checkout 이다. 서버가 거절하면 4xx + {"message": "...", "alert_type": "toast"} 가 오고 화면에는
+토스트만 잠깐 떴다 사라져 완료 문구만 기다리면 '확인필요' 가 된다. 그래서 클릭이 보내는 API 응답을 받아 4xx·5xx 면 거절(BidRejected, 입찰 안 들어감)로
+끝낸다. 카테고리 제한 거절의 처리는 store 머리글(CategoryRejections).
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from urllib.parse import urlparse
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import Page, Response, TimeoutError as PlaywrightTimeout
 
+from .api import API_BASE
 from .config import Settings
 from .debug import dump
 from .product import eval_bounded
@@ -24,10 +30,26 @@ log = logging.getLogger(__name__)
 # 마지막 '입찰하기' 뒤의 완료 문구. 새 입찰은 '구매 입찰이 완료되었습니다', 입찰 변경([입찰 변경하기] 로 희망가를 올린 경우)은
 # 같은 화면을 쓰므로 '변경' 표현도 받아 준다.
 COMPLETED_RE = re.compile(r"구매 입찰이 (완료|변경)|입찰 변경이 완료")
+COMPLETION_TIMEOUT_MS = 20_000   # 마지막 '입찰하기' 뒤 API 응답과 완료 문구를 각각 기다리는 시간
 
 
 class BidAborted(Exception):
-    """안전장치에 걸려 입찰을 중단했다."""
+    """안전장치에 걸려 입찰을 중단했다 - 마지막 '입찰하기' 는 누르지 않았다."""
+
+
+class BidRejected(Exception):
+    """마지막 '입찰하기' 를 눌렀는데 서버가 거절했다 (머리글) - 입찰은 들어가지 않았다. BidAborted(누르기 전)·BidUncertain(모름)과 다른 종류."""
+
+    def __init__(self, resp: Response) -> None:
+        self.status = resp.status
+        self.message = _response_message(resp)
+        super().__init__(f"{self.message or '사유 없음'} (HTTP {resp.status} {resp.request.method} {urlparse(resp.url).path})")
+
+    @property
+    def is_category_limit(self) -> bool:
+        """카테고리 단위 제한 ("신규 보관 신청이 제한된 카테고리의 상품입니다.") - 그날은 같은 카테고리 상품을 전부 건너뛴다 (store 머리글).
+        응답에 사유 코드가 따로 없어(code 9999 뿐) 메시지로 본다."""
+        return "카테고리" in self.message
 
 
 class StoppedBeforeSubmit(Exception):
@@ -149,9 +171,16 @@ def submit_bid(page: Page, price: int, settings: Settings, pid: int) -> None:
     if settings.stop_before_submit:
         dump(page, f"{pid}_stop_before_submit")
         raise StoppedBeforeSubmit("마지막 '입찰하기' 직전에 멈춤 (--stop-before-submit)")
-    final.click()
+    # 클릭이 보내는 API 요청(머리글)의 응답을 받아 4xx·5xx 면 거절, 아니면 완료 문구를 기다린다 (cancel.read_bid_info 와 같은 꼴).
+    # 응답이나 완료 문구가 제한 시간 안에 안 오면 입찰됐을 수 있는 것 (BidUncertain)
     try:
-        page.get_by_text(COMPLETED_RE).first.wait_for(state="visible", timeout=20_000)
+        with page.expect_response(_is_api_write_response, timeout=COMPLETION_TIMEOUT_MS) as waited:
+            final.click()
+        resp = waited.value
+        if resp.status >= 400:
+            dump(page, f"{pid}_rejected")
+            raise BidRejected(resp)
+        page.get_by_text(COMPLETED_RE).first.wait_for(state="visible", timeout=COMPLETION_TIMEOUT_MS)
     except PlaywrightTimeout as e:
         dump(page, f"{pid}_no_completion")
         raise BidUncertain("마지막 '입찰하기' 를 눌렀으나 '구매 입찰이 완료' 문구를 확인하지 못함") from e
@@ -162,6 +191,19 @@ def submit_bid(page: Page, price: int, settings: Settings, pid: int) -> None:
 
 def _completed(page: Page) -> bool:
     return page.get_by_text(COMPLETED_RE).count() > 0
+
+
+def _is_api_write_response(resp: Response) -> bool:
+    return resp.request.method != "GET" and resp.url.startswith(API_BASE)
+
+
+def _response_message(resp: Response) -> str:
+    """응답 JSON 의 message. JSON 이 아니거나 없으면 빈 문자열."""
+    try:
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return ""
+    return str(data.get("message") or "").strip() if isinstance(data, dict) else ""
 
 
 def _check_required_items(page: Page) -> int:

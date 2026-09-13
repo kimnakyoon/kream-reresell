@@ -362,8 +362,15 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
                 _record(bid, r, new_price, settings, note=" (확인 필요)")
                 r.status, r.detail = "확인필요", f"{e} - 마이페이지에서 희망가 확인 (다음 사이클에 목록으로 다시 확인)"
                 return
+            except bid_mod.BidRejected as e:
+                # 마지막 '입찰하기' 를 서버가 거절 (bid 머리글) - 희망가는 그대로고 다시 열어도 같다. 밀렸고 기준도 충족하는데 못 올리니
+                # 아래 BidAborted 와 같은 결정으로 지운다
+                _delete_bid_and_report(page, bid, settings, r,
+                                       f"밀렸는데 사이트가 입찰 변경을 거절함: {e} (내 {bid.price:,}원, 지금 B {new_price:,}원)",
+                                       should_stop, on_status)
+                return
             except bid_mod.BidAborted as e:
-                # 마지막 '입찰하기' 는 누르지 않은 상태 (눌렀으면 BidUncertain) - 희망가는 그대로다.
+                # 마지막 '입찰하기' 는 누르지 않은 상태 (눌렀으면 BidUncertain·BidRejected) - 희망가는 그대로다.
                 # 화면이 늦게 그려져 생기는 일시적 불일치가 대부분이라 변경 화면을 한 번 다시 열어 본다
                 if attempt + 1 < CHANGE_ATTEMPTS:
                     log.warning("[%d번째] 입찰 변경 못 함: %s - %d초 뒤 변경 화면을 다시 열어 한 번 더 시도",

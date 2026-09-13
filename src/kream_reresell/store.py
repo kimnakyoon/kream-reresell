@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import json
 from dataclasses import asdict, dataclass
@@ -101,14 +102,8 @@ BID_PRODUCTS_PATH = DATA_DIR / "bid_products.json"
 
 
 def load_bid_products() -> dict[int, dict]:
-    if not BID_PRODUCTS_PATH.exists():
-        return {}
-    try:
-        raw = json.loads(BID_PRODUCTS_PATH.read_text(encoding="utf-8"))
-    except (ValueError, TypeError, json.JSONDecodeError):
-        return {}
     out: dict[int, dict] = {}
-    for k, v in raw.items():
+    for k, v in _load_json(BID_PRODUCTS_PATH).items():
         try:
             if isinstance(v, dict):
                 out[int(k)] = {"product_id": int(v["product_id"]), "size": str(v.get("size") or ""),
@@ -121,6 +116,81 @@ def load_bid_products() -> dict[int, dict]:
 
 
 def save_bid_products(mapping: dict[int, dict]) -> None:
+    _write_json(BID_PRODUCTS_PATH, {str(k): v for k, v in mapping.items()})
+
+
+def _load_json(path) -> dict:
+    """JSON 객체 파일. 없거나 깨졌거나 객체가 아니면 빈 dict."""
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _write_json(path, data: dict) -> None:
     DATA_DIR.mkdir(exist_ok=True)
-    BID_PRODUCTS_PATH.write_text(json.dumps({str(k): v for k, v in mapping.items()}, ensure_ascii=False, indent=1),
-                                 encoding="utf-8")
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+# ---------------------------------------------------------------- 사이트가 카테고리 단위로 거절한 입찰 (그날 하루 건너뜀)
+# 마지막 '입찰하기'(POST /api/checkout)를 "신규 보관 신청이 제한된 카테고리의 상품입니다." 로 거절하면 (bid.BidRejected.is_category_limit,
+# 2026-09-13 18:16 [입찰] 실측: 라이프 8건 - 쿠션·보틀·라이터·팝콘통·응원봉·텀블러·랜덤박스·담요 - 이 전부 이 거절이었고 마이페이지에 입찰 없음)
+# 그 카테고리(시세 API 의 release.category, 예: life)는 그날 내내 안 된다 - 같은 날짜에는 그 카테고리 상품을 전부 건너뛴다
+# (사용자 결정 2026-09-13: 13일에 뜨면 13일 내내 안 되는 것. 날짜가 바뀌면 다시 시도). 상품 -> 카테고리는 시세 API 응답에서만 알 수 있어
+# 한 번 읽은 것은 product_categories.json 에 남긴다 (카테고리는 바뀌지 않는다) - 거절된 날 두 번째 실행부터는 그 상품의 시세 호출(틱 6초)도 안 쓴다.
+# 시세 API 응답의 market.inventory_service_available 는 true 라 사전 신호가 못 된다 - 마지막 요청에서만 거절된다.
+REJECTED_CATEGORIES_PATH = DATA_DIR / "rejected_categories.json"   # {"life": {"date": "2026-09-13", "time": "18:16", "message": "..."}}
+PRODUCT_CATEGORIES_PATH = DATA_DIR / "product_categories.json"     # {"513852": "life"}
+
+
+def _rejection_label(v: dict) -> str:
+    return f"{v.get('time', '')} {v.get('message', '')}"
+
+
+class CategoryRejections:
+    """오늘 사이트가 거절한 카테고리와, 상품 -> 카테고리 기억 (위 설명). [입찰] 실행마다 하나 만든다 (app.run_job).
+    상품 카테고리는 새로 안 것을 모아 flush() 로 한 번 쓴다 (상품마다 파일 전체를 다시 쓰지 않게 - pipeline.run 끝)."""
+
+    def __init__(self) -> None:
+        self.today = datetime.now().strftime("%Y-%m-%d")
+        self.rejected: dict[str, dict] = {k: v for k, v in _load_json(REJECTED_CATEGORIES_PATH).items()
+                                          if isinstance(v, dict) and v.get("date") == self.today}
+        self.categories: dict[int, str] = {}
+        for k, v in _load_json(PRODUCT_CATEGORIES_PATH).items():
+            with contextlib.suppress(ValueError, TypeError):
+                self.categories[int(k)] = str(v)
+        self._dirty = False
+
+    def describe(self) -> str:
+        return ", ".join(f"{c} ({_rejection_label(v)})" for c, v in self.rejected.items())
+
+    def blocked(self, category: str) -> str | None:
+        """이 카테고리가 오늘 거절됐으면 건너뛸 사유, 아니면 None."""
+        v = self.rejected.get(category)
+        if v is None:
+            return None
+        return f"오늘({self.today}) 사이트가 이 카테고리({category})의 입찰을 거절함 ({_rejection_label(v)}) - 그날은 전부 건너뜀"
+
+    def blocked_product(self, product_id: int) -> str | None:
+        """전에 시세를 읽어 카테고리를 아는 상품이 오늘 거절된 카테고리면 그 사유 (시세를 읽지 않고 건너뛴다)."""
+        return self.blocked(self.categories.get(product_id, ""))
+
+    def remember(self, product_id: int, category: str) -> None:
+        if category and self.categories.get(product_id) != category:
+            self.categories[product_id] = category
+            self._dirty = True
+
+    def flush(self) -> None:
+        if self._dirty:
+            _write_json(PRODUCT_CATEGORIES_PATH, {str(k): v for k, v in self.categories.items()})
+            self._dirty = False
+
+    def reject(self, category: str, message: str) -> None:
+        """오늘 이 카테고리가 거절됐다고 남긴다 (파일에도 - 다음 실행이 같은 날이면 그대로 건너뛴다)."""
+        if not category:
+            return
+        self.rejected[category] = {"date": self.today, "time": datetime.now().strftime("%H:%M"), "message": message}
+        _write_json(REJECTED_CATEGORIES_PATH, self.rejected)

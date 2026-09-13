@@ -30,7 +30,7 @@ from .ranking import RankedProduct
 from .report import ProductResult
 from . import pacing
 from .sitewait import TROUBLE_STREAK, wait_until_site_back
-from .store import ONE_SIZE, BidRecord, append_run_log, save_bid
+from .store import ONE_SIZE, BidRecord, CategoryRejections, append_run_log, save_bid
 
 if TYPE_CHECKING:  # cancel 이 pipeline 을 import 하므로 타입 표기용으로만
     from .cancel import OpenBid, OpenBids
@@ -169,15 +169,18 @@ def _prefilter(market: market_mod.ProductMarket, item: RankedProduct, settings: 
 
 def process_product(context: BrowserContext, item: RankedProduct, settings: Settings, api: ApiClient,
                     open_bids: "OpenBids | None" = None, should_stop: Callable[[], bool] | None = None,
-                    on_status: Callable[[str], None] | None = None) -> list[ProductResult]:
+                    on_status: Callable[[str], None] | None = None,
+                    rejected: CategoryRejections | None = None) -> list[ProductResult]:
     """상품 하나를 처리한다 (머리글의 순서). ONE SIZE 상품은 결과 한 줄, 옵션 상품은 옵션마다 한 줄.
 
     시세로 다 걸러지면 탭을 열지 않는다 (상품 사이 간격·접속 예산도 쓰지 않는다). 남는 옵션이 있으면 새 탭에서 체결 내역을 세고
     구매 페이지에서 입찰한다. 기준에 맞으면 입찰을 시도하고, 시도 중 안전장치에 걸리거나 화면이 예상과 다르면 그 상품(옵션)은 건너뛰고 다음으로 간다.
     open_bids 에 상품 ID 를 못 읽은 입찰이 있으면 상품 페이지 제목(= 마이페이지 표기)으로 대조해 이미 입찰 중이면 건너뛴다.
+    rejected: 오늘 사이트가 카테고리 단위로 거절한 입찰 (store 머리글) - 시세를 읽은 뒤 그 카테고리면 페이지를 열지 않고, 거절이 새로 나면 남긴다.
     """
     pid = item.product_id
     results: list[ProductResult] = []
+    rejected = rejected or CategoryRejections()
     log.info("[%s %d위] %s (%s)", item.category, item.rank, item.name, item.url)
 
     # 1. 시세 API - 페이지를 열지 않고 가격에서 떨어지는 옵션을 거른다
@@ -186,6 +189,10 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
         market = market_mod.fetch_market_paced(api, pid, should_stop, on_status)
     except market_mod.MarketUnavailable as e:
         r.status, r.detail = market_mod.unavailable_result(e, "건너뜀", NOT_LOADED_PREFIX)
+        return _done(results, r, item)
+    rejected.remember(pid, market.category)
+    if why := rejected.blocked(market.category):
+        r.status, r.detail = "건너뜀", why
         return _done(results, r, item)
     if not market.options:
         r.status, r.detail = "건너뜀", "시세에 옵션이 하나도 없는 상품 (브랜드샵 직접 판매만 있어 아직 리셀 거래 없음) - 바로 넘김"
@@ -278,6 +285,18 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
             r.status, r.detail = "오류", f"앞 옵션을 입찰한 뒤 {e} - 남은 옵션은 보지 않음"
             return _done(results, r, item)
         raise   # _process_with_relogin 이 다시 로그인하고 이 상품을 다시 본다 (결과를 남기지 않음)
+    except bid_mod.BidRejected as e:
+        # 마지막 '입찰하기' 를 서버가 거절 (bid 머리글) - _judge_sales_and_bid 가 그 옵션의 결과를 채우고 올렸다. 카테고리 제한이면 오늘 기록하고
+        # (store 머리글), 같은 상품의 남은 옵션도 구매 페이지를 열지 않는다 (같은 거절만 또 받는다)
+        if e.is_category_limit:
+            rejected.reject(market.category, str(e))
+            log.info("카테고리 '%s' 는 오늘(%s) 더 입찰하지 않음 - 같은 카테고리 상품은 전부 건너뜀", market.category, rejected.today)
+        for _, cr in candidates:
+            if not cr.status:
+                cr.status, cr.detail = "건너뜀", f"같은 상품의 앞 옵션 입찰을 사이트가 거절해 시도하지 않음 ({e})"
+            if not any(x is cr for x in results):
+                _done(results, cr, item)
+        return results
     except Exception as e:  # noqa: BLE001
         dump(page, f"{pid}_error")
         log.exception("상품 %s 처리 중 오류", pid)
@@ -313,6 +332,7 @@ def _judge_sales_and_bid(page: Page, r: ProductResult, stats: product_mod.SalesS
 
     ONE SIZE 상품(r.option 비움)과 옵션 상품(r.option = 옵션 표기) 이 같은 순서를 쓴다. 가격은 시세 API 로 이미 한 번 걸렀고,
     여기서는 입찰 직전에 구매 페이지에서 읽은 B 로 한 번 더 판정한다 (A 는 시세 API 값).
+    서버가 입찰을 거절하면(bid.BidRejected) 결과를 채운 뒤 다시 올린다 - 상품 단위 처리는 process_product.
     """
     r.fast_sales, r.total_sales = stats.fast_in_window, stats.total_in_window
     try:
@@ -337,6 +357,10 @@ def _judge_sales_and_bid(page: Page, r: ProductResult, stats: product_mod.SalesS
         r.status, r.detail = "건너뜀", _skip_detail(e)
     except bid_mod.StoppedBeforeSubmit as e:
         r.status, r.detail = "중단", str(e)
+    except bid_mod.BidRejected as e:
+        log.warning("[%d위%s] 사이트가 입찰을 거절함, 건너뜀: %s", item.rank, f" {r.option}" if r.option else "", e)
+        r.status, r.detail = "건너뜀", f"사이트가 입찰을 거절함: {e}"
+        raise
     except bid_mod.BidAborted as e:
         # 입찰 화면이 예상과 달라 넣지 못한 것 - 이 상품(옵션)만 건너뛰고 다음으로
         log.warning("[%d위%s] 입찰 못 함, 건너뜀: %s", item.rank, f" {r.option}" if r.option else "", e)
@@ -406,8 +430,10 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
         on_result: Callable[[ProductResult], None] | None = None,
         open_bids: "OpenBids | None" = None,
         page: Page | None = None,
-        on_status: Callable[[str], None] | None = None) -> list[ProductResult]:
-    """open_bids: 마이페이지 구매 입찰 탭에 지금 살아 있는 입찰 (cancel.OpenBids).
+        on_status: Callable[[str], None] | None = None,
+        rejected: CategoryRejections | None = None) -> list[ProductResult]:
+    """open_bids: 마이페이지 구매 입찰 탭에 지금 살아 있는 입찰 (cancel.OpenBids). rejected: 오늘 사이트가 카테고리 단위로 거절한 입찰 (store 머리글) -
+    카테고리를 이미 아는 상품은 시세도 읽지 않고 여기서 건너뛴다, 나머지는 process_product 가 시세를 읽은 뒤 본다. 없으면 파일에서 새로 읽는다.
 
     거기에 있는 상품(옵션)만 건너뛴다. 그 밖의 상품은 (예전에 입찰했다가 체결·만료로 사라진 것도) 기준에 따라 다시 판정해
     조건이 맞으면 입찰을 시도하고, 시도가 안 되면 건너뛰고 다음 상품으로 간다.
@@ -422,6 +448,7 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
     """
     stop = should_stop or (lambda: False)
     status = on_status or (lambda _t: None)
+    rejected = rejected or CategoryRejections()
     results: list[ProductResult] = []
     queue = list(items)
     done = 0
@@ -432,6 +459,7 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
             break
         item = queue.pop(0)
         done += 1
+        # 탭도 시세도 없이 건너뛰는 경우 - 마이페이지에 이미 입찰 중, 오늘 거절된 카테고리로 아는 상품
         ob = open_bids.find(item.product_id, ONE_SIZE) if open_bids is not None and not settings.force else None
         if ob is not None:
             log.info("[%d위] %s - 마이페이지에 이미 입찰 중, 건너뜀", item.rank, item.name)
@@ -439,8 +467,14 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
             if on_result:
                 on_result(results[-1])
             continue
+        if why := rejected.blocked_product(item.product_id):
+            log.info("[%d위] %s - %s", item.rank, item.name, why)
+            results.append(_item_result(item, status="건너뜀", detail=f"{why} (시세도 읽지 않음)"))
+            if on_result:
+                on_result(results[-1])
+            continue
         status(f"[{item.category}] {item.rank}위 {item.name[:24]} 확인 중 ({done}/{len(items)}, 시세 {pacing.API_PACER.describe()})")
-        product_results = _process_with_relogin(context, page, item, settings, open_bids, stop, status, api)
+        product_results = _process_with_relogin(context, page, item, settings, open_bids, stop, status, api, rejected)
         for r in product_results:
             results.append(r)
             if on_result:
@@ -466,6 +500,7 @@ def run(context: BrowserContext, items: list[RankedProduct], settings: Settings,
         queue = trouble_streak + queue
         done -= len(trouble_streak)
         trouble_streak = []
+    rejected.flush()   # 이 목록에서 새로 안 상품 카테고리를 한 번에 저장
     return results
 
 
@@ -476,10 +511,11 @@ def _item_result(item: RankedProduct, **fields) -> ProductResult:
 
 def _process_with_relogin(context: BrowserContext, page: Page | None, item: RankedProduct, settings: Settings,
                           open_bids: "OpenBids | None", stop: Callable[[], bool],
-                          status: Callable[[str], None], api: ApiClient) -> list[ProductResult]:
+                          status: Callable[[str], None], api: ApiClient,
+                          rejected: CategoryRejections | None = None) -> list[ProductResult]:
     """process_product 를 부르되, 로그인이 풀린 것이 보이면 다시 로그인하고 한 번 더 본다 (rebid._rebid_with_relogin 과 같은 꼴)."""
     try:
-        return process_product(context, item, settings, api, open_bids, stop, status)
+        return process_product(context, item, settings, api, open_bids, stop, status, rejected)
     except product_mod.LoginNeeded as e:
         log.warning("[%d위] %s - 다시 로그인하고 한 번 더 봄", item.rank, e)
         status("로그인이 풀려 다시 로그인하는 중")
@@ -494,7 +530,7 @@ def _process_with_relogin(context: BrowserContext, page: Page | None, item: Rank
                 tab.close()
         api.invalidate()
     try:
-        return process_product(context, item, settings, api, open_bids, stop, status)
+        return process_product(context, item, settings, api, open_bids, stop, status, rejected)
     except product_mod.LoginNeeded as e2:
         return _done([], _item_result(item, status="오류", detail=f"다시 로그인했는데도 {e2}"), item)
 

@@ -15,7 +15,7 @@ from playwright.sync_api import Page, sync_playwright
 
 from datetime import datetime
 
-from . import auth, cancel, history, history_report, pacing, pipeline, ranking, rebid, report, search, shop
+from . import auth, cancel, history, history_report, pacing, pipeline, ranking, rebid, report, search, shop, store
 from .api import ApiClient
 from .browser import real_chrome_context
 from .config import Settings
@@ -244,13 +244,17 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
         log.info(pacing.API_PACER.describe_setup())
         log.info("마이페이지 구매 입찰 목록 확인 중...")
         open_bids = cancel.open_bid_products(context, page)
+        rejected_categories = store.CategoryRejections()   # 오늘 사이트가 카테고리 단위로 거절한 입찰 - 그날은 전부 건너뜀 (store 참고)
+        if rejected_categories.rejected:
+            log.info("오늘 사이트가 거절한 카테고리 (상품을 전부 건너뜀): %s", rejected_categories.describe())
 
         if product_ids:
             items = [ranking.RankedProduct(rank=i + 1, product_id=pid, name=str(pid), price=None,
                                            url=f"https://kream.co.kr/products/{pid}", category="지정")
                      for i, pid in enumerate(product_ids)]
             results = pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
-                                   open_bids=open_bids, page=page, on_status=on_status, api=api)
+                                   open_bids=open_bids, page=page, on_status=on_status, api=api,
+                                   rejected=rejected_categories)
         else:
             sources = _product_sources(settings, categories, keywords, shop_categories)
             seen: dict[int, str] = {}   # 이 실행에서 이미 판정한 상품 ID -> 어디서 봤는지
@@ -286,7 +290,8 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
                 items, skipped = skip_low_trades(items, settings, on_result)
                 results.extend(skipped)
                 results.extend(pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
-                                            open_bids=open_bids, page=page, on_status=on_status, api=api))
+                                            open_bids=open_bids, page=page, on_status=on_status, api=api,
+                                            rejected=rejected_categories))
 
     log.info("==== 결과 ====")
     for r in results:

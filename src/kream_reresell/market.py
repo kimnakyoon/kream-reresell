@@ -67,6 +67,7 @@ class OptionPrice:
 class ProductMarket:
     product_id: int
     options: list[OptionPrice] = field(default_factory=list)
+    category: str = ""          # release.category (life / accessories / shoes ...). 사이트가 카테고리 단위로 입찰을 거절할 때 쓴다 (pipeline)
 
     @property
     def is_one_size(self) -> bool:
@@ -94,9 +95,12 @@ def _amount(value) -> int | None:
 def parse_market(product_id: int, body: dict) -> ProductMarket:
     """상세 응답을 ProductMarket 으로. 상품 응답은 정상인데 sales_options 가 없으면 아직 리셀 거래가 없는 상품 - 옵션 없는 시세 (머리글 참고)."""
     market = ProductMarket(product_id=product_id)
+    release = body.get("release")
+    if isinstance(release, dict):
+        market.category = str(release.get("category") or "")
     raw_options = body.get("sales_options")
     if not isinstance(raw_options, list):
-        if isinstance(body.get("release"), dict) and isinstance(body.get("product_options"), list):
+        if isinstance(release, dict) and isinstance(body.get("product_options"), list):
             return market
         raise MarketUnavailable(f"상품 {product_id} 상세 응답에 sales_options 가 없음")
     for entry in raw_options:
