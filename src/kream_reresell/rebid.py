@@ -29,6 +29,8 @@
 시세 API 가 차단 신호(무응답 · 5xx 등, api.ApiError.is_block_signal)를 주면 그 입찰은 판단 불가(확인필요)로 두고 지우지 않으며, 페이서가 틱을
 두 배로 늘린다. 판단 불가·오류가 연달아 TROUBLE_STREAK 건 나오면 멈춘 채 5분마다 시세 API 를 한 번 불러 보고, 다시 주면 로그인 상태를 확인한 뒤
 이어서 본다 (사용자 결정 2026-09-05: 시간 제한 없이 다시 줄 때까지 기다린다 - sitewait).
+시세 API 가 401 을 주면 (세션이 끊김 - 로그인 뒤 24시간쯤) 판단 불가가 아니라 로그인이 풀린 것(product.LoginNeeded)이라 바로 다시 로그인하고
+그 입찰을 한 번 더 본다. 사이트 대기 중 확인에서 401 이 나도 같이 다시 로그인한다 (2026-09-13 03:08 실측: 401 을 판단 불가로 세어 7시간 멈춰 있었다).
 상품이 없는 응답(404)이면 확인필요로 남긴다 (지우지 않음 - 상품 페이지가 내려간 것인지 사람이 본다).
 구매 페이지가 로그인 화면으로 넘어가면(로그인이 풀림) 다시 로그인하고 그 입찰을 한 번 더 본다. 목록 페이지가 로그인 화면으로
 넘어가도 (로그인 화면 주소에도 returnUrl 로 tab=bidding 이 들어가 0건으로 읽히던 문제, 2026-09-05) 다시 로그인하고 목록을 다시 읽는다.
@@ -422,15 +424,27 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
 
 # ---------------------------------------------------------------- 사이클 반복
 
-def _wait_for_site(api: ApiClient, probe: OpenBid, should_stop: Callable[[], bool],
+def _wait_for_site(api: ApiClient, probe: OpenBid, page: Page, settings: Settings, should_stop: Callable[[], bool],
                    on_status: Callable[[str], None]) -> bool:
     """사이트가 응답을 안 줄 때 다시 줄 때까지 멈춘다. PROBE_SEC 마다 마지막에 막힌 입찰의 시세 API 를 한 번 불러 보고
-    응답이 오면 돌아온다 (True). 중지 요청이면 False."""
+    응답이 오면 돌아온다 (True). 중지 요청이면 False.
+
+    확인 중 로그인이 풀린 것이 보이면 (시세 API 401 → product.LoginNeeded) 기다려도 소용없으니 여기서 다시 로그인하고 한 번 더 부른다
+    (pipeline._site_gives_sales 와 같은 꼴)."""
+    def fetch() -> None:
+        market = market_mod.fetch_market(api, probe.product_id)   # 틱 없이 한 번 (5분마다 한 번이라 예산에 뜻이 없다)
+        log.info("시세 API 가 다시 응답함 (상품 %d, 옵션 %d개)", probe.product_id, len(market.options))
+
     def check() -> bool:
         # 확인할 상품을 모르면 (상세를 못 읽은 입찰) 한 번 쉰 뒤 그냥 이어서 본다 - 또 막히면 다시 멈춘다
         if probe.product_id:
-            market = market_mod.fetch_market(api, probe.product_id)   # 틱 없이 한 번 (5분마다 한 번이라 예산에 뜻이 없다)
-            log.info("시세 API 가 다시 응답함 (상품 %d, 옵션 %d개)", probe.product_id, len(market.options))
+            try:
+                fetch()
+            except product_mod.LoginNeeded as e:
+                log.warning("확인 중 %s - 다시 로그인하고 한 번 더 확인", e)
+                auth.ensure_logged_in(page, settings)
+                api.invalidate()
+                fetch()   # 또 풀리면 그대로 올라감 (wait_until_site_back 이 '아직 안 줌' 으로 봄)
         return True
 
     return wait_until_site_back(check, should_stop, on_status, what="시세")
@@ -564,7 +578,8 @@ def run(context: BrowserContext, page: Page, settings: Settings,
                 if tab.is_closed():
                     tab = context.new_page()
                 with hangwatch.watching(tab):
-                    back = _wait_for_site(api, bid, stop, lambda t: status(f"재입찰 {cycle}회차 ({bid.order}/{len(bids)} 까지 봄): {t}"))
+                    back = _wait_for_site(api, bid, tab, settings, stop,
+                                          lambda t: status(f"재입찰 {cycle}회차 ({bid.order}/{len(bids)} 까지 봄): {t}"))
                 if not back:
                     break
                 try:

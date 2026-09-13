@@ -70,6 +70,12 @@ class ApiError(Exception):
         """상품(자료)이 없는 응답 - 사이트 문제가 아니라 그 항목만 건너뛴다."""
         return self.status in (400, 404)
 
+    @property
+    def is_auth_lost(self) -> bool:
+        """헤더를 다시 잡아도 401 - 세션이 끊긴 것 (로그인 뒤 24시간쯤, product.LoginNeeded 참고). 사이트가 막은 게 아니라 다시 로그인해야 한다
+        (2026-09-13 03:08 실측: 401 을 '판단 불가' 로 세어 사이트 대기에 들어가 7시간 동안 5분마다 같은 401 만 받았다)."""
+        return self.status == 401
+
 
 def on_site(page: Page) -> bool:
     """페이지가 kream.co.kr 문서에 있는지 - 다른 곳(about:blank 등)에서 fetch 하면 CORS 로 막힌다."""

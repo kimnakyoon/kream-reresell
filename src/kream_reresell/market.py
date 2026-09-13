@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 from . import pacing
 from .api import ApiClient, ApiError
+from .product import LoginNeeded
 from .store import ONE_SIZE
 
 log = logging.getLogger(__name__)
@@ -104,11 +105,18 @@ def parse_market(product_id: int, body: dict) -> ProductMarket:
 
 
 def fetch_market(client: ApiClient, product_id: int) -> ProductMarket:
-    """상품 상세 API 한 번으로 옵션별 A·B 를 읽는다. 못 읽으면 MarketUnavailable."""
+    """상품 상세 API 한 번으로 옵션별 A·B 를 읽는다. 못 읽으면 MarketUnavailable.
+
+    401 (헤더를 다시 잡아도 인증 실패 = 세션 끊김) 은 사이트 문제가 아니라 product.LoginNeeded 로 올린다 - [입찰]·[재입찰] 의 재로그인 경로
+    (_process_with_relogin · _rebid_with_relogin) 가 다시 로그인하고 같은 항목을 한 번 더 본다. MarketUnavailable 로 두면 '판단 불가' 로 세어
+    사이트 대기에 들어가 풀리지 않는다 (2026-09-13 03:08 실측: 7시간).
+    """
     path = f"/api/p/products/{product_id}?base_product_id={product_id}"
     try:
         body = client.get(path)
     except ApiError as e:
+        if e.is_auth_lost:
+            raise LoginNeeded(f"시세 API 가 401 (로그인이 풀림): {e}") from e
         raise MarketUnavailable(f"시세 API {e}", block_signal=e.is_block_signal, gone=e.is_gone) from e
     market = parse_market(product_id, body)
     log.info("시세 API: 상품 %d 옵션 %d개 - %s", product_id, len(market.options),

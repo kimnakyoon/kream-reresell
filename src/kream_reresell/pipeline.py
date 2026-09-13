@@ -502,22 +502,27 @@ def _process_with_relogin(context: BrowserContext, page: Page | None, item: Rank
 def _site_gives_sales(context: BrowserContext, item: RankedProduct, settings: Settings, api: ApiClient) -> bool:
     """사이트가 다시 주는지 - 시세 API 를 한 번 부르고, 막혔던 상품의 페이지를 새 탭에 열어 패널 표가 그려지는지 본다.
 
-    그 사이 로그인이 풀렸으면 (패널 대신 로그인 화면) 기다려도 소용없으니 여기서 다시 로그인하고 한 번 더 본다."""
-    try:
-        market_mod.fetch_market(api, item.product_id)   # 틱 없이 한 번 (5분마다 한 번이라 예산에 뜻이 없다)
-    except market_mod.MarketUnavailable as e:
-        if e.block_signal:
-            log.info("확인: 시세 API 가 아직 응답하지 않음 (%s)", e)
-            return False
+    그 사이 로그인이 풀렸으면 (시세 API 401, 또는 패널 대신 로그인 화면) 기다려도 소용없으니 여기서 다시 로그인하고 한 번 더 본다."""
     tab = context.new_page()
     try:
-        try:
-            ok, note = product_mod.sales_available(tab, item.url)
-        except product_mod.LoginNeeded as e:
+        def relogin(e: product_mod.LoginNeeded) -> None:
             log.warning("확인 중 %s - 다시 로그인하고 한 번 더 확인", e)
             auth.ensure_logged_in(tab, settings)
             api.invalidate()
-            ok, note = product_mod.sales_available(tab, item.url)   # 또 풀리면 그대로 올라감 (wait_until_site_back 이 '아직 안 줌' 으로 봄)
+
+        try:
+            market_mod.fetch_market(api, item.product_id)   # 틱 없이 한 번 (5분마다 한 번이라 예산에 뜻이 없다)
+        except product_mod.LoginNeeded as e:
+            relogin(e)   # 아래 패널 확인이 새 세션으로 이어진다 (또 풀리면 그대로 올라감 - wait_until_site_back 이 '아직 안 줌' 으로 봄)
+        except market_mod.MarketUnavailable as e:
+            if e.block_signal:
+                log.info("확인: 시세 API 가 아직 응답하지 않음 (%s)", e)
+                return False
+        try:
+            ok, note = product_mod.sales_available(tab, item.url)
+        except product_mod.LoginNeeded as e:
+            relogin(e)
+            ok, note = product_mod.sales_available(tab, item.url)
         log.info("확인: %s", note)
         return ok
     finally:
