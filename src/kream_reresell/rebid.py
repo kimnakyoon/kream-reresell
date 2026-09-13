@@ -21,8 +21,11 @@
      페이지 이동은 밀린 입찰(거래량 확인·변경)과 지우는 입찰에만 생기므로 접속 예산(pacing.before_page_visit)은 그 직전에만 자리를 확인한다.
      그 대기 중에 중지 요청이 오면 그 단계로 들어가지 않고 그 입찰을 '중단' 으로 남긴다.
 
+기한이 지난 입찰(목록에 날짜 대신 '기한만료', 상세 API status 'expired' - 2026-09-14 실측: 마감 뒤에도 목록에 남고 상세에 '입찰 지우기' 가 그대로 있다):
+시세를 읽지 않고 바로 지운다 (입찰취소, 사용자 결정 2026-09-14). 그 전에는 즉시 판매가가 있으면 살아 있는 입찰처럼 '순위유지' 로 두고, 내 입찰이
+유일한 구매 입찰이라 즉시 판매가가 없을 때만 상세 API 의 상태를 보고 '건너뜀' 으로 남겼다 (2026-09-14 07:28 실행: 만료 11건 중 1건만 건너뜀, 10건은 순위유지).
 시세에 즉시 판매가가 없을 때(highest_bid 없음 = 구매 입찰이 하나도 없음, 사용자 결정 2026-09-05): 그 입찰을 지운다 (입찰취소, 방식은 기준 미달 때와
-같다). 지우기 전에 상세 API 로 살아 있는 입찰인지 본다 - 이미 체결·삭제된 입찰이면 건너뜀. 지우지 못하면 확인필요. API 가 200 으로 준 값이라
+같다). 지우기 전에 상세 API 로 살아 있는 입찰인지 본다 - 만료면 지우고, 이미 체결·삭제된 입찰이면 건너뜀. 지우지 못하면 확인필요. API 가 200 으로 준 값이라
 (예전 구매 페이지의 '-' 표시와 달리) 사이트가 느려서 빈 것과 헷갈리지 않는다 - '연달아 난 수' 에 넣지 않는다.
 지운 상품은 bids.json 에서도 빼서 [입찰]이 조건이 맞으면 다시 넣을 수 있게 한다.
 시세에 빠른배송 가격이 없을 때(lowest_100 없음 = 지금 빠른배송 판매자가 없음): 그 입찰도 지운다 (사용자 결정 2026-09-06 - 빠른배송으로
@@ -66,7 +69,7 @@ from . import market as market_mod
 from . import product as product_mod
 from .api import ApiClient, ApiError
 from .cancel import (CancelAborted, CancelUncertain, OpenBid, apply_bid_info, apply_known, delete_bid, ensure_product_id,
-                     list_open_bids, match_known_bid)
+                     expired_reason, list_open_bids, match_known_bid)
 from .config import Settings
 from .debug import dump
 from .report import ProductResult, summarize
@@ -258,7 +261,9 @@ def _delete_bid_and_report(page: Page, bid: OpenBid, settings: Settings, r: Prod
     except CancelUncertain as e:
         r.status, r.detail = "확인필요", f"{why} - {e}, 마이페이지에서 확인"
         return
-    remove_bid(bid.product_id, bid.size_value)
+    if bid.product_id:
+        # 기한 만료된 옛 입찰이면 같은 상품에 새로 넣은 입찰의 기록은 남긴다 (희망가가 같은 기록만 뺌)
+        remove_bid(bid.product_id, bid.size_value, price=bid.price if bid.expired else None)
     r.status, r.detail = "입찰취소", f"{why} -> 입찰 #{bid.bid_id} 지움"
 
 
@@ -278,6 +283,12 @@ def _cancel_no_b(page: Page, bid: OpenBid, settings: Settings, r: ProductResult,
             r.status, r.detail = "확인필요", f"{head} - 그런데 입찰 상태를 읽지 못해 지우지 않음 ({e})"
             return
         status = data.get("status")
+        if status == "expired":
+            # 목록에서 못 알아본 만료 (목록을 읽은 뒤 기한이 지남) - 만료 입찰은 지운다 (사용자 결정 2026-09-14)
+            bid.expired = True
+            apply_bid_info(bid, data)
+            _delete_bid_and_report(page, bid, settings, r, f"{expired_reason(bid)} - 상세 API 에서 확인", should_stop, on_status)
+            return
         if status and status != "live":
             r.status, r.detail = "건너뜀", f"입찰 상태가 '{data.get('status_display') or status}' 라 살아 있는 입찰이 아님 (그래서 {head})"
             return
@@ -288,11 +299,26 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
                should_stop: Callable[[], bool] | None, on_status: Callable[[str], None] | None) -> None:
     old_price = bid.price
     try:
+        if bid.expired:
+            # 기한이 지난 입찰 (목록에 '기한만료') - 시세를 읽지 않고 바로 지운다 (사용자 결정 2026-09-14).
+            # 상품 ID 를 모르면 (bids.json 에 없는 입찰) 지우면서 열리는 상세의 응답으로도 채워지지 않으니 그대로 지운다 - delete_bid 는 상세 주소·희망가만 쓴다
+            r.product_id, r.bid_price, r.size = bid.product_id or 0, bid.price, bid.size_value
+            r.url = bid.product_url if bid.product_id else bid.url
+            log.info("[%d회차 %d번째] %s - %s → 지움", cycle, bid.order, bid.label, expired_reason(bid))
+            _delete_bid_and_report(page, bid, settings, r, expired_reason(bid), should_stop, on_status)
+            return
         if bid.needs_detail:
             # 상세 API 로 못 읽은 입찰 (run 이 사이클 시작 때 한꺼번에 읽는다) - 상세 페이지를 연다
             _page_room(should_stop, on_status)
             data = ensure_product_id(page, bid)
             status = (data or {}).get("status")
+            if status == "expired":
+                # 목록을 읽은 뒤 기한이 지난 입찰 - 만료 입찰은 지운다 (사용자 결정 2026-09-14)
+                bid.expired = True
+                r.product_id, r.bid_price, r.size = bid.product_id or 0, bid.price, bid.size_value
+                r.url = bid.product_url if bid.product_id else bid.url
+                _delete_bid_and_report(page, bid, settings, r, f"{expired_reason(bid)} - 상세 API 에서 확인", should_stop, on_status)
+                return
             if status and status != "live":
                 r.status, r.detail = "건너뜀", f"입찰 상태가 '{(data or {}).get('status_display') or status}' - 살아 있는 입찰이 아님"
                 return
@@ -472,7 +498,7 @@ def _list_bids(page: Page, settings: Settings) -> list[OpenBid]:
 def _fill_details_via_api(bids: list[OpenBid], api: ApiClient) -> None:
     """상품 ID·size 값을 모르는 입찰의 상세(api/m/bids/{입찰번호})를 페이지 이동 없이 한꺼번에 받아 채운다. 못 받은 것은 그대로 둔다
     (_rebid_one 이 상세 페이지를 연다)."""
-    todo = [b for b in bids if b.needs_detail]
+    todo = [b for b in bids if b.needs_detail and not b.expired]   # 만료 입찰은 판정 없이 지우므로 상세(스로틀 대상)를 읽지 않는다
     if not todo:
         return
     log.info("상세를 읽어야 하는 입찰 %d건 - 상세 API 로 한꺼번에 읽음", len(todo))
@@ -550,8 +576,8 @@ def run(context: BrowserContext, page: Page, settings: Settings,
             cache_dirty = True
         with hangwatch.watching(tab):
             _fill_details_via_api(bids, api)
-        log.info("===== 재입찰 %d회차: 구매 입찰 %d건 (상세 페이지를 열어야 하는 입찰 %d건) =====",
-                 cycle, len(bids), sum(1 for b in bids if b.needs_detail))
+        log.info("===== 재입찰 %d회차: 구매 입찰 %d건 (기한 만료라 바로 지울 입찰 %d건, 상세 페이지를 열어야 하는 입찰 %d건) =====",
+                 cycle, len(bids), sum(1 for b in bids if b.expired), sum(1 for b in bids if b.needs_detail and not b.expired))
 
         cycle_results: list[ProductResult] = []
         trouble_streak = 0     # 판단 불가·오류가 연달아 난 수

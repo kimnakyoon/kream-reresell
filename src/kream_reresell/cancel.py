@@ -54,7 +54,8 @@ class OpenBid:
     name: str
     option: str = ""           # 목록의 옵션 표기 (ONE SIZE / W240 / M ...)
     price: int | None = None   # 구매 희망가
-    deadline: str = ""         # 목록의 마감일 (26/09/05)
+    deadline: str = ""         # 목록의 마감일 (26/09/05). 만료된 입찰은 날짜 대신 '기한만료' 라 빈 문자열
+    expired: bool = False      # 목록에 '기한만료' 로 표시된 입찰 (상세 API status 'expired', 2026-09-14 실측) - 지운다
     product_id: int | None = None
     expires_at: str = ""
     size: str = ""             # 구매 페이지 주소의 size 값 (ONE SIZE / 240 ...). 상세 API 의 product_option.key
@@ -127,9 +128,12 @@ def list_open_bids(page: Page) -> list[OpenBid]:
         page.wait_for_timeout(800)
 
     bids = [OpenBid(order=i + 1, bid_id=r["bid_id"], url="https://kream.co.kr" + r["href"],
-                    name=r["name"], option=r["option"], price=r["price"], deadline=r["deadline"])
+                    name=r["name"], option=r["option"], price=r["price"], deadline=r["deadline"],
+                    expired=bool(r.get("expired")))
             for i, r in enumerate(rows)]
-    log.info("구매 입찰 목록: %d건%s", len(bids), f" (탭 표시 {expected}건)" if expected is not None else "")
+    expired = sum(1 for b in bids if b.expired)
+    log.info("구매 입찰 목록: %d건%s%s", len(bids), f" (탭 표시 {expected}건)" if expected is not None else "",
+             f", 그중 기한 만료 {expired}건" if expired else "")
     if expected is not None and len(bids) < expected:
         log.warning("탭에는 %d건인데 %d건만 읽음 - 나머지는 다음 실행에서 보게 됨", expected, len(bids))
     return bids
@@ -164,7 +168,8 @@ _BID_ROWS_JS = r"""
     out.push({ bid_id: parseInt(m[1], 10), href, name: ps[0] || '',
                option: ps[1] && ps[1] !== '/' ? ps[1] : '',
                price: pm ? parseInt(pm[1].replace(/,/g, ''), 10) : null,
-               deadline: dm ? dm[0] : '' });
+               deadline: dm ? dm[0] : '',
+               expired: /기한\s*만료/.test(text) });
   }
   return out;
 }
@@ -249,7 +254,9 @@ def open_bid_detail(page: Page, bid: OpenBid) -> None:
     page.wait_for_timeout(800)
     if data is not None:
         status = data.get("status")
-        if status and status != "live":
+        if status == "expired":
+            bid.expired = True   # 만료된 입찰은 지우는 대상 (사용자 결정 2026-09-14) - 상세 화면에 '입찰 지우기' 가 그대로 있다
+        elif status and status != "live":
             raise CancelAborted(f"입찰 상태가 '{data.get('status_display') or status}' - 살아 있는 입찰이 아님")
     else:
         bid.product_id = _product_id_via_button(page, bid)
@@ -333,7 +340,36 @@ def delete_bid(page: Page, bid: OpenBid, settings: Settings) -> None:
     log.info("입찰 #%d 지움 (DELETE %d)", bid.bid_id, status)
 
 
+def expired_reason(bid: OpenBid) -> str:
+    """기한 만료 입찰을 지우는 사유 (보고서 문장). [재입찰] 도 같이 쓴다."""
+    when = bid.expires_at[:10] or bid.deadline
+    return f"기한 만료 (목록에 '기한만료' 표시{f', 마감 {when}' if when else ''}, 내 희망가 {bid.price:,}원)" if bid.price \
+        else f"기한 만료 (목록에 '기한만료' 표시{f', 마감 {when}' if when else ''})"
+
+
 # ---------------------------------------------------------------- 실행
+
+def _delete_expired(page: Page, bid: OpenBid, settings: Settings, r: ProductResult) -> None:
+    """기한이 지난 입찰을 판정 없이 지운다 (dry-run 이면 취소대상). 상품 ID 를 모르면 상세를 한 번 읽어 보되, 못 읽어도 지운다
+    (delete_bid 는 입찰 상세 주소와 희망가만 쓴다)."""
+    if bid.needs_detail:
+        try:
+            ensure_product_id(page, bid)
+        except Exception as e:  # noqa: BLE001
+            log.info("입찰 #%d 상세를 읽지 못함 (%s) - 상품 ID 없이 지움", bid.bid_id, e)
+    r.product_id, r.bid_price, r.size = bid.product_id or 0, bid.price, bid.size_value
+    r.url = bid.product_url if bid.product_id else bid.url
+    why = expired_reason(bid)
+    log.info("[입찰 %d번째] %s - %s → 지움", bid.order, bid.label, why)
+    if settings.dry_run:
+        r.status, r.detail = "취소대상", f"dry-run: {why}"
+        return
+    delete_bid(page, bid, settings)
+    if bid.product_id:
+        # 같은 상품에 새 입찰을 넣어 둔 기록이면 남긴다 (희망가가 같은 기록만 뺀다)
+        remove_bid(bid.product_id, bid.size_value, price=bid.price)
+    r.status, r.detail = "입찰취소", f"{why} -> 입찰 #{bid.bid_id} 지움"
+
 
 def review_bid(context: BrowserContext, bid: OpenBid, settings: Settings) -> ProductResult:
     """입찰 하나를 새 탭에서 다시 판정하고, 조건 미달이면 지운다."""
@@ -341,6 +377,10 @@ def review_bid(context: BrowserContext, bid: OpenBid, settings: Settings) -> Pro
     r = ProductResult(rank=bid.order, product_id=bid.product_id or 0, name=bid.name, url=bid.url,
                       category="구매입찰", bid_price=bid.price, option="" if bid.is_one_size else bid.option)
     try:
+        if bid.expired:
+            # 기한이 지난 입찰은 판정할 것 없이 지운다 (사용자 결정 2026-09-14). 상세 화면에 '입찰 지우기' 가 그대로 있다
+            _delete_expired(page, bid, settings, r)
+            return r
         if not bid.needs_detail:
             log.info("입찰 #%d: 상품 %d%s (bids.json 기록과 일치, 상세 생략), 희망가 %s원, 마감 %s",
                      bid.bid_id, bid.product_id, f" [{bid.option}]" if not bid.is_one_size else "",
@@ -470,6 +510,12 @@ def open_bid_products(context: BrowserContext, page: Page) -> OpenBids:
     """
     bids = list_open_bids(page)
     out = OpenBids()
+    expired = [b for b in bids if b.expired]
+    if expired:
+        # 기한이 지난 입찰은 살아 있는 입찰이 아니라 건너뛰기 대상에 넣지 않는다 - [재입찰]·[입찰취소] 가 지운다 (사용자 결정 2026-09-14)
+        log.info("기한 만료된 입찰 %d건 (#%s) 은 입찰 중으로 보지 않음 - 그 상품은 기준에 맞으면 다시 입찰",
+                 len(expired), ", #".join(str(b.bid_id) for b in expired))
+        bids = [b for b in bids if not b.expired]
     if not bids:
         return out
     known = load_bids()

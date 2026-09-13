@@ -338,7 +338,7 @@ def describe_rebid_settings(settings: Settings) -> str:
             f"즉시 판매가(B) 가 내 희망가보다 높은(밀린) 입찰만 상품 페이지에서 처음 입찰 때와 같은 기준으로 다시 판정 "
             f"(최근 {settings.lookback_days}일 빠른배송 {settings.min_fast_sales}건 이상, {settings.rules.describe()}) 하고, "
             f"충족하면 [입찰 변경하기] 로 희망가를 최신 B 로 올림 (마감 {settings.bid_days}일, 창고보관). "
-            f"기준 미달이거나 빠른배송(판매자)이 없으면 입찰을 지움 (상한만 넘는 것은 그대로 둠). "
+            f"기준 미달이거나 빠른배송(판매자)이 없으면 입찰을 지움 (상한만 넘는 것은 그대로 둠). 기한 만료된 입찰은 시세를 읽지 않고 바로 지움. "
             f"시세 조회 간격 {settings.api_tick_sec:g}초 (회차 사이 쉼 없음), 접속 예산 10분 {settings.page_budget_per_10min}번, "
             f"{'중지할 때까지 반복' if not settings.rebid_cycles else f'{settings.rebid_cycles}회 돌고 끝'}")
 

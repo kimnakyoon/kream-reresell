@@ -84,11 +84,16 @@ def append_run_log(row: dict) -> None:
         w.writerow(row)
 
 
-def remove_bid(product_id: int, size: str = ONE_SIZE) -> bool:
-    """입찰을 지웠을 때 이력에서 빼서, 나중에 조건이 다시 맞으면 새로 입찰할 수 있게 한다."""
+def remove_bid(product_id: int, size: str = ONE_SIZE, price: int | None = None) -> bool:
+    """입찰을 지웠을 때 이력에서 빼서, 나중에 조건이 다시 맞으면 새로 입찰할 수 있게 한다.
+
+    price 를 주면 기록의 희망가가 그 값일 때만 뺀다 - 기한 만료된 옛 입찰을 지울 때 같은 상품에 새로 넣은 입찰의 기록을 지우지 않게.
+    """
     bids = load_bids()
     key = bid_key(product_id, size)
     if key not in bids:
+        return False
+    if price is not None and bids[key].price != price:
         return False
     del bids[key]
     _write_bids(bids)
