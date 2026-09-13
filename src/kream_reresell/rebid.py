@@ -6,8 +6,8 @@
      size 값(product_option.key, 화면 표기 W240 이 아니라 240) 도 같이 알아야 해서 그 값을 모르면 상세를 읽는다. API 로 못 읽은 입찰만
      상세 페이지를 연다 (cancel.ensure_product_id). 판정은 그 옵션의 거래량·가격으로 한다.
   2. 입찰 하나마다 **상품 상세 API 한 번**(market.fetch_market, 페이지 이동 0번)으로 그 옵션의 최신 A(빠른배송 가격 = lowest_100)와
-     즉시 판매가(highest_bid)를 읽어 마진(A−B > A×구간별 마진율)을 판정한다 (pipeline.judge_margin). B 는 밀린 입찰이면 즉시 판매가 + 1,000원
-     (1순위가 되는 금액, market.price_b - 사용자 결정 2026-09-13), 밀리지 않은 입찰이면 즉시 판매가 원값(= 내 희망가, 이미 1순위). 밀리지 않은 입찰도 A 가 내려가
+     즉시 판매가(highest_bid)를 읽어 B(1순위가 되는 입찰가 - market.price_b: 밀렸으면 즉시 판매가 + 1,000원, 아니면 내 희망가 그대로)로
+     마진(A−B > A×구간별 마진율)을 판정한다 (pipeline.judge_margin). 밀리지 않은 입찰도 A 가 내려가
      마진이 기준 아래로 떨어졌을 수 있어 매번 본다 (사용자 결정 2026-09-06: A 변동도 항상 확인). 호출은 고정 틱(pacing.ApiPacer,
      기본 6초)으로 하나씩 - 이 틱이 곧 속도이고 회차 사이에 따로 쉬지 않는다 (목록을 다시 읽기 전 30초만).
      즉시 판매가가 내 희망가 이하이면 밀리지 않은 것: 마진이 기준을 충족하면 그대로 둔다 (순위유지, 사유에 A·마진을 남김), 기준 미달이면 지운다 (아래와 같은 방식).
@@ -320,11 +320,10 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
         if entry.sell is None:
             _cancel_no_b(page, bid, settings, r, f"시세에 즉시 판매가가 없음 = 구매 입찰 없음 (옵션 {entry.label})", api, should_stop, on_status)
             return
-        # 밀렸는지는 즉시 판매가 원값으로 본다. B 는 밀렸으면 즉시 판매가 + 1,000원(1순위가 되는 금액), 아니면 원값(이미 1순위 - 머리글·market 머리글)
-        pushed = entry.sell > bid.price
-        r.price_b = market_mod.price_b_for_bid(entry.sell, bid.price)
-        log.info("A(빠른배송 가격)%s = %s원, 즉시 판매가 = %s원, B = %s원 (시세 API)", f" [{entry.label}]" if not bid.is_one_size else "",
-                 f"{r.price_a:,}", f"{entry.sell:,}", f"{r.price_b:,}")
+        r.price_b = market_mod.price_b(entry.sell, bid.price)
+        pushed = r.price_b != bid.price   # B 가 내 희망가 그대로면 밀리지 않은 것 (market.price_b)
+        log.info("A(빠른배송 가격)%s = %s원, %s (시세 API)", f" [{entry.label}]" if not bid.is_one_size else "",
+                 f"{r.price_a:,}", market_mod.describe_b(entry.sell, r.price_b))
         reason = pipeline.judge_margin(r, settings, price_limit=False)
         if pushed:
             log.info("밀림: 즉시 판매가 %s원 > 내 희망가 %s원 - 올린다면 B %s원으로", f"{entry.sell:,}", f"{bid.price:,}", f"{r.price_b:,}")

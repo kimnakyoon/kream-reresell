@@ -46,7 +46,7 @@ class ProductResult:
     fast_sales: int | None = None      # 기간 내 빠른배송 체결 수
     total_sales: int | None = None     # 기간 내 전체 체결 수
     price_a: int | None = None         # 빠른배송 가격 (예상 판매가)
-    price_b: int | None = None         # B = 즉시 판매가 + 1,000원 (market.price_b). [재입찰] 의 밀리지 않은 입찰은 즉시 판매가 원값
+    price_b: int | None = None         # B = 1순위가 되는 입찰가 (market.price_b: 즉시 판매가 + 1,000원, 내 입찰이 이미 1순위면 내 희망가)
     margin_min: float | None = None    # 이 상품(A 금액 구간)에 적용된 최소 마진율 (0.10 = 10%)
     bid_price: int | None = None       # 입찰가 (= B)
     bid_days: int | None = None
@@ -67,11 +67,11 @@ class ProductResult:
 
 COLUMNS = [
     ("랭킹", 10), ("순위", 6), ("상품명", 46), ("옵션", 9), ("상품ID", 10), ("판정", 12), ("사유 / 결과", 46),
-    ("30일 빠른배송", 13), ("30일 전체", 10), ("A 빠른배송가", 14), ("B 즉시판매가+1000", 17),
+    ("30일 빠른배송", 13), ("30일 전체", 10), ("A 빠른배송가", 14), ("B 1순위입찰가", 14),
     ("A−B", 11), ("마진율", 9), ("기준마진", 9), ("입찰가", 12), ("입찰기한", 9), ("처리시각", 20), ("링크", 40),
 ]
 _COL = {title: i for i, (title, _) in enumerate(COLUMNS, start=1)}   # 제목 -> 열 번호
-_MONEY_COLS = [_COL[t] for t in ("A 빠른배송가", "B 즉시판매가+1000", "A−B", "입찰가")]
+_MONEY_COLS = [_COL[t] for t in ("A 빠른배송가", "B 1순위입찰가", "A−B", "입찰가")]
 
 STATUS_FILL = {
     "입찰완료": "C6EFCE",

@@ -32,7 +32,7 @@ class BidRecord:
     placed_at: str
     fast_sales_30d: int
     price_a: int
-    price_b: int
+    price_b: int             # 2026-09-13 부터 B = 1순위가 되는 입찰가 (market.price_b), 그 전 기록은 즉시 판매가 원값
     option: str = ONE_SIZE   # 화면 표기 옵션 (W240, M, ONE SIZE ...) - 마이페이지 목록·상품 페이지의 표기와 같다
     size: str = ONE_SIZE     # 구매 페이지 주소 /buy/{id}?size=... 의 값 (product_option.key, 예: 240). 표기(W240)와 다를 수 있다
 

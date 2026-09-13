@@ -737,7 +737,7 @@ _SALES_PANEL_VISIBLE_JS = r"""
 # ---------------------------------------------------------------- 구매하기 모달 -> A
 
 def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None = None) -> tuple[int, int]:
-    """'구매하기' 모달에서 빠른배송 가격 A 를 읽고, 일반배송을 골라 구매 페이지로 넘어가 즉시 판매가 B 까지 읽는다. (A, B).
+    """'구매하기' 모달에서 빠른배송 가격 A 를 읽고, 일반배송을 골라 구매 페이지로 넘어가 즉시 판매가까지 읽는다. (A, 즉시 판매가) - B 는 market.price_b.
 
     모달 루트는 .bottom-sheet__layer--open.layer-option-picker (사이즈 목록 + 배송 선택 + 버튼).
     option 을 주면 모달의 옵션 목록에서 그 옵션(화면 표기, 예 W240)을 고른 뒤 읽는다. 없으면 ONE SIZE 상품이어야 한다.
@@ -823,8 +823,8 @@ def read_price_a_and_go_to_buy(page: Page, product_id: int, option: str | None =
         # 구매 페이지 상단의 옵션 표기가 고른 것과 같아야 한다 (다른 사이즈에 입찰하지 않도록). 다 불러온 뒤에 본다 - 불러오는 중에는
         # 상품명·옵션 자리에 '리스트 로딩중입니다.' 그림만 있어 옵션 표기가 없다
         raise SkipProduct(f"구매 페이지의 옵션 표기가 '{option}' 이 아님 (주소 {page.url})")
-    log.info("B(즉시 판매가) = %s원", f"{loaded.price_b:,}")
-    return price_a, loaded.price_b
+    log.info("즉시 판매가 = %s원 (구매 페이지)", f"{loaded.sell:,}")
+    return price_a, loaded.sell
 
 
 # 구매 페이지가 상품 정보를 다 불러왔는지. '즉시 판매가' 글자는 페이지 뼈대에 있어 API 응답 전에도 '-' 값과 함께 바로 그려지고,
@@ -859,12 +859,12 @@ BUY_PAGE_POLL_MS = 200              # 위 상태를 이 간격으로 본다 (기
 
 @dataclass
 class BuyPageLoaded:
-    price_b: int          # 즉시 판매가 (B)
+    sell: int             # 즉시 판매가 원값 (market.OptionPrice.sell 과 같은 뜻 - B 는 market.price_b)
     option_shown: bool    # 상단의 옵션 표기가 기대한 label 과 같은지
 
 
 def wait_buy_page_loaded(page: Page, product_id: int, label: str) -> BuyPageLoaded:
-    """구매 페이지가 상품 정보를 다 불러올 때까지 기다린다. '즉시 판매가 N원' 이 그려지면 그 값(B)과 옵션 표기 여부를 돌려준다.
+    """구매 페이지가 상품 정보를 다 불러올 때까지 기다린다. '즉시 판매가 N원' 이 그려지면 그 값과 옵션 표기 여부를 돌려준다.
 
     다 불러왔는데(로딩 그림 없음, 옵션 표기 label 그려짐) 즉시 판매가가 '-' 이면 구매 입찰이 없는 것 → SkipProduct (건너뜀).
     ([재입찰]은 2026-09-13 부터 시세 API 의 highest_bid 로 판정하므로 여기 오지 않는다.)
@@ -880,7 +880,7 @@ def wait_buy_page_loaded(page: Page, product_id: int, label: str) -> BuyPageLoad
         raise SkipProduct(f"구매 페이지가 뜨지 않음 (지금 주소 {page.url})")
     state = result["state"]
     if state == "price":
-        return BuyPageLoaded(price_b=result["price"], option_shown=result["optionShown"])
+        return BuyPageLoaded(sell=result["price"], option_shown=result["optionShown"])
     if state == "no-price":
         # 다 불러왔는데 즉시 판매가가 '-' (구매 입찰이 하나도 없음) - [재입찰]은 이 경우 입찰을 지운다
         raise SkipProduct(f"구매 페이지를 다 불러왔는데 '즉시 판매가' 가 없음 ('-', 옵션 표기 '{label}' 은 그려짐)")
