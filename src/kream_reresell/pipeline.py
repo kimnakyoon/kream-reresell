@@ -1,13 +1,14 @@
 """랭킹 상품을 순서대로 보며 조건에 맞으면 구매 입찰까지 진행.
 
 순서 (2026-09-13 부터 - 시세 API 로 가격을 먼저 거른다, 사용자 결정. 거래량 기준은 그대로):
-  1. 상품 하나마다 **상품 상세 API 한 번**(market.fetch_market_paced, 페이지 이동 없음)으로 모든 옵션의 A(빠른배송 가격)·B(즉시 판매가)를 읽어,
+  1. 상품 하나마다 **상품 상세 API 한 번**(market.fetch_market_paced, 페이지 이동 없음)으로 모든 옵션의 A(빠른배송 가격)·즉시 판매가를 읽어
+     B(= 즉시 판매가 + 1,000원, 1순위가 되는 입찰가 - market.price_b, 사용자 결정 2026-09-13)를 정하고,
      빠른배송 판매자가 없거나 · 즉시 판매가가 없거나 · A 가 상한을 넘거나 · 마진이 기준에 못 미치는 옵션을 상품 페이지를 열지 않고 거른다.
      (예전에는 옵션마다 체결 내역을 다 센 뒤 가격을 봤다 - 09-07 이후 실측에서 체결 내역 조회의 46% 가 어차피 가격에서 떨어질 옵션에 쓰였다.)
      모든 옵션이 걸러지면 상품 페이지는 열지 않는다.
   2. 남은 옵션만 상품 페이지의 체결 내역 패널에서 30일 빠른배송 건수를 센다 (스로틀 대상 요청 - 이 기준은 시세 API 로 대신할 수 없다).
-  3. 거래량도 넘는 옵션은 구매 페이지(/buy/{id}?size=옵션값)를 바로 열어 (구매하기 모달을 거치지 않음) 최신 B 를 한 번 더 읽고
-     마진을 다시 판정한 뒤 입찰한다 (ONE SIZE 상품과 같은 순서). 결과는 옵션마다 한 줄이다.
+  3. 거래량도 넘는 옵션은 구매 페이지(/buy/{id}?size=옵션값)를 바로 열어 (구매하기 모달을 거치지 않음) 최신 즉시 판매가로 B 를 다시 정해
+     마진을 다시 판정한 뒤 B 로 입찰한다 (ONE SIZE 상품과 같은 순서). 결과는 옵션마다 한 줄이다.
 """
 
 from __future__ import annotations
@@ -142,7 +143,7 @@ def _prefilter(market: market_mod.ProductMarket, item: RankedProduct, settings: 
     candidates: list[tuple[market_mod.OptionPrice, ProductResult]] = []
     for o in options:
         r = _item_result(item, option="" if one_size else o.label)
-        r.size, r.price_a, r.price_b = o.key, o.fast, o.sell
+        r.size, r.price_a, r.price_b = o.key, o.fast, market_mod.price_b(o.sell)
         if open_bids is not None and not settings.force:
             ob = open_bids.find(item.product_id, r.option or ONE_SIZE)
             if ob is not None:
@@ -154,8 +155,8 @@ def _prefilter(market: market_mod.ProductMarket, item: RankedProduct, settings: 
         elif o.sell is None:
             r.status, r.detail = "건너뜀", "시세에 즉시 판매가가 없음 (구매 입찰 없음)"
         else:
-            log.info("A(빠른배송 가격)%s = %s원, B(즉시 판매가) = %s원 (시세 API)", f" [{o.label}]" if not one_size else "",
-                     f"{o.fast:,}", f"{o.sell:,}")
+            log.info("A(빠른배송 가격)%s = %s원, B = %s원 (즉시 판매가 %s원 + %s, 시세 API)", f" [{o.label}]" if not one_size else "",
+                     f"{o.fast:,}", f"{r.price_b:,}", f"{o.sell:,}", f"{market_mod.BID_STEP:,}")
             reason = judge_margin(r, settings, price_limit=True)
             if reason is None or settings.force:
                 candidates.append((o, r))
@@ -331,7 +332,7 @@ def _judge_sales_and_bid(page: Page, r: ProductResult, stats: product_mod.SalesS
     """거래량(stats)을 안 상태에서 상품명으로 이미 입찰 중인지 → 거래량 → 구매 페이지의 최신 B 로 마진 → 입찰 순으로 r.status/detail 을 채운다.
 
     ONE SIZE 상품(r.option 비움)과 옵션 상품(r.option = 옵션 표기) 이 같은 순서를 쓴다. 가격은 시세 API 로 이미 한 번 걸렀고,
-    여기서는 입찰 직전에 구매 페이지에서 읽은 B 로 한 번 더 판정한다 (A 는 시세 API 값).
+    여기서는 입찰 직전에 구매 페이지에서 읽은 즉시 판매가로 B(+1,000원)를 다시 정해 한 번 더 판정한다 (A 는 시세 API 값).
     서버가 입찰을 거절하면(bid.BidRejected) 결과를 채운 뒤 다시 올린다 - 상품 단위 처리는 process_product.
     """
     r.fast_sales, r.total_sales = stats.fast_in_window, stats.total_in_window
@@ -368,7 +369,7 @@ def _judge_sales_and_bid(page: Page, r: ProductResult, stats: product_mod.SalesS
 
 
 def _open_buy_page(page: Page, r: ProductResult, label: str, settings: Settings) -> None:
-    """구매 페이지(/buy/{id}?size=옵션값)를 바로 열어 상품 정보를 다 불러올 때까지 기다리고 최신 B 를 r.price_b 에 넣는다.
+    """구매 페이지(/buy/{id}?size=옵션값)를 바로 열어 상품 정보를 다 불러올 때까지 기다리고 최신 즉시 판매가로 정한 B 를 r.price_b 에 넣는다.
 
     구매하기 모달을 거치지 않는다 (2026-09-13 - 옵션 값은 시세 API 의 product_option.key 로 이미 안다). 이동이 15초 안에 안 끝나거나
     끊기면(net::ERR_ABORTED) 1.5초 뒤 한 번 더 열고, 그래도 안 되면 SkipProduct. 옵션 상품은 상단의 옵션 표기가 고른 것과 같아야 한다.
@@ -382,15 +383,15 @@ def _open_buy_page(page: Page, r: ProductResult, label: str, settings: Settings)
         # 구매 페이지 상단의 옵션 표기가 고른 것과 같아야 한다 (다른 사이즈에 입찰하지 않도록)
         raise product_mod.SkipProduct(f"구매 페이지의 옵션 표기가 '{r.option}' 이 아님 (주소 {page.url})")
     before = r.price_b
-    r.price_b = loaded.price_b
-    log.info("B(즉시 판매가) = %s원 (구매 페이지%s)", f"{r.price_b:,}",
-             f", 시세 API 는 {before:,}원" if before and before != r.price_b else "")
+    r.price_b = market_mod.price_b(loaded.price_b)
+    log.info("B = %s원 (구매 페이지의 즉시 판매가 %s원 + %s%s)", f"{r.price_b:,}", f"{loaded.price_b:,}", f"{market_mod.BID_STEP:,}",
+             f", 시세 API 로는 B {before:,}원" if before and before != r.price_b else "")
     if settings.inspect:
         dump(page, f"{r.product_id}_1_buy_page")
 
 
 def _place_bid(page: Page, r: ProductResult, settings: Settings) -> None:
-    """구매 페이지에 있는 상태에서 B 로 입찰한다 (dry-run 이면 입찰대상으로만)."""
+    """구매 페이지에 있는 상태에서 B(즉시 판매가 + 1,000원) 로 입찰한다 (dry-run 이면 입찰대상으로만)."""
     r.bid_price, r.bid_days = r.price_b, settings.bid_days
     if settings.dry_run:
         r.status, r.detail = "입찰대상", f"dry-run: {r.bid_price:,}원에 {settings.bid_days}일 입찰 조건 충족"

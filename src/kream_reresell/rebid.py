@@ -6,15 +6,16 @@
      size 값(product_option.key, 화면 표기 W240 이 아니라 240) 도 같이 알아야 해서 그 값을 모르면 상세를 읽는다. API 로 못 읽은 입찰만
      상세 페이지를 연다 (cancel.ensure_product_id). 판정은 그 옵션의 거래량·가격으로 한다.
   2. 입찰 하나마다 **상품 상세 API 한 번**(market.fetch_market, 페이지 이동 0번)으로 그 옵션의 최신 A(빠른배송 가격 = lowest_100)와
-     B(즉시 판매가 = highest_bid)를 읽어 마진(A−B > A×구간별 마진율)을 판정한다 (pipeline.judge_margin). 밀리지 않은 입찰도 A 가 내려가
+     즉시 판매가(highest_bid)를 읽어 마진(A−B > A×구간별 마진율)을 판정한다 (pipeline.judge_margin). B 는 밀린 입찰이면 즉시 판매가 + 1,000원
+     (1순위가 되는 금액, market.price_b - 사용자 결정 2026-09-13), 밀리지 않은 입찰이면 즉시 판매가 원값(= 내 희망가, 이미 1순위). 밀리지 않은 입찰도 A 가 내려가
      마진이 기준 아래로 떨어졌을 수 있어 매번 본다 (사용자 결정 2026-09-06: A 변동도 항상 확인). 호출은 고정 틱(pacing.ApiPacer,
      기본 6초)으로 하나씩 - 이 틱이 곧 속도이고 회차 사이에 따로 쉬지 않는다 (목록을 다시 읽기 전 30초만).
-     B 가 내 희망가 이하이면 밀리지 않은 것: 마진이 기준을 충족하면 그대로 둔다 (순위유지, 사유에 A·마진을 남김), 기준 미달이면 지운다 (아래와 같은 방식).
-  3. B 가 내 희망가보다 높으면(누가 더 비싸게 입찰함) 밀린 것: 마진이 기준 미달이면 지우고, 충족하면 상품 페이지를 열어 (이때만 sales 를 받아)
+     즉시 판매가가 내 희망가 이하이면 밀리지 않은 것: 마진이 기준을 충족하면 그대로 둔다 (순위유지, 사유에 A·마진을 남김), 기준 미달이면 지운다 (아래와 같은 방식).
+  3. 즉시 판매가가 내 희망가보다 높으면(누가 더 비싸게 입찰함) 밀린 것: B(즉시 판매가 + 1,000원)로 마진이 기준 미달이면 지우고, 충족하면 상품 페이지를 열어 (이때만 sales 를 받아)
      최근 30일 빠른배송 건수까지 처음 입찰할 때와 똑같이 판정한다 (pipeline.check_sales - 이 기준은 시세 API 로 대신할 수 없다). 거래량 미달이면 지운다.
   4. 조건이 맞으면 입찰 상세의 [입찰 변경하기] 버튼이 여는 것과 같은 주소
      /buy/{상품ID}?size={옵션 값}&bid={입찰번호}&from=changeBidding&type=bid&price={기존 희망가}
-     로 가서 처음 입찰과 같은 화면을 채운다: 희망가 = 최신 B, 마감기한, 구매 입찰 계속 → 창고보관 → 포인트 최대 사용
+     로 가서 처음 입찰과 같은 화면을 채운다: 희망가 = B(최신 즉시 판매가 + 1,000원), 마감기한, 구매 입찰 계속 → 창고보관 → 포인트 최대 사용
      → 입찰하기 → 동의 3항목 → 입찰하기 (bid.fill_bid_form / choose_warehouse_and_points / submit_bid 그대로).
   5. 목록 끝까지 가면 한 사이클. 정한 횟수(max_cycles, GUI '재입찰 횟수' 칸 / --cycles) 만큼 또는 중지할 때까지 사이클을 반복한다.
      페이지 이동은 밀린 입찰(거래량 확인·변경)과 지우는 입찰에만 생기므로 접속 예산(pacing.before_page_visit)은 그 직전에만 자리를 확인한다.
@@ -184,7 +185,7 @@ def _page_room(should_stop: Callable[[], bool] | None, on_status: Callable[[str]
 
 def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, api: ApiClient,
               should_stop: Callable[[], bool] | None = None, on_status: Callable[[str], None] | None = None) -> ProductResult:
-    """입찰 하나를 본다: 시세 API 로 A·B → 밀렸는지 → 처음 입찰 기준으로 다시 판정 → [입찰 변경하기] 로 희망가를 B 로 (또는 기준 미달이면 지움).
+    """입찰 하나를 본다: 시세 API 로 A·즉시 판매가 → 밀렸는지 → B 를 정해 처음 입찰 기준으로 다시 판정 → [입찰 변경하기] 로 희망가를 B 로 (또는 기준 미달이면 지움).
 
     page 는 실행 내내 같은 탭을 다시 쓴다 (입찰마다 탭을 열고 닫는 시간을 아낀다. 페이지가 필요한 단계마다 goto 로 시작하므로 앞 입찰의 화면이 남지 않는다).
     api 는 시세·입찰 상세 API 클라이언트. 로그인이 풀린 것이 보이면 다시 로그인하고 한 번 더 본다.
@@ -310,7 +311,7 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
             r.status, r.detail = "확인필요", (f"시세 응답에 옵션 '{bid.option or ONE_SIZE}'(size={bid.size_value}) 이 없어 올리지 않음 "
                                           f"(있는 옵션: {have or '없음'})")
             return
-        r.price_a, r.price_b, r.size = entry.fast, entry.sell, entry.key
+        r.price_a, r.size = entry.fast, entry.key
         if entry.fast is None:
             why = f"시세에 빠른배송 가격이 없음 = 지금 빠른배송 판매자 없음 (옵션 {entry.label})"
             log.info("%s - 입찰 #%d 을 지움", why, bid.bid_id)
@@ -319,18 +320,20 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
         if entry.sell is None:
             _cancel_no_b(page, bid, settings, r, f"시세에 즉시 판매가가 없음 = 구매 입찰 없음 (옵션 {entry.label})", api, should_stop, on_status)
             return
-        log.info("A(빠른배송 가격)%s = %s원, B(즉시 판매가) = %s원 (시세 API)", f" [{entry.label}]" if not bid.is_one_size else "",
-                 f"{r.price_a:,}", f"{r.price_b:,}")
+        # 밀렸는지는 즉시 판매가 원값으로 본다. B 는 밀렸으면 즉시 판매가 + 1,000원(1순위가 되는 금액), 아니면 원값(이미 1순위 - 머리글·market 머리글)
+        pushed = entry.sell > bid.price
+        r.price_b = market_mod.price_b(entry.sell) if pushed else entry.sell
+        log.info("A(빠른배송 가격)%s = %s원, 즉시 판매가 = %s원, B = %s원 (시세 API)", f" [{entry.label}]" if not bid.is_one_size else "",
+                 f"{r.price_a:,}", f"{entry.sell:,}", f"{r.price_b:,}")
         reason = pipeline.judge_margin(r, settings, price_limit=False)
-        pushed = r.price_b > bid.price
         if pushed:
-            log.info("밀림: 즉시 판매가 %s원 > 내 희망가 %s원", f"{r.price_b:,}", f"{bid.price:,}")
+            log.info("밀림: 즉시 판매가 %s원 > 내 희망가 %s원 - 올린다면 B %s원으로", f"{entry.sell:,}", f"{bid.price:,}", f"{r.price_b:,}")
             if reason is None:
                 # 올리려면 거래량 기준도 봐야 한다 - 이 기준은 시세 API 에 없어 상품 페이지를 열어 (sales 를 받아) 체결 내역을 센다
                 _page_room(should_stop, on_status)
                 reason = pipeline.check_sales(page, bid.product_url, r, settings, bid.eval_option)
         else:
-            log.info("밀리지 않음: 즉시 판매가 %s원 <= 내 희망가 %s원", f"{r.price_b:,}", f"{bid.price:,}")
+            log.info("밀리지 않음: 즉시 판매가 %s원 <= 내 희망가 %s원", f"{entry.sell:,}", f"{bid.price:,}")
         if reason:
             # 기준 미달이면 밀렸든 아니든 둘 수 없으니 지운다 ([입찰취소] 와 같은 기준·방식). 판단 불가(예외)는 지우지 않는다
             head = "밀렸는데 기준 미달이라 올릴 수 없음" if pushed else "밀리진 않았지만 기준 미달이라 둘 수 없음"
@@ -339,7 +342,7 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
                                    should_stop, on_status)
             return
         if not pushed:
-            r.status, r.detail = "순위유지", (f"즉시 판매가 {r.price_b:,}원 {'=' if r.price_b == bid.price else '<'} "
+            r.status, r.detail = "순위유지", (f"즉시 판매가 {entry.sell:,}원 {'=' if entry.sell == bid.price else '<'} "
                                           f"내 희망가 {bid.price:,}원 - 밀리지 않음, {_margin_note(r)}")
             return
         if settings.rules.over_limit(r.price_a):
