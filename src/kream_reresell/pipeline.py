@@ -188,7 +188,7 @@ def process_product(context: BrowserContext, item: RankedProduct, settings: Sett
         r.status, r.detail = market_mod.unavailable_result(e, "건너뜀", NOT_LOADED_PREFIX)
         return _done(results, r, item)
     if not market.options:
-        r.status, r.detail = "건너뜀", "시세 응답에 옵션이 하나도 없음"
+        r.status, r.detail = "건너뜀", "시세에 옵션이 하나도 없는 상품 (브랜드샵 직접 판매만 있어 아직 리셀 거래 없음) - 바로 넘김"
         return _done(results, r, item)
     candidates = _prefilter(market, item, settings, open_bids, results)
     if not candidates:
