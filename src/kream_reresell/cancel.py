@@ -84,8 +84,18 @@ class OpenBid:
         return not self.product_id or not self.size_value
 
     @property
+    def needs_detail_for_judgement(self) -> bool:
+        """판정하려면 상세를 읽어야 하는지 - 기한 만료는 판정 없이 지우므로 상세(스로틀 대상)를 읽지 않는다."""
+        return self.needs_detail and not self.expired
+
+    @property
     def label(self) -> str:
         return f"{self.name} [{self.option}]" if not self.is_one_size else self.name
+
+    def fill_result(self, r: "ProductResult") -> None:
+        """보고서 줄에 이 입찰의 상품 ID · 주소 · 희망가 · size 를 채운다. 상품 ID 를 모르면 주소는 입찰 상세 주소."""
+        r.product_id, r.bid_price, r.size = self.product_id or 0, self.price, self.size_value
+        r.url = self.product_url if self.product_id else self.url
 
 
 # ---------------------------------------------------------------- 목록
@@ -169,7 +179,7 @@ _BID_ROWS_JS = r"""
                option: ps[1] && ps[1] !== '/' ? ps[1] : '',
                price: pm ? parseInt(pm[1].replace(/,/g, ''), 10) : null,
                deadline: dm ? dm[0] : '',
-               expired: /기한\s*만료/.test(text) });
+               expired: /기한\s*만료/.test(ps[ps.length - 1] || '') });   // 마감일 자리(마지막 줄)에 날짜 대신 '기한만료'
   }
   return out;
 }
@@ -200,7 +210,11 @@ def apply_bid_info(bid: OpenBid, data) -> dict | None:
 
     [재입찰]은 2026-09-13 부터 이 응답을 페이지 이동 없이 api.ApiClient 로 받아 여기로 넘긴다.
     """
-    if not isinstance(data, dict) or not data.get("product_id"):
+    if not isinstance(data, dict):
+        return None
+    if data.get("status") == "expired":
+        bid.expired = True   # 목록을 읽은 뒤 기한이 지났거나 목록에서 못 알아본 만료 - 호출자는 bid.expired 만 본다
+    if not data.get("product_id"):
         return None
     bid.product_id = int(data["product_id"])
     if data.get("price"):
@@ -254,9 +268,7 @@ def open_bid_detail(page: Page, bid: OpenBid) -> None:
     page.wait_for_timeout(800)
     if data is not None:
         status = data.get("status")
-        if status == "expired":
-            bid.expired = True   # 만료된 입찰은 지우는 대상 (사용자 결정 2026-09-14) - 상세 화면에 '입찰 지우기' 가 그대로 있다
-        elif status and status != "live":
+        if status and status != "live" and not bid.expired:   # 만료는 지우는 대상이라 통과 (상세 화면에 '입찰 지우기' 가 그대로 있다)
             raise CancelAborted(f"입찰 상태가 '{data.get('status_display') or status}' - 살아 있는 입찰이 아님")
     else:
         bid.product_id = _product_id_via_button(page, bid)
@@ -343,66 +355,47 @@ def delete_bid(page: Page, bid: OpenBid, settings: Settings) -> None:
 def expired_reason(bid: OpenBid) -> str:
     """기한 만료 입찰을 지우는 사유 (보고서 문장). [재입찰] 도 같이 쓴다."""
     when = bid.expires_at[:10] or bid.deadline
-    return f"기한 만료 (목록에 '기한만료' 표시{f', 마감 {when}' if when else ''}, 내 희망가 {bid.price:,}원)" if bid.price \
-        else f"기한 만료 (목록에 '기한만료' 표시{f', 마감 {when}' if when else ''})"
+    extra = (f", 마감 {when}" if when else "") + (f", 내 희망가 {bid.price:,}원" if bid.price else "")
+    return f"기한 만료 (목록에 '기한만료' 표시{extra})"
 
 
 # ---------------------------------------------------------------- 실행
 
-def _delete_expired(page: Page, bid: OpenBid, settings: Settings, r: ProductResult) -> None:
-    """기한이 지난 입찰을 판정 없이 지운다 (dry-run 이면 취소대상). 상품 ID 를 모르면 상세를 한 번 읽어 보되, 못 읽어도 지운다
-    (delete_bid 는 입찰 상세 주소와 희망가만 쓴다)."""
-    if bid.needs_detail:
-        try:
-            ensure_product_id(page, bid)
-        except Exception as e:  # noqa: BLE001
-            log.info("입찰 #%d 상세를 읽지 못함 (%s) - 상품 ID 없이 지움", bid.bid_id, e)
-    r.product_id, r.bid_price, r.size = bid.product_id or 0, bid.price, bid.size_value
-    r.url = bid.product_url if bid.product_id else bid.url
-    why = expired_reason(bid)
-    log.info("[입찰 %d번째] %s - %s → 지움", bid.order, bid.label, why)
-    if settings.dry_run:
-        r.status, r.detail = "취소대상", f"dry-run: {why}"
-        return
-    delete_bid(page, bid, settings)
-    if bid.product_id:
-        # 같은 상품에 새 입찰을 넣어 둔 기록이면 남긴다 (희망가가 같은 기록만 뺀다)
-        remove_bid(bid.product_id, bid.size_value, price=bid.price)
-    r.status, r.detail = "입찰취소", f"{why} -> 입찰 #{bid.bid_id} 지움"
-
-
 def review_bid(context: BrowserContext, bid: OpenBid, settings: Settings) -> ProductResult:
-    """입찰 하나를 새 탭에서 다시 판정하고, 조건 미달이면 지운다."""
+    """입찰 하나를 새 탭에서 다시 판정하고, 조건 미달이면 지운다. 기한이 지난 입찰은 판정 없이 지운다."""
     page: Page = context.new_page()
     r = ProductResult(rank=bid.order, product_id=bid.product_id or 0, name=bid.name, url=bid.url,
                       category="구매입찰", bid_price=bid.price, option="" if bid.is_one_size else bid.option)
     try:
         if bid.expired:
-            # 기한이 지난 입찰은 판정할 것 없이 지운다 (사용자 결정 2026-09-14). 상세 화면에 '입찰 지우기' 가 그대로 있다
-            _delete_expired(page, bid, settings, r)
-            return r
-        if not bid.needs_detail:
-            log.info("입찰 #%d: 상품 %d%s (bids.json 기록과 일치, 상세 생략), 희망가 %s원, 마감 %s",
-                     bid.bid_id, bid.product_id, f" [{bid.option}]" if not bid.is_one_size else "",
-                     f"{bid.price:,}" if bid.price else "?", bid.deadline)
+            # 상세를 읽지 않는다 (스로틀 대상) - delete_bid 는 입찰 상세 주소와 희망가만 쓴다
+            bid.fill_result(r)
+            reason = expired_reason(bid)
+            log.info("[입찰 %d번째] %s - %s → 지움", bid.order, bid.label, reason)
         else:
-            open_bid_detail(page, bid)
-        r.product_id, r.url, r.bid_price, r.size = bid.product_id or 0, bid.product_url, bid.price, bid.size_value
-        log.info("[입찰 %d번째] %s (%s)", bid.order, bid.label, bid.product_url)
-        # 거래량이 모자라도 A/B 까지 읽어 보고서에 남긴다 (지운 이유를 나중에 볼 수 있게)
-        # 상품 금액 상한은 새로 입찰할 때만 쓰는 규칙이라 이미 넣은 입찰에는 적용하지 않는다
-        reason = pipeline.evaluate(page, bid.product_url, r, settings, stop_early=False, price_limit=False,
-                                   option=bid.eval_option, my_price=bid.price)
-        when = f"마감 {bid.deadline or bid.expires_at[:10]}"
-        if reason is None:
-            r.status, r.detail = "입찰유지", f"조건 충족 ({when})"
-            return r
+            if not bid.needs_detail:
+                log.info("입찰 #%d: 상품 %d%s (bids.json 기록과 일치, 상세 생략), 희망가 %s원, 마감 %s",
+                         bid.bid_id, bid.product_id, f" [{bid.option}]" if not bid.is_one_size else "",
+                         f"{bid.price:,}" if bid.price else "?", bid.deadline)
+            else:
+                open_bid_detail(page, bid)
+            bid.fill_result(r)
+            log.info("[입찰 %d번째] %s (%s)", bid.order, bid.label, bid.product_url)
+            # 거래량이 모자라도 A/B 까지 읽어 보고서에 남긴다 (지운 이유를 나중에 볼 수 있게)
+            # 상품 금액 상한은 새로 입찰할 때만 쓰는 규칙이라 이미 넣은 입찰에는 적용하지 않는다
+            reason = pipeline.evaluate(page, bid.product_url, r, settings, stop_early=False, price_limit=False,
+                                       option=bid.eval_option, my_price=bid.price)
+            when = f"마감 {bid.deadline or bid.expires_at[:10]}"
+            if reason is None:
+                r.status, r.detail = "입찰유지", f"조건 충족 ({when})"
+                return r
+            reason = f"{reason} ({when})"
         if settings.dry_run:
-            r.status, r.detail = "취소대상", f"dry-run: {reason} ({when})"
+            r.status, r.detail = "취소대상", f"dry-run: {reason}"
             return r
         delete_bid(page, bid, settings)
         if bid.product_id:
-            remove_bid(bid.product_id, bid.size_value)
+            remove_bid(bid.product_id, bid.size_value, price=bid.price)
         r.status, r.detail = "입찰취소", f"{reason} -> 입찰 #{bid.bid_id} 지움"
         return r
     except product_mod.SkipProduct as e:
@@ -510,12 +503,10 @@ def open_bid_products(context: BrowserContext, page: Page) -> OpenBids:
     """
     bids = list_open_bids(page)
     out = OpenBids()
-    expired = [b for b in bids if b.expired]
-    if expired:
-        # 기한이 지난 입찰은 살아 있는 입찰이 아니라 건너뛰기 대상에 넣지 않는다 - [재입찰]·[입찰취소] 가 지운다 (사용자 결정 2026-09-14)
-        log.info("기한 만료된 입찰 %d건 (#%s) 은 입찰 중으로 보지 않음 - 그 상품은 기준에 맞으면 다시 입찰",
-                 len(expired), ", #".join(str(b.bid_id) for b in expired))
-        bids = [b for b in bids if not b.expired]
+    live = [b for b in bids if not b.expired]   # 기한 만료는 입찰 중이 아니다 - [재입찰]·[입찰취소] 가 지우고, 그 상품은 기준에 맞으면 다시 입찰
+    if len(live) < len(bids):
+        log.info("기한 만료된 입찰 %d건은 입찰 중으로 보지 않음", len(bids) - len(live))
+    bids = live
     if not bids:
         return out
     known = load_bids()

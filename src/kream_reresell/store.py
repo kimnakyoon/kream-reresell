@@ -87,7 +87,8 @@ def append_run_log(row: dict) -> None:
 def remove_bid(product_id: int, size: str = ONE_SIZE, price: int | None = None) -> bool:
     """입찰을 지웠을 때 이력에서 빼서, 나중에 조건이 다시 맞으면 새로 입찰할 수 있게 한다.
 
-    price 를 주면 기록의 희망가가 그 값일 때만 뺀다 - 기한 만료된 옛 입찰을 지울 때 같은 상품에 새로 넣은 입찰의 기록을 지우지 않게.
+    price 를 주면 기록의 희망가가 그 값일 때만 뺀다 (지우는 경로는 모두 지운 입찰의 희망가를 넘긴다) - 기한 만료된 옛 입찰을 지울 때
+    같은 상품에 새로 넣은 입찰의 기록을 지우지 않게. 기록이 같은 입찰인지 알 열쇠가 상품 ID·size 뿐이라 희망가로 가려낸다.
     """
     bids = load_bids()
     key = bid_key(product_id, size)

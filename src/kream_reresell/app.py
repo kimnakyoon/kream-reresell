@@ -306,7 +306,7 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
 
 def describe_cancel_settings(settings: Settings) -> str:
     return (f"입찰취소 기준: 최근 {settings.lookback_days}일 빠른배송 {settings.min_fast_sales}건 미만이거나 "
-            f"마진 기준에 못 미치면 입찰을 지움 ({settings.rules.describe()}) "
+            f"마진 기준에 못 미치면 입찰을 지움 ({settings.rules.describe()}), 기한 만료된 입찰은 판정 없이 지움 "
             f"(마이페이지 > 구매 내역 > 구매 입찰 순서대로)")
 
 
