@@ -18,6 +18,8 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import BrowserContext, Page, Request, TimeoutError as PlaywrightTimeout
 
+from .product import on_login_page
+
 log = logging.getLogger(__name__)
 
 API_BASE = "https://api.kream.co.kr"
@@ -52,7 +54,8 @@ class ApiError(Exception):
     """API 호출이 200 + JSON 으로 끝나지 않았다.
 
     status: HTTP 상태 (무응답 -2, 망 오류 -1, 페이지 명령 실패 0).
-    kind: "timeout"(시간 안에 응답 없음) / "network"(fetch 자체 실패) / "http"(상태 코드) / "page"(페이지 명령이 실패).
+    kind: "timeout"(시간 안에 응답 없음) / "network"(fetch 자체 실패) / "http"(상태 코드) / "page"(페이지 명령이 실패)
+          / "auth"(헤더를 잡으러 간 페이지가 로그인 화면 - status 401 로 두어 is_auth_lost 가 참).
     is_block_signal: 사이트가 막았을 때 나는 모양(무응답 · 망 오류 · 429 · 403 · 5xx)인지 - pacing.ApiPacer 가 간격을 늘리는 근거.
     """
 
@@ -119,13 +122,24 @@ class ApiClient:
         self.headers = {}
 
     def capture_headers(self, url: str = INVENTORY_FINISHED_URL) -> None:
-        """url 로 이동하면서 사이트가 API 에 보내는 헤더를 잡아 둔다 (페이지 이동 1번 - 저절로 못 잡았을 때만)."""
+        """url 로 이동하면서 사이트가 API 에 보내는 헤더를 잡아 둔다 (페이지 이동 1번 - 저절로 못 잡았을 때만).
+
+        세션이 끊기면 마이페이지가 /login 으로 넘어가 인증된 API 요청이 하나도 안 나간다 - 사이트가 막은 게 아니라 다시 로그인할 일이라
+        status 401 (is_auth_lost) 로 올린다 (2026-09-14 10:35 실측: 이 시간 제한을 차단 신호로 세어 사이트 대기에 들어가 20분 동안 안 풀렸다).
+        이동 직후 이미 로그인 화면이면 20초를 기다리지 않는다 - with 블록 안의 예외는 대기를 취소한다 (Playwright 1.62 _sync_base.EventContextManager).
+        """
         try:
             with self.page.expect_request(_is_api_request, timeout=20_000) as req:
                 self.page.goto(url, wait_until="domcontentloaded")
+                self._raise_if_login_page()
             self._sniff(req.value)
         except PlaywrightTimeout as e:
+            self._raise_if_login_page(e)   # SPA 라우팅으로 늦게 넘어간 경우
             raise ApiError("KREAM API 요청 헤더를 잡지 못했습니다 (로그인 상태와 페이지를 확인)", kind="page") from e
+
+    def _raise_if_login_page(self, cause: Exception | None = None) -> None:
+        if on_login_page(self.page):
+            raise ApiError(f"헤더를 잡으러 간 페이지가 로그인 화면 (로그인이 풀림): {self.page.url}", status=401, kind="auth") from cause
 
     def _request_headers(self) -> dict[str, str]:
         if not self.headers or not on_site(self.page):
