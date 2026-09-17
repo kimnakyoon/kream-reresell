@@ -288,6 +288,7 @@ class SellState:
     expected: dict[int, int] = field(default_factory=dict)                # 보관번호 → 마지막에 넣은 가격 (다음 사이클 확인용)
     base_price: dict[int, int] = field(default_factory=dict)              # 보관번호 → 처음 본 가격 (탐침 상한 기준)
     last_probe: dict[int, float] = field(default_factory=dict)            # 보관번호 → 마지막 탐침 시각 (monotonic)
+    buy_tried: set[int] = field(default_factory=set)                      # 매입가 짝을 찾아 본 보관번호 (못 찾은 것도 - 사이클마다 구매 내역을 다시 읽지 않게)
 
 
 def _result(item: StockItem, order: int, cycle: int, settings: Settings) -> ProductResult:
@@ -548,15 +549,21 @@ def save_sell_rules(rules: dict[int, SellRule]) -> None:
     SELL_RULES_PATH.write_text(json.dumps({str(k): asdict(v) for k, v in rules.items()}, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+NEW_STOCK_CHECK_SEC = 120   # 경쟁을 돌리지 않는 동안 새 입고를 보러 보관 목록을 다시 읽는 간격 (목록 API 는 스로틀 대상이 아님, 한 번에 2건)
+
+
 class SellEngine:
     """판매 관리 창이 쓰는 작업 스레드. 크롬(봇 프로필)을 창이 열려 있는 동안 붙들고 있고, 명령 큐로 움직인다.
 
     Playwright 동기 API 는 만든 스레드에서만 부를 수 있어 브라우저·API 호출은 전부 이 스레드 안에서 한다.
     명령: ("refresh",) 목록 다시 읽기 · ("start",) 경쟁 시작 · ("stop",) 경쟁 멈춤 · ("close",) 브라우저 닫고 끝.
-    경쟁 중에는 한 틱에 항목 하나씩(sell_one) 보고 그 사이사이 명령 큐를 본다. 대상은 rules 에서 compete 가 켜지고 하한이 있는 항목뿐.
+    목록 읽기는 한 곳(_loop 의 사이클 시작)뿐이다: 경쟁 중이면 읽고 경쟁 대상을 한 틱에 하나씩(sell_one) 본 뒤 CYCLE_GAP_SEC 쉬고,
+    아니면 읽기만 하고(새 입고가 창에 보이도록) NEW_STOCK_CHECK_SEC 쉰다. 쉬는 동안은 명령 큐를 기다리므로 명령이 오면 바로 깬다 -
+    새로고침은 언제든 되고, 경쟁 중이면 지금 항목을 본 뒤 목록을 다시 읽어 새 사이클을 시작한다 (사용자 요청 2026-09-17).
+    대상은 rules 에서 compete 가 켜지고 하한이 있는 항목뿐. 새 입고 판정은 창이 한다 (sellwin - 받은 목록과 전에 받은 목록의 차이).
     이벤트(on_event(kind, payload), 다른 스레드에서 호출됨 - GUI 는 큐로 받을 것):
-      ("items", list[StockItem]) 목록 · ("result", (StockItem, ProductResult)) 판정 하나 · ("status", str) · ("running", bool) ·
-      ("error", str) · ("closed", None)
+      ("items", list[StockItem]) 목록 (내용이 바뀌었을 때만) · ("result", (StockItem, ProductResult)) 판정 하나 · ("status", str) ·
+      ("running", bool) · ("error", str) · ("closed", None)
     """
 
     def __init__(self, settings: Settings, rules: dict[int, SellRule], on_event: Callable[[str, object], None]) -> None:
@@ -576,7 +583,7 @@ class SellEngine:
 
     def request(self, cmd: str) -> None:
         if cmd in ("stop", "close"):
-            self._stop_tick.set()   # 사이클 사이 쉼(sleep_with_stop)이나 틱 대기를 바로 끊는다
+            self._stop_tick.set()   # 항목 하나를 보는 중(sell_one)의 틱 대기를 바로 끊는다
         self.commands.put(cmd)
 
     # ---- 작업 스레드
@@ -606,70 +613,70 @@ class SellEngine:
         running = False
         cycle = 0
         order = 0
-        pending: list[StockItem] = []
-        self._refresh(page, api, state)
+        pending: list[StockItem] = []   # 이 사이클에서 아직 안 본 경쟁 대상
+        wait = 0.0                      # 다음 목록 읽기까지 쉴 시간 - 명령이 오면 바로 깬다
+        manual = True                   # 다음 읽기가 사용자가 시킨 것(처음·새로고침)인지 - 상태 줄에 알리고 매입가 짝을 다시 찾는다
         while True:
-            # 경쟁 중이면 명령을 기다리지 않고 바로 다음 항목, 아니면 명령이 올 때까지 기다린다
             try:
-                cmd = self.commands.get(timeout=0.2 if running else None)
+                cmd = self.commands.get(timeout=wait)
             except queue.Empty:
                 cmd = None
             if cmd == "close":
                 return
             if cmd == "refresh":
-                self._refresh(page, api, state)
-                pending = []
+                pending, wait, manual = [], 0.0, True
                 continue
-            if cmd == "stop":
-                running = False
-                pending = []
+            if cmd in ("start", "stop"):
+                running = cmd == "start"
+                pending, wait = [], (0.0 if running else NEW_STOCK_CHECK_SEC)
                 self._stop_tick.clear()
-                self._emit("running", False)
-                self._emit("status", "경쟁 멈춤")
+                self._emit("running", running)
+                if not running:
+                    self._emit("status", "경쟁 멈춤")
                 continue
-            if cmd == "start":
-                running = True
-                pending = []
-                self._stop_tick.clear()
-                self._emit("running", True)
+            if pending:
+                item = pending.pop(0)
+                order += 1
+                self._sell_one(page, api, state, item, cycle, order)
+                if not pending:
+                    self._emit("status", f"{cycle}회차 끝 - {CYCLE_GAP_SEC}초 뒤 다시")
+                    wait = CYCLE_GAP_SEC
                 continue
-            if not running:
-                continue
-            if not pending:
-                # 사이클 시작: 목록을 다시 읽고(팔린 것 빠짐, 남이 바꾼 가격 반영) 경쟁 대상만 고른다
+            # 목록 읽기: 경쟁 중이면 사이클 시작(팔린 것 빠짐, 남이 바꾼 가격 반영), 아니면 새 입고가 창에 보이도록 읽기만
+            self._refresh(page, api, state, manual)
+            manual = False
+            wait = NEW_STOCK_CHECK_SEC
+            if running:
                 cycle += 1
                 order = 0
-                self._refresh(page, api, state, quiet=True)
                 pending = [i for i in self.items if self.is_target(i)]
-                if not pending:
+                wait = 0.0 if pending else CYCLE_GAP_SEC
+                if pending:
+                    log.info("===== 판매 %d회차: 경쟁 대상 %d건 / 보관 %d건 =====", cycle, len(pending), len(self.items))
+                else:
                     self._emit("status", f"{cycle}회차: 경쟁에 넣은 항목이 없음 - {CYCLE_GAP_SEC}초 뒤 다시")
-                    sleep_with_stop(CYCLE_GAP_SEC, self._stop_tick.is_set)
-                    continue
-                log.info("===== 판매 %d회차: 경쟁 대상 %d건 / 보관 %d건 =====", cycle, len(pending), len(self.items))
-            item = pending.pop(0)
-            order += 1
-            rule = self._rule(item)
-            self._emit("status", f"{cycle}회차 {order}: {item.name[:24]} ({pacing.API_PACER.describe()})")
-            try:
-                with hangwatch.watching(page):
-                    r = sell_one(item, order, cycle, api, self.settings, state, self._stop_tick.is_set, None, floor=rule.floor)
-            except product_mod.LoginNeeded as e:
-                log.info("로그인이 풀림 (%s) - 다시 로그인하고 이 항목을 한 번 더 봄", e)
-                auth.ensure_logged_in(page, self.settings)
-                api.invalidate()
-                with hangwatch.watching(page):
-                    r = sell_one(item, order, cycle, api, self.settings, state, self._stop_tick.is_set, None, floor=rule.floor)
-            except Exception as e:  # noqa: BLE001
-                log.exception("보관 %s 처리 중 오류", item.ask_id)
-                r = _result(item, order, cycle, self.settings)
-                r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
-            r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            log.info("[%d회차 %d번째] 결과: %s - %s", cycle, order, r.status, r.detail)
-            self.results.append(r)
-            self._emit("result", (item, r))
-            if not pending:
-                self._emit("status", f"{cycle}회차 끝 - {CYCLE_GAP_SEC}초 뒤 다시")
-                sleep_with_stop(CYCLE_GAP_SEC, self._stop_tick.is_set)
+
+    def _sell_one(self, page: Page, api: ApiClient, state: SellState, item: StockItem, cycle: int, order: int) -> None:
+        """항목 하나를 판정하고 결과를 창에 보낸다 (로그인이 풀렸으면 다시 로그인하고 한 번 더)."""
+        rule = self._rule(item)
+        self._emit("status", f"{cycle}회차 {order}: {item.name[:24]} ({pacing.API_PACER.describe()})")
+        try:
+            with hangwatch.watching(page):
+                r = sell_one(item, order, cycle, api, self.settings, state, self._stop_tick.is_set, None, floor=rule.floor)
+        except product_mod.LoginNeeded as e:
+            log.info("로그인이 풀림 (%s) - 다시 로그인하고 이 항목을 한 번 더 봄", e)
+            auth.ensure_logged_in(page, self.settings)
+            api.invalidate()
+            with hangwatch.watching(page):
+                r = sell_one(item, order, cycle, api, self.settings, state, self._stop_tick.is_set, None, floor=rule.floor)
+        except Exception as e:  # noqa: BLE001
+            log.exception("보관 %s 처리 중 오류", item.ask_id)
+            r = _result(item, order, cycle, self.settings)
+            r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
+        r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log.info("[%d회차 %d번째] 결과: %s - %s", cycle, order, r.status, r.detail)
+        self.results.append(r)
+        self._emit("result", (item, r))
 
     def _rule(self, item: StockItem) -> SellRule:
         return self.rules.setdefault(item.ask_id, SellRule())
@@ -679,9 +686,12 @@ class SellEngine:
         rule = self._rule(item)
         return item.is_free_mode(self.settings) or (rule.compete and rule.floor is not None)
 
-    def _refresh(self, page: Page, api: ApiClient, state: SellState, quiet: bool = False) -> None:
-        """목록을 읽고 매입가를 붙여 GUI 로 보낸다. 매입가·하한 제안은 규칙에 채워 둔다 (경쟁 여부는 건드리지 않음)."""
-        if not quiet:
+    def _refresh(self, page: Page, api: ApiClient, state: SellState, manual: bool) -> None:
+        """목록을 읽고 매입가를 붙여 GUI 로 보낸다 (내용이 바뀌었을 때만). 매입가·하한 제안은 규칙에 채워 둔다 (경쟁 여부는 건드리지 않음).
+
+        매입가 짝을 못 찾은 항목은 다시 찾지 않는다 (구매 내역 전체를 읽는 일이라 사이클마다 반복하면 안 됨) - 사용자가 새로고침(manual)하면 다시 찾는다.
+        """
+        if manual:
             self._emit("status", "보관 목록 읽는 중...")
         try:
             with hangwatch.watching(page):
@@ -690,30 +700,35 @@ class SellEngine:
                     rule = self._rule(i)
                     if rule.buy_price:
                         i.buy_price, i.buy_oid = rule.buy_price, rule.buy_oid
-                attach_buy_prices(api, items, state.known_buy)
+                attach_buy_prices(api, [i for i in items if manual or i.ask_id not in state.buy_tried], state.known_buy)
+                state.buy_tried.update(i.ask_id for i in items)
         except ApiError as e:
             if e.is_auth_lost:
                 auth.ensure_logged_in(page, self.settings)
                 api.invalidate()
-                return self._refresh(page, api, state, quiet)
+                return self._refresh(page, api, state, manual)
             log.exception("보관 목록을 읽지 못함")
             self._emit("error", f"보관 목록을 읽지 못함: {e}")
             return
+        changed = False
         for i in items:
             rule = self._rule(i)
             if i.buy_price and not rule.buy_price:
                 rule.buy_price, rule.buy_oid = i.buy_price, i.buy_oid
+                changed = True
             if rule.floor is None and i.buy_price:
                 rule.floor = floor_price(i.buy_price, self.settings.sell_margin_rate, i.fee_rate)
-        gone = set(self.rules) - {i.ask_id for i in items}
-        for k in gone:   # 팔렸거나 취소된 항목의 규칙은 지운다
+                changed = True
+        for k in set(self.rules) - {i.ask_id for i in items}:   # 팔렸거나 취소된 항목의 규칙은 지운다
             del self.rules[k]
-        save_sell_rules(self.rules)
-        self.items = items
-        self._emit("items", list(items))
-        if not quiet:
+            changed = True
+        if changed:
+            save_sell_rules(self.rules)
+        if items != self.items:
+            self.items = items
+            self._emit("items", list(items))
+        if manual:
             self._emit("status", f"보관 {len(items)}건 (매입가 있음 {sum(1 for i in items if i.buy_price)}건)")
-
 
 __all__ = ["run", "list_stock", "attach_buy_prices", "floor_price", "target_price", "set_price", "StockItem",
            "SellRule", "SellEngine", "load_sell_rules", "save_sell_rules"]

@@ -7,6 +7,9 @@
       - 선택 칸을 누르면 체크. [전체 선택]/[선택 해제]. 체크한 행에 [경쟁 등록]/[해제]/[판매 하한가 다시 계산] 이 적용된다.
       - 판매 하한가 칸을 두 번 누르면 직접 고친다. 경쟁 칸을 두 번 누르면 켜고 끈다.
       - 보관 일수가 '보관 N일부터 하한 없이' 를 넘긴 행은 주황 배경, 경쟁 칸 '자동' - 등록과 관계없이 하한 없이 경쟁한다 (sell 머리글 4).
+  새로고침: 경쟁 중에도 언제든 누를 수 있다 (엔진이 지금 항목을 본 뒤 목록을 다시 읽고 새 사이클을 시작).
+  새 입고 알림: 엔진이 보내는 목록(쉬는 동안은 sell.NEW_STOCK_CHECK_SEC 마다 읽음)에 이 창이 처음 보는 보관번호가 있으면 그 행을 노란 배경으로
+      그리고 [새로고침] 버튼이 주황색 '새 입고 N건' 으로 바뀌며 소리가 난다. [새로고침] 을 누르면 표시가 지워진다 (사용자 요청 2026-09-17).
   아래: 가격 로그 (판정 결과가 쌓인다)
 동작은 sell.SellEngine (작업 스레드가 크롬에 자기 연결로 붙어 명령 큐로 움직임 - 다른 버튼과 동시에 돈다). 창을 닫으면 경쟁을 멈추고 연결을 끊고
 (크롬은 다른 작업이 없을 때만 닫힘), 결과가 있으면 엑셀 보고서를 남긴다.
@@ -37,6 +40,9 @@ COLUMNS = [
 ]
 WIDTH, HEIGHT = 1360, 760
 CHECKED, UNCHECKED = "☑", "☐"
+# [새로고침] 버튼의 새 입고 표시 모양 - 평소 모양은 같은 키로 만들 때 떠 둔다 (text 는 건수를 넣어 채움)
+REFRESH_ALERT = {"text": "새로고침 ★ 새 입고 {n}건", "width": 0, "bg": "#FF8F00", "fg": "white",
+                 "activebackground": "#FFA726", "activeforeground": "white", "font": ("맑은 고딕", 9, "bold")}
 
 
 def _won(v: int | None) -> str:
@@ -52,6 +58,8 @@ class SellWindow:
         self.items: list[sell.StockItem] = []
         self.last: dict[int, tuple[int | None, str, str]] = {}   # 보관번호 → (경쟁 최저가, 처리 결과, 시각)
         self.checked: set[int] = set()                            # 선택 칸을 체크한 보관번호
+        self.seen_ids: set[int] | None = None                     # 지금까지 목록에서 본 보관번호 (None = 아직 첫 목록 전) - 없던 것이 오면 새 입고
+        self.new_ids: set[int] = set()                            # 새 입고로 알렸는데 아직 [새로고침] 을 안 누른 보관번호
         self.running = False
         self.closing = False
         self.engine = sell.SellEngine(settings, self.rules, lambda kind, payload: self.q.put((kind, payload)))
@@ -74,8 +82,9 @@ class SellWindow:
     def _build_toolbar(self, top: tk.Toplevel) -> None:
         bar = tk.Frame(top)
         bar.pack(fill="x", padx=10, pady=(10, 4))
-        self.refresh_button = tk.Button(bar, text="새로고침", width=9, command=lambda: self.engine.request("refresh"))
+        self.refresh_button = tk.Button(bar, text="새로고침", width=9, command=self._refresh_click)
         self.refresh_button.pack(side="left")
+        self._refresh_plain = {k: self.refresh_button.cget(k) for k in REFRESH_ALERT}   # 평소 모양 (새 입고 표시를 지울 때 되돌림)
         tk.Button(bar, text="전체 선택", command=lambda: self._check_all(True)).pack(side="left", padx=(8, 0))
         tk.Button(bar, text="선택 해제", command=lambda: self._check_all(False)).pack(side="left", padx=(4, 0))
         tk.Label(bar, text="보기:", font=FONT).pack(side="left", padx=(14, 2))
@@ -107,6 +116,8 @@ class SellWindow:
         hint = tk.Label(top, text="판매 하한가 = 이 프로그램이 내리는 최저선 (즉시 판매가와 무관) = 매입가 × (1 + 하한 마진) ÷ (1 − 판매 수수료). "
                                   "경쟁은 그 위에서만 경쟁 최저가 − 1,000원으로 맞춥니다. 빨간 글씨 = 지금 판매 희망가가 판매 하한가보다 낮음, 회색 = 매입 내역이 없어 하한 없음, "
                                   "주황 배경 = 보관 기한이 지나 하한 없이 자동 경쟁 (창고 보관료는 첫 30일만 무료). "
+                                  "노란 배경 = 새로 입고된 항목 ([새로고침] 이 주황색으로 바뀜, 누르면 지워짐 - 쉬는 동안 "
+                                  f"{sell.NEW_STOCK_CHECK_SEC // 60}분마다 확인). "
                                   "선택 칸 누름 = 체크, 판매 하한가 칸 두 번 누름 = 직접 입력, 경쟁 칸 두 번 누름 = 켜기/끄기. "
                                   f"시세 조회 간격 {self.settings.api_tick_sec:g}초, 사이클 사이 {sell.CYCLE_GAP_SEC}초. "
                                   "※ No1 Seller Center 의 최저가 경쟁은 같은 항목에서 꺼 두세요.",
@@ -127,6 +138,7 @@ class SellWindow:
         self.tree.configure(yscrollcommand=ys.set)
         self.tree.pack(side="left", fill="both", expand=True)
         ys.pack(side="right", fill="y")
+        self.tree.tag_configure("new", background="#FFF59D")        # 새로 입고된 항목 ([새로고침] 을 누르면 지워짐) - 먼저 붙여 다른 배경보다 우선
         self.tree.tag_configure("compete", background="#E8F5E9")
         self.tree.tag_configure("free", background="#FFE0B2")       # 보관 기한 지나 하한 없이 자동 경쟁
         self.tree.tag_configure("below", foreground="#B00020")      # 지금 가격이 하한 아래
@@ -160,7 +172,7 @@ class SellWindow:
             rule = self.rules.get(item.ask_id) or sell.SellRule()
             lowest, result, when = self.last.get(item.ask_id, (None, "", ""))
             free = item.is_free_mode(self.settings)
-            tags = []
+            tags = ["new"] if item.ask_id in self.new_ids else []
             if free:
                 tags.append("free")
             elif rule.compete:
@@ -307,20 +319,58 @@ class SellWindow:
         self.running = running
         self.start_button.configure(state="disabled" if running else "normal")
         self.stop_button.configure(state="normal" if running else "disabled")
-        self.refresh_button.configure(state="disabled" if running else "normal")
+
+    # ------------------------------------------------------------ 새로고침 · 새 입고 알림
+    def _refresh_click(self) -> None:
+        """언제든 누를 수 있다. 새 입고 표시를 지우고 엔진에 목록을 다시 읽으라고 한다 (경쟁 중이면 지금 항목을 본 뒤)."""
+        if self.new_ids:
+            self.new_ids.clear()
+            self._paint_refresh()
+            self._render()
+        if self.running:
+            self.status.configure(text="새로고침 요청 - 지금 항목을 본 뒤 목록을 다시 읽고 새 사이클을 시작합니다")
+        self.engine.request("refresh")
+
+    def _paint_refresh(self) -> None:
+        """[새로고침] 버튼 모양 - 새 입고가 남아 있으면 주황색에 건수, 아니면 평소 모양."""
+        if self.new_ids:
+            self.refresh_button.configure(**{**REFRESH_ALERT, "text": REFRESH_ALERT["text"].format(n=len(self.new_ids))})
+        else:
+            self.refresh_button.configure(**self._refresh_plain)
+
+    def _note_new_stock(self, items: list[sell.StockItem]) -> list[sell.StockItem]:
+        """받은 목록에서 이 창이 처음 보는 항목을 골라 새 입고로 알린다 (첫 목록은 기준만 잡음). 표는 부르는 쪽이 다시 그린다."""
+        ids = {i.ask_id for i in items}
+        new = [i for i in items if i.ask_id not in self.seen_ids] if self.seen_ids is not None else []
+        self.seen_ids = (self.seen_ids or set()) | ids
+        if not new:
+            return new
+        self.new_ids |= {i.ask_id for i in new}
+        self._paint_refresh()
+        names = ", ".join(i.label[:30] for i in new)
+        log.info("[판매 관리 창] 새 입고 %d건: %s", len(new), names)
+        self._log(f"새 입고 {len(new)}건: {names} - 하한을 확인하고 [경쟁 등록] 하세요")
+        self.status.configure(text=f"새 입고 {len(self.new_ids)}건 - 노란 행을 확인하세요")
+        try:
+            self.top.bell()
+        except tk.TclError:
+            pass
+        return new
 
     # ------------------------------------------------------------ 이벤트
     def _poll(self) -> None:
+        render = False   # 쌓인 이벤트를 다 처리한 뒤 표는 한 번만 그린다
         try:
             while True:
                 kind, payload = self.q.get_nowait()
                 if kind == "items":
+                    self._note_new_stock(payload)
                     self.items = payload
-                    self._render()
+                    render = True
                 elif kind == "result":
                     item, r = payload
                     self.last[item.ask_id] = (r.price_a, f"{r.status}: {r.detail}", r.time[11:16])
-                    self._render()
+                    render = True
                     self._log(f"[{item.label[:30]}] {r.status} - {r.detail}")
                 elif kind == "status":
                     self.status.configure(text=payload)
@@ -334,6 +384,8 @@ class SellWindow:
                     return
         except queue.Empty:
             pass
+        if render:
+            self._render()
         if not self.closing or self.top.winfo_exists():
             self.top.after(200, self._poll)
 
