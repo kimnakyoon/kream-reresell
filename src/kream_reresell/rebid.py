@@ -7,8 +7,9 @@
      상세 페이지를 연다 (cancel.ensure_product_id). 판정은 그 옵션의 거래량·가격으로 한다.
   2. 입찰 하나마다 **상품 상세 API 한 번**(market.fetch_market, 페이지 이동 0번)으로 그 옵션의 최신 A(빠른배송 가격 = lowest_100)와
      즉시 판매가(highest_bid)를 읽어 B(1순위가 되는 입찰가 - market.price_b: 밀렸으면 즉시 판매가 + 1,000원, 아니면 내 희망가 그대로)로
-     마진(A−B > A×구간별 마진율)을 판정한다 (pipeline.judge_margin). 밀리지 않은 입찰도 A 가 내려가
-     마진이 기준 아래로 떨어졌을 수 있어 매번 본다 (사용자 결정 2026-09-06: A 변동도 항상 확인). 호출은 고정 틱(pacing.ApiPacer,
+     마진(S−B > S×구간별 마진율, S = 예상 판매가 = min(A, R) - 2026-09-17 부터, pipeline.judge_margin)을 판정한다. 밀리지 않은 입찰도 A 가 내려가
+     마진이 기준 아래로 떨어졌을 수 있어 매번 본다 (사용자 결정 2026-09-06: A 변동도 항상 확인). R(최근 30일 안 빠른배송 체결 15건의 최저가)은
+     시세 API 에 없어 입찰 때 bids.json 에 기록한 값을 쓰고(그 전 기록이면 A 만), 밀린 입찰은 체결 표를 읽으면서 최신 R 로 다시 판정한다. 호출은 고정 틱(pacing.ApiPacer,
      기본 6초)으로 하나씩 - 이 틱이 곧 속도이고 회차 사이에 따로 쉬지 않는다 (목록을 다시 읽기 전 30초만).
      즉시 판매가가 내 희망가 이하이면 밀리지 않은 것: 마진이 기준을 충족하면 그대로 둔다 (순위유지, 사유에 A·마진을 남김), 기준 미달이면 지운다 (아래와 같은 방식).
   3. 즉시 판매가가 내 희망가보다 높으면(누가 더 비싸게 입찰함) 밀린 것: B(즉시 판매가 + 1,000원)로 마진이 기준 미달이면 지우고, 충족하면 상품 페이지를 열어 (이때만 sales 를 받아)
@@ -78,7 +79,7 @@ from .report import ProductResult, summarize
 from . import pacing
 from .pacing import sleep_with_stop
 from .sitewait import PROBE_SEC, TROUBLE_STREAK, wait_until_site_back
-from .store import (ONE_SIZE, BidRecord, append_run_log, load_bid_products, load_bids, remove_bid, save_bid,
+from .store import (ONE_SIZE, BidRecord, append_run_log, bid_key, load_bid_products, load_bids, remove_bid, save_bid,
                     save_bid_products)
 
 log = logging.getLogger(__name__)
@@ -162,12 +163,12 @@ def _won(price: int | None) -> str:
 
 
 def _margin_note(r: ProductResult) -> str:
-    """순위유지 사유에 붙일 A·마진 요약 (예: 'A 35,000원, 마진 22.9% > 기준 10%')."""
+    """순위유지 사유에 붙일 S·마진 요약 (예: 'S 35,000원 (A 38,000원, R 35,000원), 마진 22.9% > 기준 10%')."""
     rate = r.margin_rate
     if rate is None:
-        return f"A {_won(r.price_a)}"
+        return pipeline.describe_s(r)
     base = f"기준 {r.margin_min * 100:g}%" if r.margin_min is not None else "기준 없음"
-    return f"A {_won(r.price_a)}, 마진 {rate * 100:.1f}% > {base}"
+    return f"{pipeline.describe_s(r)}, 마진 {rate * 100:.1f}% > {base}"
 
 
 def _record(bid: OpenBid, r: ProductResult, new_price: int, settings: Settings, note: str = "") -> None:
@@ -175,7 +176,7 @@ def _record(bid: OpenBid, r: ProductResult, new_price: int, settings: Settings, 
     save_bid(BidRecord(
         product_id=bid.product_id, name=bid.name or r.name, price=new_price, bid_days=settings.bid_days,
         placed_at=datetime.now().isoformat(timespec="seconds") + note,
-        fast_sales_30d=r.fast_sales or 0, price_a=r.price_a or 0, price_b=r.price_b or 0,
+        fast_sales_30d=r.fast_sales or 0, price_a=r.price_a or 0, price_r=r.price_r or 0, price_b=r.price_b or 0,
         option=bid.option or ONE_SIZE, size=bid.size_value or ONE_SIZE,
     ))
 
@@ -215,7 +216,7 @@ def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, api: Api
         append_run_log({
             "category": r.category, "rank": r.rank, "product_id": r.product_id, "name": r.name, "option": r.option,
             "fast_sales": r.fast_sales if r.fast_sales is not None else "",
-            "price_a": r.price_a or "", "price_b": r.price_b or "",
+            "price_a": r.price_a or "", "price_r": r.price_r or "", "price_b": r.price_b or "",
             "status": r.status, "detail": r.detail,
         })
     return r
@@ -347,15 +348,22 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
             return
         r.price_b = market_mod.price_b(entry.sell, bid.price)
         pushed = r.price_b != bid.price   # B 가 내 희망가 그대로면 밀리지 않은 것 (market.price_b)
-        log.info("A(빠른배송 가격)%s = %s원, %s (시세 API)", f" [{entry.label}]" if not bid.is_one_size else "",
-                 f"{r.price_a:,}", market_mod.describe_b(entry.sell, r.price_b))
+        # R(최근 빠른배송 체결 15건의 최저가)은 시세 API 에 없다 - 입찰 때 기록한 값(bids.json, 2026-09-17 이후 기록)으로 S = min(A, R) 을 본다.
+        # 그 전 기록(price_r 0)이면 A 만으로 본다. 밀린 입찰은 아래에서 체결 표를 읽으며 최신 R 로 바꾼다
+        rec = load_bids().get(bid_key(bid.product_id, bid.size_value))
+        r.price_r = (rec.price_r or None) if rec else None
+        log.info("A(빠른배송 가격)%s = %s원, R(입찰 때 기록) %s, %s (시세 API)", f" [{entry.label}]" if not bid.is_one_size else "",
+                 f"{r.price_a:,}", f"{r.price_r:,}원" if r.price_r else "없음", market_mod.describe_b(entry.sell, r.price_b))
         reason = pipeline.judge_margin(r, settings, price_limit=False)
         if pushed:
             log.info("밀림: 즉시 판매가 %s원 > 내 희망가 %s원 - 올린다면 B %s원으로", f"{entry.sell:,}", f"{bid.price:,}", f"{r.price_b:,}")
             if reason is None:
-                # 올리려면 거래량 기준도 봐야 한다 - 이 기준은 시세 API 에 없어 상품 페이지를 열어 (sales 를 받아) 체결 내역을 센다
+                # 올리려면 거래량 기준도 봐야 한다 - 이 기준은 시세 API 에 없어 상품 페이지를 열어 (sales 를 받아) 체결 내역을 센다.
+                # 그 표에서 최신 R 이 나오므로 마진도 그 R 로 다시 판정한다
                 _page_room(should_stop, on_status)
                 reason = pipeline.check_sales(page, bid.product_url, r, settings, bid.eval_option)
+                if reason is None:
+                    reason = pipeline.judge_margin(r, settings, price_limit=False)
         else:
             log.info("밀리지 않음: 즉시 판매가 %s원 <= 내 희망가 %s원", f"{entry.sell:,}", f"{bid.price:,}")
         if reason:

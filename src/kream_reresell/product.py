@@ -1,4 +1,9 @@
-"""상품 페이지: 체결 내역(빠른배송 거래량) 과 빠른배송 가격 A 를 읽고 구매 페이지로 넘어간다.
+"""상품 페이지: 체결 내역(빠른배송 거래량 + 최근 체결가 R) 과 빠른배송 가격 A 를 읽고 구매 페이지로 넘어간다.
+
+체결 표 행마다 가격이 같이 오므로, 건수를 세면서 기간 내 빠른배송 체결가도 모아 **R = 최신 RECENT_FAST_N(15)건의 최저가**(SalesStats.recent_price)를 낸다
+(2026-09-17 사용자 결정 - 9월 판매 38건을 대조하니 A 는 판매자 호가라 실제 판매가가 입찰 때 A 보다 평균 19.5% 낮았고 30건이 역마진.
+체결 API 로 입찰 시점의 직전 15건을 재구성해 보니 판매가는 그 중앙값보다 14.8% 낮았고 최저가와는 −1.0% 로 거의 같았다 - 최저가로 등록해
+파는 구조라 시장 바닥값에 팔린다). 추가 요청은 없다 - 건수를 세려고 이미 읽는 행에서 가격만 더 읽는다 (need 건을 채우면 더 읽지 않는다).
 
 옵션(사이즈)이 있는 상품 (2026-09-05 실측, 신발 '(W) 나이키 토탈 90'):
   - '거래 내역 더보기' 패널 위에 옵션 선택 버튼(.detail-size, 처음엔 '모든 옵션')이 있다. 누르면 '옵션 선택' 레이어에
@@ -15,7 +20,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from urllib.parse import parse_qs, quote_plus, urlparse
 
@@ -30,6 +35,7 @@ log = logging.getLogger(__name__)
 MAX_SALES_ROWS = 600        # 이보다 많이 읽지 않는다 (거래량이 큰 상품 보호)
 SALES_PAGE_SIZE = 50        # 체결 표는 50행씩 불러온다 (2026-09-05 실측). 50의 배수가 아니면 더 불러올 것이 없다
 MAX_SCROLL_ROUNDS = 40
+RECENT_FAST_N = 15          # R 을 낼 때 보는 최신 빠른배송 체결 수 (머리글)
 ALL_OPTIONS_LABEL = "모든 옵션"
 
 
@@ -152,6 +158,14 @@ class SalesStats:
     total_in_window: int     # 기간 내 전체 체결 수
     rows_read: int           # 읽은 행 수
     reached_window_end: bool  # 기간 밖(더 오래된) 행까지 봤는지
+    fast_prices: list[int] = field(default_factory=list)   # 기간 내 빠른배송 체결가 (표 순서 = 최신순). 가격을 못 읽은 행은 뺀다
+
+    @property
+    def recent_price(self) -> int | None:
+        """R = 기간 내 최신 빠른배송 체결 RECENT_FAST_N 건의 최저가 (머리글). 체결가가 하나도 없으면 None."""
+        if not self.fast_prices:
+            return None
+        return min(self.fast_prices[:RECENT_FAST_N])
 
 
 def goto_with_retry(page: Page, url: str, what: str) -> None:
@@ -406,12 +420,14 @@ def count_sales(page: Page, lookback_days: int, need: int, option: str | None = 
     fast = total = 0
     reached_end = False
     rows: list[dict] = []
+    prices: list[int] = []
     prev_count = -1
     stale = 0
     for _ in range(MAX_SCROLL_ROUNDS):
         rows = page.evaluate(_SALES_ROWS_JS)
         fast = total = 0
         reached_end = False
+        prices = []
         for r in rows:
             if option and r.get("option") and r["option"] != option:
                 continue
@@ -424,6 +440,8 @@ def count_sales(page: Page, lookback_days: int, need: int, option: str | None = 
             total += 1
             if r["fast"]:
                 fast += 1
+                if r.get("price"):
+                    prices.append(int(r["price"]))
         if reached_end or fast >= need or len(rows) >= MAX_SALES_ROWS:
             break
         if len(rows) == 0 or len(rows) % SALES_PAGE_SIZE != 0:
@@ -439,10 +457,14 @@ def count_sales(page: Page, lookback_days: int, need: int, option: str | None = 
         page.evaluate(_SCROLL_SALES_JS)
         page.wait_for_timeout(700)
 
-    stats = SalesStats(fast, total, len(rows), reached_end)
-    log.info("체결 내역%s: %d행 읽음, %d일 내 빠른배송 %d건 / 전체 %d건%s", f" [{option}]" if option else "",
-             stats.rows_read, lookback_days, fast, total, "" if reached_end else " (기간 끝까지 못 봄)")
+    stats = SalesStats(fast, total, len(rows), reached_end, fast_prices=prices)
+    log.info("체결 내역%s: %d행 읽음, %d일 내 빠른배송 %d건 / 전체 %d건%s, R(최근 빠른배송 체결 15건 최저가) %s", f" [{option}]" if option else "",
+             stats.rows_read, lookback_days, fast, total, "" if reached_end else " (기간 끝까지 못 봄)", _won(stats.recent_price))
     return stats
+
+
+def _won(price: int | None) -> str:
+    return f"{price:,}원" if price else "없음"
 
 
 def count_sales_by_option(page: Page, lookback_days: int, need: int, options: list[str],
@@ -467,6 +489,7 @@ def count_sales_by_option(page: Page, lookback_days: int, need: int, options: li
         rows = page.evaluate(_SALES_ROWS_JS)
         fast = dict.fromkeys(options, 0)
         total = dict.fromkeys(options, 0)
+        prices: dict[str, list[int]] = {o: [] for o in options}
         reached_end = False
         oldest: datetime | None = None
         for r in rows:
@@ -483,11 +506,13 @@ def count_sales_by_option(page: Page, lookback_days: int, need: int, options: li
             total[o] += 1
             if r["fast"]:
                 fast[o] += 1
+                if r.get("price"):
+                    prices[o].append(int(r["price"]))
         exhausted = len(rows) == 0 or len(rows) % SALES_PAGE_SIZE != 0   # 마지막 페이지가 꽉 차지 않았다 = 표가 끝났다
         done = reached_end or exhausted
         for o in options:
             if done or fast[o] >= need:
-                resolved[o] = SalesStats(fast[o], total[o], len(rows), done)
+                resolved[o] = SalesStats(fast[o], total[o], len(rows), done, fast_prices=prices[o])
         unresolved = [o for o in options if o not in resolved]
         if done or not unresolved or len(rows) >= MAX_SALES_ROWS:
             break
@@ -517,7 +542,7 @@ def count_sales_by_option(page: Page, lookback_days: int, need: int, options: li
             pages += 1
     if resolved:
         log.info("모든 옵션 표 %d페이지(%d행)에서 %d/%d 옵션 정해짐: %s", pages, len(rows), len(resolved), len(options),
-                 ", ".join(f"{o} {s.fast_in_window}건" for o, s in resolved.items()))
+                 ", ".join(f"{o} {s.fast_in_window}건 R {_won(s.recent_price)}" for o, s in resolved.items()))
     return resolved, pages
 
 

@@ -10,7 +10,7 @@
 올리며, 기준 미달이라 올릴 수 없으면 그 입찰을 지운다. A·B 는 페이지를 열지 않고 시세 API 로 읽으며(입찰 하나에 호출 하나),
 호출 간격은 설정칸의 '시세 조회 간격' (기본 6초, 3~60초) - 회차 사이에 따로 쉬지 않는다. [입찰]도 같은 API 로 가격을 먼저 걸러
 체결 내역 조회를 줄인다.
-[입찰 기준] 표에서 A(빠른배송 가격) 금액 구간별 최소 마진율과 상품 금액 상한(A 가 넘으면 바로 건너뜀)을 정한다.
+[입찰 기준] 표에서 S(예상 판매가 = min(A 빠른배송 가격, R 최근 빠른배송 체결 15건 최저가)) 금액 구간별 최소 마진율과 상품 금액 상한(A 가 넘으면 바로 건너뜀)을 정한다.
 [입찰]/[입찰취소]/[기준 저장] 을 누르면 data/bid_rules.json 에 저장돼 다음 실행과 명령행에도 쓰인다.
 끝나면 바탕화면\\KREAM 결과\\ 에 엑셀 보고서가 저장된다 (자동으로 열지는 않는다).
 [내역] 은 달을 고르면 보관 판매(종료) 에서 그 달에 거래된 판매를 구매 내역(종료) 과 짝지어
@@ -227,7 +227,7 @@ class App:
                        command=self.toggle_chrome_window).pack(side="right")
 
         cond = (f"조건: 최근 {self.base.lookback_days}일 빠른배송 {self.base.min_fast_sales}건 이상 · "
-                f"마진 (A−B) > A×[아래 입찰 기준의 구간별 %] · 입찰 {self.base.bid_days}일 · 창고보관 · 포인트 최대 사용")
+                f"마진 (S−B) > S×[아래 입찰 기준의 구간별 %], S = 예상 판매가 = min(A 빠른배송가, R 최근 체결 15건 최저가) · 입찰 {self.base.bid_days}일 · 창고보관 · 포인트 최대 사용")
         tk.Label(frame, text=cond, fg="#555", anchor="w", justify="left", wraplength=580).pack(fill="x", padx=12, pady=(0, 6))
         tk.Label(frame, text="(거래량·기간·입찰기한은 프로젝트 폴더의 .env 에서 바꿉니다. 랭킹·검색어·SHOP 카테고리·상품 수는 [입찰]에만, "
                              "재입찰 횟수는 [재입찰]에만, 시세 조회 간격은 [입찰]·[재입찰]에 쓰입니다)",
@@ -303,7 +303,7 @@ class App:
 
         self.tier_grid = tk.Frame(panel)
         self.tier_grid.pack(fill="x", padx=12, pady=(6, 2))
-        for col, text in enumerate(("A 부터 (원)", "A 미만 (원, 비우면 끝없음)", "최소 마진율 (%)")):
+        for col, text in enumerate(("S 부터 (원)", "S 미만 (원, 비우면 끝없음)", "최소 마진율 (%)")):
             tk.Label(self.tier_grid, text=text, fg="#555").grid(row=0, column=col, sticky="w", padx=(0, 10))
 
         row = tk.Frame(panel)

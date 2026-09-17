@@ -45,33 +45,46 @@ class ProductResult:
     detail: str = ""            # 사유
     fast_sales: int | None = None      # 기간 내 빠른배송 체결 수
     total_sales: int | None = None     # 기간 내 전체 체결 수
-    price_a: int | None = None         # 빠른배송 가격 (예상 판매가)
+    price_a: int | None = None         # A = 빠른배송 가격 (지금 가장 싼 빠른배송 판매 호가)
+    price_r: int | None = None         # R = 최근 30일 안 빠른배송 체결 15건의 최저가 (product.SalesStats.recent_price). 체결 표를 읽기 전엔 None
     price_b: int | None = None         # B = 1순위가 되는 입찰가 (market.price_b: 즉시 판매가 + 1,000원, 내 입찰이 이미 1순위면 내 희망가)
-    margin_min: float | None = None    # 이 상품(A 금액 구간)에 적용된 최소 마진율 (0.10 = 10%)
+    margin_min: float | None = None    # 이 상품(S 금액 구간)에 적용된 최소 마진율 (0.10 = 10%)
     bid_price: int | None = None       # 입찰가 (= B)
     bid_days: int | None = None
     time: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     @property
+    def price_s(self) -> int | None:
+        """S = 예상 판매가 = min(A, R). 마진 판정(S − B > S × 기준)의 기준 금액 (2026-09-17 사용자 결정, product 머리글).
+
+        A 는 판매자 호가라 실제로 팔리는 값보다 높은 때가 많고, R 은 최근 실제 체결가 - 둘 중 낮은 쪽을 예상 판매가로 본다.
+        R 을 아직 못 읽었으면(시세 API 로만 거른 단계) A 그대로."""
+        if self.price_a is None:
+            return self.price_r
+        if self.price_r is None:
+            return self.price_a
+        return min(self.price_a, self.price_r)
+
+    @property
     def margin(self) -> int | None:
-        if self.price_a is None or self.price_b is None:
+        if self.price_s is None or self.price_b is None:
             return None
-        return self.price_a - self.price_b
+        return self.price_s - self.price_b
 
     @property
     def margin_rate(self) -> float | None:
-        if self.margin is None or not self.price_a:
+        if self.margin is None or not self.price_s:
             return None
-        return self.margin / self.price_a
+        return self.margin / self.price_s
 
 
 COLUMNS = [
     ("랭킹", 10), ("순위", 6), ("상품명", 46), ("옵션", 9), ("상품ID", 10), ("판정", 12), ("사유 / 결과", 46),
-    ("30일 빠른배송", 13), ("30일 전체", 10), ("A 빠른배송가", 14), ("B 1순위입찰가", 14),
-    ("A−B", 11), ("마진율", 9), ("기준마진", 9), ("입찰가", 12), ("입찰기한", 9), ("처리시각", 20), ("링크", 40),
+    ("30일 빠른배송", 13), ("30일 전체", 10), ("A 빠른배송가", 14), ("R 최근체결가", 14), ("S 예상판매가", 14), ("B 1순위입찰가", 14),
+    ("S−B", 11), ("마진율", 9), ("기준마진", 9), ("입찰가", 12), ("입찰기한", 9), ("처리시각", 20), ("링크", 40),
 ]
 _COL = {title: i for i, (title, _) in enumerate(COLUMNS, start=1)}   # 제목 -> 열 번호
-_MONEY_COLS = [_COL[t] for t in ("A 빠른배송가", "B 1순위입찰가", "A−B", "입찰가")]
+_MONEY_COLS = [_COL[t] for t in ("A 빠른배송가", "R 최근체결가", "S 예상판매가", "B 1순위입찰가", "S−B", "입찰가")]
 
 STATUS_FILL = {
     "입찰완료": "C6EFCE",
@@ -132,7 +145,7 @@ _STATUS_FILLS = {st: PatternFill("solid", fgColor=color) for st, color in STATUS
 def _write_row(ws, i: int, r: ProductResult) -> None:
     values = [
         r.category, r.rank, r.name, r.option or None, r.product_id, r.status, r.detail,
-        r.fast_sales, r.total_sales, r.price_a, r.price_b,
+        r.fast_sales, r.total_sales, r.price_a, r.price_r, r.price_s, r.price_b,
         r.margin, r.margin_rate, r.margin_min, r.bid_price,
         f"{r.bid_days}일" if r.bid_days else None, r.time, r.url,
     ]

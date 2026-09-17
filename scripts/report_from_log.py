@@ -49,7 +49,7 @@ def main() -> int:
             rank=_int(row["rank"]) or 0, product_id=pid, name=row["name"], option=row.get("option", "") or "",
             url=f"https://kream.co.kr/products/{pid}", category=row.get("category", ""),
             status=status, detail=detail,
-            fast_sales=_int(row.get("fast_sales", "")), price_a=_int(row.get("price_a", "")),
+            fast_sales=_int(row.get("fast_sales", "")), price_a=_int(row.get("price_a", "")), price_r=_int(row.get("price_r", "")),
             price_b=_int(row.get("price_b", "")), time=row["time"],
         )
         if status == "입찰대상" and r.price_b:

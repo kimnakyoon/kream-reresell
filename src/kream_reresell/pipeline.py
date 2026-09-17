@@ -77,7 +77,7 @@ def check_sales(page: Page, url: str, r: ProductResult, settings: Settings, opti
 
     pacing.before_sales_request()
     stats = product_mod.read_sales_stats(page, settings.lookback_days, settings.min_fast_sales, option)
-    r.fast_sales, r.total_sales = stats.fast_in_window, stats.total_in_window
+    r.fast_sales, r.total_sales, r.price_r = stats.fast_in_window, stats.total_in_window, stats.recent_price
     return _sales_reason(stats, settings)
 
 
@@ -88,8 +88,10 @@ def _sales_reason(stats: product_mod.SalesStats, settings: Settings) -> str | No
 
 
 def judge_margin(r: ProductResult, settings: Settings, price_limit: bool = True) -> str | None:
-    """r.price_a / r.price_b 가 채워진 상태에서 상한·마진을 판정한다. 미달이면 사유, 충족이면 None. [입찰] · [재입찰] · [입찰취소] 공용.
+    """r.price_a / r.price_b (있으면 r.price_r) 가 채워진 상태에서 상한·마진을 판정한다. 미달이면 사유, 충족이면 None. [입찰] · [재입찰] · [입찰취소] 공용.
 
+    마진은 예상 판매가 S = min(A, R) 기준 (report.ProductResult.price_s): S − B > S × 구간별 기준. 체결 표를 읽기 전(시세 API 단계)엔 R 이 없어
+    S = A 로 거르고, 체결 표를 읽은 뒤 R 까지 넣어 다시 판정한다. 상한은 A 로 본다 (상품 가격대 규칙).
     price_limit 가 True 면 A 가 상품 금액 상한을 넘으면 바로 사유 (입찰 전용 규칙 - 재입찰·취소는 False).
     r.margin_min 에 적용된 구간의 기준 마진율을 남긴다 (보고서).
     """
@@ -99,15 +101,24 @@ def judge_margin(r: ProductResult, settings: Settings, price_limit: bool = True)
         log.info("A %s원 > 상품 금액 상한 %s원 - 바로 건너뜀", f"{r.price_a:,}", f"{settings.rules.max_price_a:,}")
         return f"A {r.price_a:,}원 > 상품 금액 상한 {settings.rules.max_price_a:,}원"
     rate = r.margin_rate or 0.0
-    tier = settings.rules.tier_for(r.price_a)
+    tier = settings.rules.tier_for(r.price_s)
     r.margin_min = tier.margin_rate if tier else None
-    log.info("A-B = %s원 (A의 %.1f%%), 기준 %s", f"{r.margin:,}",
-             rate * 100, tier.describe() if tier else "없음 (A 가 설정한 금액 구간 밖)")
+    log.info("%s, S-B = %s원 (S의 %.1f%%), 기준 %s", describe_s(r), f"{r.margin:,}",
+             rate * 100, tier.describe() if tier else "없음 (S 가 설정한 금액 구간 밖)")
     if tier is None:
-        return f"A {r.price_a:,}원은 설정한 금액 구간에 없음"
+        return f"S {r.price_s:,}원은 설정한 금액 구간에 없음"
     if rate <= r.margin_min:
-        return f"마진 {rate*100:.1f}% <= 기준 {tier.margin_pct:g}% ({tier.label})"
+        return f"마진 {rate*100:.1f}% <= 기준 {tier.margin_pct:g}% ({tier.label}, {describe_s(r)})"
     return None
+
+
+def describe_s(r: ProductResult) -> str:
+    """로그·사유용: 'S 47,000원 (A 54,000원, R 47,000원)'. R 이 없으면 'S 54,000원 (= A, R 없음)'."""
+    if r.price_s is None:
+        return "S 없음"
+    if r.price_r is None:
+        return f"S {r.price_s:,}원 (= A, R 없음)"
+    return f"S {r.price_s:,}원 (A {r.price_a:,}원, R {r.price_r:,}원)"
 
 
 def judge_prices(page: Page, r: ProductResult, settings: Settings, price_limit: bool = True,
@@ -324,7 +335,7 @@ def _done(results: list[ProductResult], r: ProductResult, item: RankedProduct) -
     append_run_log({
         "category": r.category, "rank": r.rank, "product_id": r.product_id, "name": r.name, "option": r.option,
         "fast_sales": r.fast_sales if r.fast_sales is not None else "",
-        "price_a": r.price_a or "", "price_b": r.price_b or "",
+        "price_a": r.price_a or "", "price_r": r.price_r or "", "price_b": r.price_b or "",
         "status": r.status, "detail": r.detail,
     })
     results.append(r)
@@ -335,11 +346,11 @@ def _judge_sales_and_bid(page: Page, r: ProductResult, stats: product_mod.SalesS
                          item: RankedProduct, settings: Settings, open_bids: "OpenBids | None") -> None:
     """거래량(stats)을 안 상태에서 상품명으로 이미 입찰 중인지 → 거래량 → 구매 페이지의 최신 B 로 마진 → 입찰 순으로 r.status/detail 을 채운다.
 
-    ONE SIZE 상품(r.option 비움)과 옵션 상품(r.option = 옵션 표기) 이 같은 순서를 쓴다. 가격은 시세 API 로 이미 한 번 걸렀고,
-    여기서는 입찰 직전에 구매 페이지에서 읽은 즉시 판매가로 B 를 다시 정해 한 번 더 판정한다 (A 는 시세 API 값).
+    ONE SIZE 상품(r.option 비움)과 옵션 상품(r.option = 옵션 표기) 이 같은 순서를 쓴다. 가격은 시세 API 로 이미 한 번 걸렀고(S = A),
+    여기서는 체결 표에서 읽은 R 을 넣고(S = min(A, R)) 입찰 직전에 구매 페이지에서 읽은 즉시 판매가로 B 를 다시 정해 한 번 더 판정한다 (A 는 시세 API 값).
     서버가 입찰을 거절하면(bid.BidRejected) 결과를 채운 뒤 다시 올린다 - 상품 단위 처리는 process_product.
     """
-    r.fast_sales, r.total_sales = stats.fast_in_window, stats.total_in_window
+    r.fast_sales, r.total_sales, r.price_r = stats.fast_in_window, stats.total_in_window, stats.recent_price
     try:
         if open_bids is not None and not settings.force:
             ob = open_bids.by_name(r.name, r.option or ONE_SIZE)
@@ -354,7 +365,7 @@ def _judge_sales_and_bid(page: Page, r: ProductResult, stats: product_mod.SalesS
         _open_buy_page(page, r, opt.label if r.option else ONE_SIZE, settings)
         reason = judge_margin(r, settings, price_limit=True)
         if reason and not settings.force:
-            r.status, r.detail = "건너뜀", f"{reason} (구매 페이지의 최신 B 로 다시 판정)"
+            r.status, r.detail = "건너뜀", f"{reason} (체결 표의 R 과 구매 페이지의 최신 B 로 다시 판정)"
             return
         _place_bid(page, r, settings)
     except product_mod.SkipProduct as e:
@@ -418,7 +429,7 @@ def _record_bid(r: ProductResult, fast_sales: int, settings: Settings, note: str
     save_bid(BidRecord(
         product_id=r.product_id, name=r.name, price=r.bid_price or 0, bid_days=settings.bid_days,
         placed_at=datetime.now().isoformat(timespec="seconds") + note,
-        fast_sales_30d=fast_sales, price_a=r.price_a or 0, price_b=r.price_b or 0,
+        fast_sales_30d=fast_sales, price_a=r.price_a or 0, price_r=r.price_r or 0, price_b=r.price_b or 0,
         option=r.option or ONE_SIZE, size=r.size or ONE_SIZE,
     ))
 

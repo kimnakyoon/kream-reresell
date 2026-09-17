@@ -421,7 +421,7 @@ def review_bid(context: BrowserContext, bid: OpenBid, settings: Settings) -> Pro
         append_run_log({
             "category": r.category, "rank": r.rank, "product_id": r.product_id, "name": r.name, "option": r.option,
             "fast_sales": r.fast_sales if r.fast_sales is not None else "",
-            "price_a": r.price_a or "", "price_b": r.price_b or "",
+            "price_a": r.price_a or "", "price_r": r.price_r or "", "price_b": r.price_b or "",
             "status": r.status, "detail": r.detail,
         })
         try:
