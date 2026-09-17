@@ -30,13 +30,19 @@ TIMEOUT_MS = 12_000             # 막히면 10초 홀드 뒤 끊기므로 그보
 PARALLEL_FETCH = 10             # 한 번에 이만큼 동시에 받는다 (순차보다 5배쯤 빠르다, [내역])
 HEADER_KEEP = ("authorization", "accept")
 
-# 주소 목록을 한 번에 받는다 (하나짜리 호출도 이걸로). 항목마다 {status, body, text} - 무응답 -2, 망 오류 -1
+# 요청 목록을 한 번에 보낸다 (하나짜리 호출도 이걸로). 요청마다 {url, method, body} - body 가 있으면 JSON 으로 보낸다 ([판매] 의 review_live·set_live).
+# 항목마다 {status, body, text} - 무응답 -2, 망 오류 -1
 _FETCH_MANY_JS = """
-async ([urls, headers, timeoutMs]) => Promise.all(urls.map(async (url) => {
+async ([reqs, headers, timeoutMs]) => Promise.all(reqs.map(async ({url, method, body: payload}) => {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const r = await fetch(url, { credentials: 'omit', headers, signal: ctl.signal });
+    const init = { method: method || 'GET', credentials: 'omit', headers, signal: ctl.signal };
+    if (payload !== undefined && payload !== null) {
+      init.headers = { ...headers, 'content-type': 'application/json' };
+      init.body = JSON.stringify(payload);
+    }
+    const r = await fetch(url, init);
     const text = await r.text();
     let body = null;
     try { body = JSON.parse(text); } catch (e) { body = null; }
@@ -165,13 +171,19 @@ class ApiClient:
         return ApiError(f"API 응답 오류 {status} ({path}): {res.get('text', '')[:200]}", status=status, kind="http")
 
     def _fetch(self, paths: list[str], retry: bool = True) -> list[dict | ApiError]:
-        """paths 를 한 번에 받는다 (PARALLEL_FETCH 개 이하). 항목마다 응답 dict 또는 ApiError.
-        인증이 끊긴 항목(401/403)은 헤더를 한 번만 다시 잡고 그 항목들만 한 번 더 받는다."""
-        self.calls += len(paths)
+        """GET 여러 개를 한 번에 받는다 (PARALLEL_FETCH 개 이하). 항목마다 응답 dict 또는 ApiError."""
+        return self._send([(p, "GET", None) for p in paths], retry)
+
+    def _send(self, reqs: list[tuple[str, str, dict | None]], retry: bool = True) -> list[dict | ApiError]:
+        """(경로, 메서드, JSON 본문) 요청들을 한 번에 보낸다. 항목마다 응답 dict 또는 ApiError.
+        인증이 끊긴 항목(401/403)은 헤더를 한 번만 다시 잡고 그 항목들만 한 번 더 보낸다 (POST 도 같다 - 가격 변경은 멱등이라 다시 보내도 된다)."""
+        self.calls += len(reqs)
+        paths = [p for p, _, _ in reqs]
         try:
-            results = self.page.evaluate(_FETCH_MANY_JS, [[self._url(p) for p in paths], self._request_headers(), TIMEOUT_MS])
+            results = self.page.evaluate(_FETCH_MANY_JS, [[{"url": self._url(p), "method": m, "body": b} for p, m, b in reqs],
+                                                          self._request_headers(), TIMEOUT_MS])
         except ApiError as e:
-            return [e] * len(paths)
+            return [e] * len(reqs)
         except Exception as e:  # noqa: BLE001
             return [ApiError(f"API 호출 실패 ({p}): {e}", kind="page") for p in paths]
         out: list[dict | ApiError] = []
@@ -187,13 +199,20 @@ class ApiClient:
         if redo:
             log.info("API 인증이 끊겨 헤더를 다시 잡습니다 (%d건)", len(redo))
             self.capture_headers()
-            for i, again in zip(redo, self._fetch([paths[i] for i in redo], retry=False)):
+            for i, again in zip(redo, self._send([reqs[i] for i in redo], retry=False)):
                 out[i] = again
         return out
 
     def get(self, path: str) -> dict:
         """GET 하나. 200 + JSON 객체면 그 객체, 아니면 ApiError."""
         result = self._fetch([path])[0]
+        if isinstance(result, ApiError):
+            raise result
+        return result
+
+    def post(self, path: str, body: dict) -> dict:
+        """POST 하나 (JSON 본문). 200 + JSON 객체면 그 객체, 아니면 ApiError. 응답 본문의 업무 오류(message 등)는 부르는 쪽이 본다."""
+        result = self._send([(path, "POST", body)])[0]
         if isinstance(result, ApiError):
             raise result
         return result

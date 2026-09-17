@@ -49,8 +49,9 @@ class ProductResult:
     price_r: int | None = None         # R = 최근 30일 안 빠른배송 체결 15건의 최저가 (product.SalesStats.recent_price). 체결 표를 읽기 전엔 None
     price_b: int | None = None         # B = 1순위가 되는 입찰가 (market.price_b: 즉시 판매가 + 1,000원, 내 입찰이 이미 1순위면 내 희망가)
     margin_min: float | None = None    # 이 상품(S 금액 구간)에 적용된 최소 마진율 (0.10 = 10%)
-    bid_price: int | None = None       # 입찰가 (= B)
+    bid_price: int | None = None       # 입찰가 (= B). [판매]에서는 처리 뒤 판매 희망가
     bid_days: int | None = None
+    buy_price: int | None = None       # [판매] 매입가 (수수료 포함 결제금액) - 하한의 기준
     time: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     @property
@@ -86,6 +87,15 @@ COLUMNS = [
 _COL = {title: i for i, (title, _) in enumerate(COLUMNS, start=1)}   # 제목 -> 열 번호
 _MONEY_COLS = [_COL[t] for t in ("A 빠른배송가", "R 최근체결가", "S 예상판매가", "B 1순위입찰가", "S−B", "입찰가")]
 
+# [판매] 보고서는 열이 다르다 (sell 머리글): 경쟁 최저가 / 매입가 / 하한 / 이전·새 판매가
+SELL_COLUMNS = [
+    ("회차", 8), ("순서", 6), ("상품명", 46), ("옵션", 9), ("상품ID", 10), ("판정", 10), ("사유 / 결과", 60),
+    ("경쟁 최저가", 12), ("매입가", 12), ("하한", 12), ("이전 판매가", 12), ("새 판매가", 12), ("하한 마진", 9),
+    ("처리시각", 20), ("링크", 40),
+]
+_SELL_COL = {title: i for i, (title, _) in enumerate(SELL_COLUMNS, start=1)}
+_SELL_MONEY_COLS = [_SELL_COL[t] for t in ("경쟁 최저가", "매입가", "하한", "이전 판매가", "새 판매가")]
+
 STATUS_FILL = {
     "입찰완료": "C6EFCE",
     "입찰대상": "FFEB9C",
@@ -97,6 +107,9 @@ STATUS_FILL = {
     "확인필요": "F8CBAD",
     "오류": "FFC7CE",
     "중단": "FFC7CE",
+    "가격변경": "C6EFCE",
+    "하한대기": "DDEBF7",
+    "유지": "FFFFFF",
 }
 
 BID_LEGEND = ("판정: 입찰완료 = 실제 입찰됨 / 입찰대상 = dry-run에서 조건 충족 / "
@@ -109,7 +122,11 @@ REBID_LEGEND = ("판정: 변경완료 = 밀린 입찰의 희망가를 B(즉시 �
                 "취소대상 = dry-run에서 지울 대상 / 변경안함 = 기준은 충족하나 A 가 상품 금액 상한을 넘어 그대로 둠 / "
                 "변경못함 = 희망가·옵션을 못 읽어 변경 화면까지 못 감 / 확인필요 = 판단 불가 또는 올렸는지 불확실 - 마이페이지에서 확인. "
                 "랭킹 열 = 몇 번째 사이클인지, 입찰가 열 = 처리 뒤 내 희망가")
-LEGENDS = {"입찰": BID_LEGEND, "입찰취소": CANCEL_LEGEND, "재입찰": REBID_LEGEND}
+SELL_LEGEND = ("판정: 가격변경 = 판매 희망가를 바꿈 (경쟁 최저가 − 1,000원, 하한 위) / 변경대상 = dry-run에서 바꿀 조건 충족 / "
+               "유지 = 내가 최저가이거나 바꿀 이유 없음 / 하한대기 = 경쟁 최저가가 하한 아래라 하한에 걸어 두고 기다림 / "
+               "건너뜀 = 매입 내역이 없어 하한을 못 정함 / 확인필요 = 시세를 못 읽었거나 사이트가 변경을 거절 - 마이페이지 보관 판매에서 확인. "
+               "하한 = 매입가 × (1 + 하한 마진) ÷ (1 − 판매 수수료율), 1,000원 단위 올림")
+LEGENDS = {"입찰": BID_LEGEND, "입찰취소": CANCEL_LEGEND, "재입찰": REBID_LEGEND, "판매": SELL_LEGEND}
 
 
 def summarize(results: list[ProductResult], unit: str = "건", empty: str = "처리한 상품 없음") -> str:
@@ -142,6 +159,25 @@ _SECTION_FILL = PatternFill("solid", fgColor="BDD7EE")
 _STATUS_FILLS = {st: PatternFill("solid", fgColor=color) for st, color in STATUS_FILL.items()}   # 셀마다 새로 만들지 않게
 
 
+def _write_sell_row(ws, i: int, r: ProductResult) -> None:
+    values = [
+        r.category, r.rank, r.name, r.option or None, r.product_id, r.status, r.detail,
+        r.price_a, r.buy_price, r.price_r, r.price_b, r.bid_price, r.margin_min, r.time, r.url,
+    ]
+    for col, v in enumerate(values, start=1):
+        ws.cell(row=i, column=col, value=v)
+    for col in _SELL_MONEY_COLS:
+        ws.cell(row=i, column=col).number_format = "#,##0"
+    ws.cell(row=i, column=_SELL_COL["하한 마진"]).number_format = "0.0%"
+    link = ws.cell(row=i, column=_SELL_COL["링크"])
+    link.hyperlink = r.url
+    link.font = Font(color="0563C1", underline="single")
+    fill = _STATUS_FILLS.get(r.status)
+    if fill:
+        for col in range(1, len(SELL_COLUMNS) + 1):
+            ws.cell(row=i, column=col).fill = fill
+
+
 def _write_row(ws, i: int, r: ProductResult) -> None:
     values = [
         r.category, r.rank, r.name, r.option or None, r.product_id, r.status, r.detail,
@@ -166,7 +202,7 @@ def _write_row(ws, i: int, r: ProductResult) -> None:
 
 def write_report(results: list[ProductResult], settings_line: str, mode: str,
                  path: Path | None = None, kind: str = "입찰", section_label: str | None = None) -> Path:
-    """kind 는 파일 이름과 판정 설명에 쓴다: '입찰' / '입찰취소' / '재입찰'.
+    """kind 는 파일 이름과 판정 설명에 쓴다: '입찰' / '입찰취소' / '재입찰' / '판매' (판매는 열 구성이 다르다 - SELL_COLUMNS).
     section_label 을 주면 (재입찰: '회차') 결과 시트에서 랭킹 열 값이 바뀌는 곳마다 구분 줄(이름·시각·요약)을 넣고
     요약 시트의 구간 표 머리글에 쓴다 - 한 파일에 여러 회차가 쌓이는 재입찰용 (사용자 요청 2026-09-13)."""
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -184,9 +220,11 @@ def write_report(results: list[ProductResult], settings_line: str, mode: str,
     ws["A4"].font = Font(color="666666", size=9)
 
     header_row = 6
+    columns = SELL_COLUMNS if kind == "판매" else COLUMNS
+    write_row = _write_sell_row if kind == "판매" else _write_row
     bold = Font(bold=True, color="FFFFFF")
     head_fill = PatternFill("solid", fgColor="222222")
-    for col, (title, width) in enumerate(COLUMNS, start=1):
+    for col, (title, width) in enumerate(columns, start=1):
         c = ws.cell(row=header_row, column=col, value=title)
         c.font = bold
         c.fill = head_fill
@@ -200,12 +238,12 @@ def write_report(results: list[ProductResult], settings_line: str, mode: str,
             # 구분 줄: 셀을 합치지 않는다 (합치면 엑셀에서 필터 정렬이 막힘). 오른쪽 셀이 비어 있어 글이 그대로 넘쳐 보인다
             i += 1
             ws.cell(row=i, column=1, value=f"▶ {section_title(name, rs)}").font = _BOLD
-            for col in range(1, len(COLUMNS) + 1):
+            for col in range(1, len(columns) + 1):
                 ws.cell(row=i, column=col).fill = _SECTION_FILL
         for r in rs:
             i += 1
-            _write_row(ws, i, r)
-    ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(COLUMNS))}{max(i, header_row + 1)}"
+            write_row(ws, i, r)
+    ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(columns))}{max(i, header_row + 1)}"
 
     # 요약 시트: 판정별 합계 + 랭킹(재입찰은 회차)별 판정 수. 한 번 세어 두고 조회만 한다 (100회차 재입찰이면 수천 줄)
     ss = wb.create_sheet("요약")

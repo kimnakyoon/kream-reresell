@@ -15,7 +15,7 @@ from playwright.sync_api import Page, sync_playwright
 
 from datetime import datetime
 
-from . import auth, cancel, history, history_report, pacing, pipeline, ranking, rebid, report, search, shop, store
+from . import auth, cancel, history, history_report, pacing, pipeline, ranking, rebid, report, search, sell, shop, store
 from .api import ApiClient
 from .browser import real_chrome_context
 from .config import Settings
@@ -331,6 +331,71 @@ def run_cancel_job(settings: Settings,
     path = report.write_report(results, settings_line, mode, kind="입찰취소")
     log.info("엑셀 보고서: %s", path)
     return JobResult(results=results, report_path=path, mode=mode)
+
+
+def describe_sell_settings(settings: Settings) -> str:
+    return (f"판매 기준: 보관 판매(입찰중·판매대기) 항목마다 구매 내역에서 매입가(수수료 포함)를 찾아 "
+            f"하한 = 매입가 × (1 + {settings.sell_margin_rate * 100:g}%) ÷ (1 − 판매 수수료율) 을 1,000원 단위로 올림. "
+            f"시세 API 로 빠른배송 최저가를 읽어 목표가 = max(하한, 최저가 − {sell.STEP:,}원) 으로 판매 희망가를 바꿈 (review_live → set_live). "
+            f"최저가가 내 가격과 같으면 {'잠깐 올려 2등을 확인(탐침)' if settings.sell_probe else '그대로 둠'}. "
+            f"시세 조회 간격 {settings.api_tick_sec:g}초, 사이클 사이 {sell.CYCLE_GAP_SEC}초, "
+            f"{'중지할 때까지 반복' if not settings.sell_cycles else f'{settings.sell_cycles}회 돌고 끝'}")
+
+
+def run_sell_job(settings: Settings,
+                 should_stop: Callable[[], bool] | None = None,
+                 on_result: Callable[[ProductResult], None] | None = None,
+                 on_status: Callable[[str], None] | None = None,
+                 max_cycles: int | None = None) -> JobResult:
+    """[판매]: 보관 판매 항목의 희망가를 하한(매입가 + 마진) 위에서 최저가 경쟁으로 맞춘다 (sell 머리글). 보고서는 사이클마다 덮어쓴다."""
+    settings.validate()
+    if max_cycles is None:
+        max_cycles = settings.sell_cycles or None
+    else:
+        settings.sell_cycles = max_cycles
+    mode = describe_mode(settings, "판매")
+    settings_line = describe_sell_settings(settings)
+    log.info("%s | %s", mode, settings_line)
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    path = REPORT_DIR / f"KREAM 판매결과 {datetime.now():%Y-%m-%d %H%M}.xlsx"
+    results: list[ProductResult] = []
+
+    def write(p: Path) -> Path:
+        try:
+            return report.write_report(results, settings_line, mode, path=p, kind="판매", section_label="회차")
+        except PermissionError:
+            alt = p.with_name(f"{p.stem} ({datetime.now():%H%M%S}){p.suffix}")
+            log.warning("보고서가 열려 있어 다른 이름으로 저장: %s", alt)
+            return report.write_report(results, settings_line, mode, path=alt, kind="판매", section_label="회차")
+
+    def collect(r: ProductResult) -> None:
+        results.append(r)
+        if on_result:
+            on_result(r)
+
+    def cycle_done(_cycle: int, _rs: list[ProductResult]) -> None:
+        nonlocal path
+        path = write(path)
+
+    try:
+        with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images, trim_api=settings.trim_api,
+                                                            show_chrome=settings.show_chrome) as context:
+            page = context.pages[0] if context.pages else context.new_page()
+            auth.ensure_logged_in(page, settings)
+            sell.run(context, page, settings, should_stop=should_stop, on_result=collect,
+                     on_status=on_status, on_cycle=cycle_done, max_cycles=max_cycles)
+    except KeyboardInterrupt:
+        log.info("Ctrl+C 로 중지")
+    finally:
+        try:
+            path = write(path)
+            log.info("엑셀 보고서: %s", path)
+        except Exception:  # noqa: BLE001
+            log.exception("보고서 저장 실패")
+
+    log.info("==== 판매 결과: %s ====%s", report.summarize(results, empty="처리한 항목 없음"),
+             "".join(f"\n  {line}" for line in report.section_lines(results)))
+    return JobResult(results=results, report_path=path, mode=mode, section_label="회차")
 
 
 def describe_rebid_settings(settings: Settings) -> str:

@@ -39,7 +39,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from kream_reresell import browser, pacing  # noqa: E402
-from kream_reresell.app import normalize_keywords, run_cancel_job, run_history_job, run_job, run_rebid_job  # noqa: E402
+from kream_reresell.app import normalize_keywords, run_cancel_job, run_history_job, run_job, run_rebid_job, run_sell_job  # noqa: E402
 from kream_reresell.config import LOG_DIR, RULES_PATH, Settings  # noqa: E402
 from kream_reresell.ranking import ALL_CATEGORIES, DEFAULT_CATEGORY  # noqa: E402
 from kream_reresell.report import REPORT_DIR, section_lines, summarize  # noqa: E402
@@ -209,6 +209,12 @@ class App:
         self.rebid_cycles.insert(0, str(self.base.rebid_cycles))
         self.rebid_cycles.pack(side="left", padx=(6, 0))
         tk.Label(row_rebid, text="(0 = [중지]까지 계속)", fg="#888").pack(side="left", padx=(6, 0))
+        tk.Label(row_rebid, text="판매 하한 마진(%)").pack(side="left", padx=(18, 0))
+        self.sell_margin = tk.Spinbox(row_rebid, from_=0, to=99, increment=1, width=5)
+        self.sell_margin.delete(0, "end")
+        self.sell_margin.insert(0, f"{self.base.sell_margin_rate * 100:g}")
+        self.sell_margin.pack(side="left", padx=(6, 0))
+        tk.Label(row_rebid, text="(하한 = 매입가 × (1 + 이 %), 그 아래로는 안 내림)", fg="#888").pack(side="left", padx=(6, 0))
         tk.Label(row_rebid, text="시세 조회 간격(초)").pack(side="left", padx=(18, 0))
         self.api_tick = tk.Spinbox(row_rebid, from_=int(pacing.API_TICK_MIN_SEC), to=int(pacing.API_TICK_MAX_SEC), width=5)
         self.api_tick.delete(0, "end")
@@ -250,6 +256,7 @@ class App:
         self.cancel_button = big_button("입찰취소", "#8B0000", "#B22222", self.start_cancel)
         self.rebid_button = big_button("재입찰", "#B36B00", "#D98C1F", self.start_rebid)
         self.history_button = big_button("내역", "#1F4E79", "#2E75B6", self.start_history)
+        self.sell_button = big_button("판매", "#2E7D32", "#43A047", self.start_sell)
         self.stop_button = tk.Button(buttons, text="중지 (지금 것까지만)", width=18, height=2, state="disabled",
                                      command=self.request_stop)
         self.stop_button.pack(side="left", padx=(8, 0))
@@ -599,6 +606,55 @@ class App:
             logging.getLogger("gui").exception("재입찰 중 오류")
             self.q.put(("error", f"{type(e).__name__}: {e}"))
 
+    def start_sell(self) -> None:
+        """[판매]: 보관 판매 항목의 희망가를 하한(매입가 + 마진) 위에서 최저가 경쟁으로 맞춘다 ([중지] 까지 반복)."""
+        if self.worker and self.worker.is_alive():
+            return
+        try:
+            margin = float(self.sell_margin.get()) / 100.0
+        except ValueError:
+            messagebox.showerror("입력 오류", "판매 하한 마진은 숫자(%)로 넣어주세요.")
+            return
+        if not 0 <= margin < 1:
+            messagebox.showerror("입력 오류", "판매 하한 마진은 0 이상 100 미만(%)이어야 합니다.")
+            return
+        tick = self._read_tick_sec()
+        if tick is None:
+            return
+        rules = self._apply_rules()
+        if rules is None:
+            return
+        dry = self.mode.get() == "dry"
+        if not dry and not messagebox.askyesno(
+                "판매", "마이페이지 > 보관 판매의 입찰중·판매대기 항목을 순서대로 보며, 항목마다 구매 내역에서 매입가(수수료 포함)를 찾아\n"
+                      f"하한 = 매입가 × (1 + {margin * 100:g}%) 을 정하고, 시세 API 로 빠른배송 최저가를 읽어\n"
+                      "판매 희망가를 max(하한, 최저가 − 1,000원) 으로 실제로 바꿉니다 (하한 아래로는 절대 안 내림).\n"
+                      "최저가가 내 가격과 같으면 잠깐 올려 2등 가격을 확인한 뒤 2등 − 1,000원으로 둡니다.\n\n"
+                      "※ No1 Seller Center 의 최저가 경쟁이 같은 항목에 켜져 있으면 서로 가격을 바꿉니다 - 그쪽 경쟁을 끄고 실행하세요.\n"
+                      "매입 내역을 못 찾는 항목(수동 구매)은 건드리지 않습니다.\n\n"
+                      "[중지] 를 누를 때까지 반복합니다.\n\n진행할까요?"):
+            return
+        settings = self._make_settings(dry, rules, tick)
+        settings.sell_margin_rate = margin
+        settings.sell_cycles = 0
+        self.stop_flag.clear()
+        self.last_report = None
+        self.open_report_button.configure(state="disabled")
+        self._set_busy(True, "판매 실행 중...")
+        self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 판매 시작: 하한 마진 {margin * 100:g}%, "
+                  f"{'판단만' if dry else '판매 희망가를 실제로 바꿈'}, [중지]까지 반복 =====")
+        self.worker = threading.Thread(target=self._sell_worker, args=(settings,), daemon=True)
+        self.worker.start()
+
+    def _sell_worker(self, settings: Settings) -> None:
+        try:
+            job = run_sell_job(settings, should_stop=self.stop_flag.is_set,
+                               on_status=lambda text: self.q.put(("status", text)))
+            self.q.put(("done", job))
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger("gui").exception("판매 중 오류")
+            self.q.put(("error", f"{type(e).__name__}: {e}"))
+
     def start_history(self) -> None:
         """[내역]: 달을 고르면 보관 판매 거래일시가 그 달인 판매를 구매 내역과 짝지어 엑셀로 저장한다."""
         if self.worker and self.worker.is_alive():
@@ -684,6 +740,7 @@ class App:
         self.cancel_button.configure(state="disabled" if busy else "normal")
         self.rebid_button.configure(state="disabled" if busy else "normal")
         self.history_button.configure(state="disabled" if busy else "normal")
+        self.sell_button.configure(state="disabled" if busy else "normal")
         self.stop_button.configure(state="normal" if busy else "disabled")
         self.status.configure(text=text or ("대기 중" if not busy else ""))
 

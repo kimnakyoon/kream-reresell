@@ -60,6 +60,12 @@ class Settings:
     api_tick_sec: float = field(default_factory=lambda: _float("API_TICK_SEC", pacing.API_TICK_SEC))
     # [재입찰] 몇 사이클 돌고 끝낼지 (GUI "재입찰 횟수" 칸의 기본값). 0 이면 [중지]/Ctrl+C 까지 계속
     rebid_cycles: int = field(default_factory=lambda: _int("REBID_CYCLES", 1))
+    # [판매] 하한 마진율 - 하한 = 매입가(수수료 포함) × (1 + 이 값) ÷ (1 − 판매 수수료율). 기본 5% (사용자 결정 2026-09-17). GUI "하한 마진" 칸
+    sell_margin_rate: float = field(default_factory=lambda: _float("SELL_MARGIN_RATE", 0.05))
+    # [판매] 몇 사이클 돌고 끝낼지. 0 이면 [중지]/Ctrl+C 까지 계속 (기본 - 판매는 계속 도는 것이 보통)
+    sell_cycles: int = field(default_factory=lambda: _int("SELL_CYCLES", 0))
+    # [판매] 최저가가 내 가격과 같을 때 잠깐 올려 2등 가격을 읽는 탐침 (sell 머리글 4). 끄면 그대로 둔다
+    sell_probe: bool = field(default_factory=lambda: _bool("SELL_PROBE", True))
     # 이미지/동영상/폰트를 받지 않아 페이지를 빨리 띄운다. 화면 확인이 필요하면 .env 에 BLOCK_IMAGES=0
     block_images: bool = field(default_factory=lambda: _bool("BLOCK_IMAGES", True))
     # 사이트 스로틀(IP 단위) 대응 - pacing 참고. 10분 창 안에 상품 API(sales 등) 요청을 이만큼까지만 보내고 넘으면 쉰다.
@@ -92,4 +98,8 @@ class Settings:
                              f"(사이트 차단 방지): {self.api_tick_sec:g}")
         if self.rebid_cycles < 0:
             raise ValueError(f"재입찰 횟수는 0(계속) 또는 1 이상이어야 합니다: {self.rebid_cycles}")
+        if self.sell_cycles < 0:
+            raise ValueError(f"판매 반복 횟수는 0(계속) 또는 1 이상이어야 합니다: {self.sell_cycles}")
+        if not 0 <= self.sell_margin_rate < 1:
+            raise ValueError(f"판매 하한 마진율은 0 이상 1 미만이어야 합니다: {self.sell_margin_rate}")
         self.rules.validate()
