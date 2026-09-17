@@ -1,9 +1,12 @@
 """판매 관리 창 - GUI [판매] 를 누르면 뜨는 tkinter 창 (No1 Seller Center 의 보관관리 화면을 본떠 필요한 것만, 사용자 요청 2026-09-17).
 
 구성:
-  위 줄: [새로고침] · 보기(전체/입찰중/판매대기) · 하한 마진(%) · [선택 행 하한을 매입가로] · [경쟁 등록] [경쟁 해제] · [경쟁 시작] [정지] · 상태
-  표: 순번 / 제품명 / 옵션 / 상태 / 판매 희망가 / 경쟁 최저가 / 매입가 / 하한 / 경쟁 / 처리 결과 / 시각
-      - 하한 칸을 두 번 누르면 직접 고친다. 경쟁 칸을 두 번 누르면 켜고 끈다. 여러 행을 골라 [경쟁 등록]/[해제].
+  위 줄: [새로고침] · [전체 선택] [선택 해제] · 보기(전체/입찰중/판매대기) · 하한 마진(%) · [판매 하한가 다시 계산] (체크한 행, 없으면 전부: 매입가 × 마진) ·
+         보관 N일부터 하한 없이 경쟁 · [경쟁 등록] [경쟁 해제] · [경쟁 시작] [정지] · 상태
+  표: 선택(☐/☑) / 순번 / 제품명 / 옵션 / 상태 / 보관일수 / 판매 희망가 / 경쟁 최저가 / 매입가 / 판매 하한가 / 경쟁 / 처리 결과 / 시각
+      - 선택 칸을 누르면 체크. [전체 선택]/[선택 해제]. 체크한 행에 [경쟁 등록]/[해제]/[판매 하한가 다시 계산] 이 적용된다.
+      - 판매 하한가 칸을 두 번 누르면 직접 고친다. 경쟁 칸을 두 번 누르면 켜고 끈다.
+      - 보관 일수가 '보관 N일부터 하한 없이' 를 넘긴 행은 주황 배경, 경쟁 칸 '자동' - 등록과 관계없이 하한 없이 경쟁한다 (sell 머리글 4).
   아래: 가격 로그 (판정 결과가 쌓인다)
 동작은 sell.SellEngine (작업 스레드가 크롬을 붙들고 명령 큐로 움직임). 창을 닫으면 경쟁을 멈추고 크롬을 닫고, 결과가 있으면 엑셀 보고서를 남긴다.
 항목별 하한·경쟁 여부는 data/sell_rules.json 에 저장되어 다음에 창을 열어도 남는다.
@@ -26,11 +29,13 @@ log = logging.getLogger(__name__)
 
 FONT = ("맑은 고딕", 9)
 COLUMNS = [
-    ("no", "순번", 44, "center"), ("name", "제품명", 330, "w"), ("option", "옵션", 90, "center"), ("status", "상태", 64, "center"),
-    ("price", "판매 희망가", 88, "e"), ("lowest", "경쟁 최저가", 88, "e"), ("buy", "매입가", 84, "e"), ("floor", "하한", 84, "e"),
-    ("compete", "경쟁", 48, "center"), ("result", "처리 결과", 300, "w"), ("time", "시각", 60, "center"),
+    ("check", "선택", 40, "center"), ("no", "순번", 40, "center"), ("name", "제품명", 300, "w"), ("option", "옵션", 84, "center"),
+    ("status", "상태", 60, "center"), ("days", "보관일수", 62, "center"),
+    ("price", "판매 희망가", 86, "e"), ("lowest", "경쟁 최저가", 86, "e"), ("buy", "매입가", 82, "e"), ("floor", "판매 하한가", 90, "e"),
+    ("compete", "경쟁", 48, "center"), ("result", "처리 결과", 280, "w"), ("time", "시각", 56, "center"),
 ]
-WIDTH, HEIGHT = 1280, 740
+WIDTH, HEIGHT = 1360, 760
+CHECKED, UNCHECKED = "☑", "☐"
 
 
 def _won(v: int | None) -> str:
@@ -45,6 +50,7 @@ class SellWindow:
         self.q: queue.Queue = queue.Queue()
         self.items: list[sell.StockItem] = []
         self.last: dict[int, tuple[int | None, str, str]] = {}   # 보관번호 → (경쟁 최저가, 처리 결과, 시각)
+        self.checked: set[int] = set()                            # 선택 칸을 체크한 보관번호
         self.running = False
         self.closing = False
         self.engine = sell.SellEngine(settings, self.rules, lambda kind, payload: self.q.put((kind, payload)))
@@ -69,6 +75,8 @@ class SellWindow:
         bar.pack(fill="x", padx=10, pady=(10, 4))
         self.refresh_button = tk.Button(bar, text="새로고침", width=9, command=lambda: self.engine.request("refresh"))
         self.refresh_button.pack(side="left")
+        tk.Button(bar, text="전체 선택", command=lambda: self._check_all(True)).pack(side="left", padx=(8, 0))
+        tk.Button(bar, text="선택 해제", command=lambda: self._check_all(False)).pack(side="left", padx=(4, 0))
         tk.Label(bar, text="보기:", font=FONT).pack(side="left", padx=(14, 2))
         self.view = tk.StringVar(value="all")
         for text, value in (("전체", "all"), ("입찰중", "live"), ("판매대기", "in_storage")):
@@ -78,7 +86,14 @@ class SellWindow:
         self.margin.delete(0, "end")
         self.margin.insert(0, f"{self.settings.sell_margin_rate * 100:g}")
         self.margin.pack(side="left")
-        tk.Button(bar, text="선택 행 하한을 매입가로", command=self._floor_from_buy).pack(side="left", padx=(6, 0))
+        tk.Button(bar, text="판매 하한가 다시 계산", command=self._floor_from_buy).pack(side="left", padx=(6, 0))
+        tk.Label(bar, text="보관", font=FONT).pack(side="left", padx=(14, 2))
+        self.free_after = tk.Spinbox(bar, from_=1, to=30, width=3, command=self._apply_free_after)
+        self.free_after.delete(0, "end")
+        self.free_after.insert(0, str(self.settings.sell_free_after_days + 1))
+        self.free_after.pack(side="left")
+        self.free_after.bind("<FocusOut>", lambda _e: self._apply_free_after())
+        tk.Label(bar, text="일부터 하한 없이 경쟁", font=FONT).pack(side="left", padx=(2, 0))
         tk.Button(bar, text="경쟁 등록", command=lambda: self._set_compete(True)).pack(side="left", padx=(14, 0))
         tk.Button(bar, text="경쟁 해제", command=lambda: self._set_compete(False)).pack(side="left", padx=(4, 0))
         self.start_button = tk.Button(bar, text="경쟁 시작", width=9, bg="#2E7D32", fg="white", activebackground="#43A047",
@@ -88,8 +103,10 @@ class SellWindow:
         self.stop_button.pack(side="left", padx=(4, 0))
         self.status = tk.Label(bar, text="크롬 여는 중...", fg="#555", font=FONT, anchor="w")
         self.status.pack(side="left", padx=(14, 0), fill="x", expand=True)
-        hint = tk.Label(top, text="하한 = 매입가 × (1 + 하한 마진) ÷ (1 − 판매 수수료). 경쟁은 하한 위에서만 경쟁 최저가 − 1,000원으로 맞춥니다. "
-                                  "하한 칸 두 번 누름 = 직접 입력, 경쟁 칸 두 번 누름 = 켜기/끄기. "
+        hint = tk.Label(top, text="판매 하한가 = 이 프로그램이 내리는 최저선 (즉시 판매가와 무관) = 매입가 × (1 + 하한 마진) ÷ (1 − 판매 수수료). "
+                                  "경쟁은 그 위에서만 경쟁 최저가 − 1,000원으로 맞춥니다. 빨간 글씨 = 지금 판매 희망가가 판매 하한가보다 낮음, 회색 = 매입 내역이 없어 하한 없음, "
+                                  "주황 배경 = 보관 기한이 지나 하한 없이 자동 경쟁 (창고 보관료는 첫 30일만 무료). "
+                                  "선택 칸 누름 = 체크, 판매 하한가 칸 두 번 누름 = 직접 입력, 경쟁 칸 두 번 누름 = 켜기/끄기. "
                                   f"시세 조회 간격 {self.settings.api_tick_sec:g}초, 사이클 사이 {sell.CYCLE_GAP_SEC}초. "
                                   "※ No1 Seller Center 의 최저가 경쟁은 같은 항목에서 꺼 두세요.",
                         fg="#777", font=("맑은 고딕", 8), anchor="w", justify="left", wraplength=WIDTH - 40)
@@ -110,9 +127,11 @@ class SellWindow:
         self.tree.pack(side="left", fill="both", expand=True)
         ys.pack(side="right", fill="y")
         self.tree.tag_configure("compete", background="#E8F5E9")
+        self.tree.tag_configure("free", background="#FFE0B2")       # 보관 기한 지나 하한 없이 자동 경쟁
         self.tree.tag_configure("below", foreground="#B00020")      # 지금 가격이 하한 아래
         self.tree.tag_configure("nofloor", foreground="#888888")    # 하한 없음
         self.tree.bind("<Double-1>", self._on_double_click)
+        self.tree.bind("<Button-1>", self._on_click)
 
     def _build_log(self, top: tk.Toplevel) -> None:
         frame = tk.LabelFrame(top, text="가격 로그")
@@ -139,25 +158,62 @@ class SellWindow:
                 continue
             rule = self.rules.get(item.ask_id) or sell.SellRule()
             lowest, result, when = self.last.get(item.ask_id, (None, "", ""))
+            free = item.is_free_mode(self.settings)
             tags = []
-            if rule.compete:
+            if free:
+                tags.append("free")
+            elif rule.compete:
                 tags.append("compete")
             if rule.floor is None:
                 tags.append("nofloor")
-            elif item.price < rule.floor:
+            elif item.price < rule.floor and not free:
                 tags.append("below")
+            days = item.stored_days
             self.tree.insert("", "end", iid=str(item.ask_id), tags=tags, values=(
-                n, item.name, item.option if not item.is_one_size else "", item.status_text,
+                CHECKED if item.ask_id in self.checked else UNCHECKED,
+                n, item.name, item.option if not item.is_one_size else "", item.status_text, f"{days}일" if days else "?",
                 _won(item.price), _won(lowest), _won(item.buy_price), _won(rule.floor) or "(없음)",
-                "●" if rule.compete else "", result, when,
+                "자동" if free else ("●" if rule.compete else ""), result, when,
             ))
         keep = [str(a) for a in selected if self.tree.exists(str(a))]
         if keep:
             self.tree.selection_set(keep)
 
     def _selected_items(self) -> list[sell.StockItem]:
-        ids = {int(i) for i in self.tree.selection()}
+        """체크한 행. 하나도 체크하지 않았으면 파란 선택(클릭한 행)으로 대신한다."""
+        ids = self.checked or {int(i) for i in self.tree.selection()}
         return [i for i in self.items if i.ask_id in ids]
+
+    def _check_all(self, on: bool) -> None:
+        shown = {int(i) for i in self.tree.get_children()}
+        self.checked = (self.checked | shown) if on else (self.checked - shown)
+        self._render()
+
+    def _on_click(self, event) -> str | None:
+        """선택 칸을 누르면 체크를 바꾼다 (다른 칸은 기본 동작)."""
+        if self.tree.identify_region(event.x, event.y) != "cell" or self.tree.identify_column(event.x) != "#1":
+            return None
+        row = self.tree.identify_row(event.y)
+        if row:
+            self._toggle_check(int(row))
+        return "break"
+
+    def _toggle_check(self, ask_id: int) -> None:
+        """선택 칸 체크를 켜고 끈다 (같은 칸을 다시 누르면 해제)."""
+        self.checked.symmetric_difference_update({ask_id})
+        row = str(ask_id)
+        if self.tree.exists(row):
+            self.tree.set(row, "check", CHECKED if ask_id in self.checked else UNCHECKED)
+
+    def _apply_free_after(self) -> None:
+        try:
+            day = int(self.free_after.get())
+        except ValueError:
+            return
+        if day < 1:
+            return
+        self.settings.sell_free_after_days = day - 1
+        self._render()
 
     def _on_double_click(self, event) -> None:
         row = self.tree.identify_row(event.y)
@@ -168,9 +224,13 @@ class SellWindow:
         item = next((i for i in self.items if str(i.ask_id) == row), None)
         if item is None:
             return
+        if key == "check":
+            # 빠르게 두 번 누르면 Button-1 이 두 번(켬→끔) 온 뒤 여기로 온다 - 한 번 더 바꿔 두 번 누름도 한 번 누른 것과 같게
+            self._toggle_check(item.ask_id)
+            return
         rule = self.rules.setdefault(item.ask_id, sell.SellRule())
         if key == "floor":
-            value = simpledialog.askinteger("하한", f"{item.label}\n\n하한(원, 이 아래로는 안 내림)을 넣어주세요.\n"
+            value = simpledialog.askinteger("판매 하한가", f"{item.label}\n\n판매 하한가(원, 이 아래로는 안 내림)를 넣어주세요.\n"
                                                     f"매입가 {_won(item.buy_price) or '모름'} / 지금 판매가 {item.price:,}",
                                             parent=self.top, initialvalue=rule.floor or item.price, minvalue=1000)
             if value:
@@ -178,7 +238,7 @@ class SellWindow:
                 self._save()
         elif key == "compete":
             if not rule.compete and rule.floor is None:
-                messagebox.showwarning("경쟁 등록", "하한이 없는 항목은 경쟁에 넣을 수 없습니다. 하한 칸을 두 번 눌러 넣거나 [선택 행 하한을 매입가로] 를 쓰세요.", parent=self.top)
+                messagebox.showwarning("경쟁 등록", "하한이 없는 항목은 경쟁에 넣을 수 없습니다. 하한 칸을 두 번 눌러 넣거나 [하한 다시 계산] 을 쓰세요.", parent=self.top)
                 return
             rule.compete = not rule.compete
             self._save()
@@ -204,7 +264,7 @@ class SellWindow:
     def _set_compete(self, on: bool) -> None:
         items = self._selected_items()
         if not items:
-            messagebox.showinfo("경쟁 등록" if on else "경쟁 해제", "표에서 행을 먼저 골라주세요 (Ctrl/Shift 로 여러 행).", parent=self.top)
+            messagebox.showinfo("경쟁 등록" if on else "경쟁 해제", "표의 선택 칸을 눌러 행을 먼저 체크해 주세요 ([전체 선택] 도 됩니다).", parent=self.top)
             return
         skipped = 0
         for item in items:
@@ -222,12 +282,15 @@ class SellWindow:
 
     # ------------------------------------------------------------ 경쟁
     def _start(self) -> None:
-        targets = [i for i in self.items if (self.rules.get(i.ask_id) or sell.SellRule()).compete]
+        self._apply_free_after()
+        free = [i for i in self.items if i.is_free_mode(self.settings)]
+        targets = [i for i in self.items if self.engine.is_target(i)]
         if not targets:
-            messagebox.showinfo("경쟁 시작", "경쟁에 넣은 항목이 없습니다. 행을 고르고 [경쟁 등록] 을 누르세요.", parent=self.top)
+            messagebox.showinfo("경쟁 시작", "경쟁에 넣은 항목이 없습니다. 행을 체크하고 [경쟁 등록] 을 누르세요.", parent=self.top)
             return
         if not self.settings.dry_run and not messagebox.askyesno(
-                "경쟁 시작", f"경쟁에 넣은 {len(targets)}건의 판매 희망가를 실제로 바꿉니다 (하한 위에서 경쟁 최저가 − 1,000원).\n\n"
+                "경쟁 시작", f"경쟁에 넣은 {len(targets)}건의 판매 희망가를 실제로 바꿉니다 (하한 위에서 경쟁 최저가 − 1,000원).\n"
+                            f"그중 보관 {self.settings.sell_free_after_days + 1}일째 이상인 {len(free)}건은 하한 없이 경쟁합니다.\n\n"
                             "※ No1 Seller Center 의 최저가 경쟁이 이 항목들에 켜져 있으면 서로 가격을 바꿉니다 - 꺼져 있는지 확인하세요.\n\n"
                             "시작할까요?", parent=self.top):
             return

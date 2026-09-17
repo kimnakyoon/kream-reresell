@@ -19,6 +19,9 @@
        실행 시작 때 가격의 PROBE_CEILING 배까지만 (경쟁자가 아예 없는 상품이 끝없이 오르지 않게).
      - A 가 없거나(빠른배송 판매자 없음 - 판매대기 항목은 내 것이 시세에 안 잡힌다) 내 가격보다 높으면 → 목표가 = max(하한, A − 1,000) (A 없으면 max(하한, 내 가격)).
      - 내 가격이 하한 아래면 어떤 경우든 하한으로 올린다.
+     - **보관 일수가 settings.sell_free_after_days(15) 를 넘긴 항목(16일째부터)은 하한 없이** 위 규칙을 돈다 (창고 보관료가 첫 30일만 무료라 그 안에 팔려고 -
+       사용자 결정 2026-09-17, No1 의 최저가 경쟁과 같음). 보관 시작일은 목록의 date_shipment_available(입고 완료 시각). 판매 관리 창에서는
+       이런 항목은 경쟁 등록과 관계없이 자동으로 경쟁 대상이 된다 (표의 경쟁 칸에 '자동').
   5. 가격 변경은 No1 과 같은 경로: `POST /api/seller/inventory/actions/review_live` (견적 - 응답 items[].review.processing_fee.value) →
      `POST /api/seller/inventory/actions/set_live` (본문 items[{ask_id, product_id, price, warning: null, processing_fee}]). 판매대기 항목은 이걸로 입찰중이 된다.
      바꾼 가격은 다음 사이클에 목록에서 확인해 다르면 '확인필요' 로 남긴다.
@@ -48,7 +51,7 @@ from . import market as market_mod
 from . import product as product_mod
 from .api import ApiClient, ApiError
 from .config import DATA_DIR, Settings
-from .history import PurchaseRecord, fetch_purchases, load_purchase_details
+from .history import PurchaseRecord, fetch_purchases, load_purchase_details, parse_utc
 from .pacing import sleep_with_stop
 from .report import ProductResult, summarize
 from .store import ONE_SIZE
@@ -85,12 +88,25 @@ class StockItem:
     fee_rate: float             # 판매 수수료율 (price_breakdown.processing_fee / price, 0.005)
     expires_at: str = ""
     oid: str = ""               # 보관판매 주문번호 I-…
+    stored_at: datetime | None = None   # 창고 입고 완료 시각 (date_shipment_available, KST) - 보관료 무료 30일의 기준
     buy_price: int | None = None    # 매입가 (수수료 포함) - 구매 내역 짝. None = 짝 없음
     buy_oid: str = ""
 
     @property
     def is_one_size(self) -> bool:
         return not self.option or self.option == ONE_SIZE
+
+    @property
+    def stored_days(self) -> int | None:
+        """보관 며칠째인지 (입고 당일 = 1). 입고 시각을 모르면 None."""
+        if self.stored_at is None:
+            return None
+        return (datetime.now().date() - self.stored_at.date()).days + 1
+
+    def is_free_mode(self, settings: Settings) -> bool:
+        """하한 없이 경쟁할 항목인지 - 보관 일수가 settings.sell_free_after_days 를 넘겼으면 (머리글 4)."""
+        days = self.stored_days
+        return days is not None and days > settings.sell_free_after_days
 
     @property
     def label(self) -> str:
@@ -118,6 +134,7 @@ def parse_stock_item(raw: dict, status_text: str) -> StockItem | None:
         status_text=str(((raw.get("status_display_item") or {}).get("text")) or status_text),
         fee_rate=(fee / price) if price else 0.0,
         expires_at=str(raw.get("expires_at") or ""), oid=str(raw.get("oid") or ""),
+        stored_at=parse_utc(raw.get("date_shipment_available")),
     )
 
 
@@ -174,8 +191,14 @@ def attach_buy_prices(api: ApiClient, items: list[StockItem], known: dict[int, t
         if p.inventory_id and p.inventory_id not in by_inv:
             by_inv[p.inventory_id] = p
 
+    def opt(text: str) -> str:
+        # 구매 목록은 'ONE SIZE', 보관 목록도 'ONE SIZE' 지만 빈 값으로 오기도 한다 - 둘 다 빈 값으로 맞춘다
+        # (2026-09-17 실측: 카시오 LTP-1094E 가 이 차이로 짝을 못 찾음 - 집으로 받은 뒤 보관 신청한 구매라 목록에 창고보관 링크가 없었다)
+        n = _norm(text)
+        return "" if n in ("", "onesize") else n
+
     def same_product(p: PurchaseRecord, i: StockItem) -> bool:
-        return "취소" not in p.status and _norm(p.name_ko) == _norm(i.name) and _norm(p.option) == _norm(i.option if not i.is_one_size else "")
+        return "취소" not in p.status and _norm(p.name_ko) == _norm(i.name) and opt(p.option) == opt(i.option)
 
     pending = [i for i in todo if i.ask_id not in by_inv]
     if pending and not (should_stop and should_stop()):
@@ -289,18 +312,23 @@ def sell_one(item: StockItem, order: int, cycle: int, api: ApiClient, settings: 
     """항목 하나를 판정하고 필요하면 가격을 바꾼다. floor 를 주면(판매 관리 창의 항목별 하한) 그 값을, 아니면 매입가로 계산한 하한을 쓴다."""
     r = _result(item, order, cycle, settings)
     try:
-        if floor is None and item.buy_price is None:
+        free = item.is_free_mode(settings)
+        if free:
+            # 보관료 무료 기간이 끝나기 전에 팔아야 하는 항목 - 하한 없이 경쟁 (머리글 4). 1,000원은 형식상 최저값
+            floor = STEP
+            r.detail = f"[보관 {item.stored_days}일째 - 하한 없이 경쟁] "
+        elif floor is None and item.buy_price is None:
             r.status, r.detail = "건너뜀", "매입 내역을 찾지 못해 하한을 정할 수 없음 (수동으로 산 상품이면 하한을 직접 넣거나 이 프로그램으로 팔지 않음)"
             return r
         expected = state.expected.get(item.ask_id)
         if expected is not None and expected != item.price:
             log.warning("보관 %s: 지난번에 %s원으로 바꿨는데 목록은 %s원 - 다른 프로그램(No1 최저가 경쟁?)이 바꿨거나 반영 안 됨",
                         item.ask_id, f"{expected:,}", f"{item.price:,}")
-            r.detail = f"지난 사이클에 넣은 {expected:,}원이 아니라 {item.price:,}원으로 읽힘 (다른 프로그램이 바꿨는지 확인) - "
+            r.detail += f"지난 사이클에 넣은 {expected:,}원이 아니라 {item.price:,}원으로 읽힘 (다른 프로그램이 바꿨는지 확인) - "
         state.base_price.setdefault(item.ask_id, item.price)
         if floor is None:
             floor = floor_price(item.buy_price, settings.sell_margin_rate, item.fee_rate)
-        r.price_r = floor
+        r.price_r = None if free else floor
 
         market = market_mod.fetch_market_paced(api, item.product_id, should_stop, on_status)
         entry = market.find(item.size, item.option)
@@ -311,9 +339,9 @@ def sell_one(item: StockItem, order: int, cycle: int, api: ApiClient, settings: 
         lowest = entry.fast
         r.price_a = lowest
         live = item.status == "live"
-        log.info("[%d회차 %d번째] %s - 내 %s원 (%s), 빠른배송 최저가 %s, 하한 %s원 (매입 %s, 수수료 %.2f%%)",
-                 cycle, order, item.label[:40], f"{item.price:,}", item.status_text, _won(lowest), f"{floor:,}",
-                 _won(item.buy_price), item.fee_rate * 100)
+        log.info("[%d회차 %d번째] %s - 내 %s원 (%s), 빠른배송 최저가 %s, 하한 %s (매입 %s, 수수료 %.2f%%, 보관 %s일째)",
+                 cycle, order, item.label[:40], f"{item.price:,}", item.status_text, _won(lowest),
+                 "없음 (보관료 기한)" if free else f"{floor:,}원", _won(item.buy_price), item.fee_rate * 100, item.stored_days or "?")
 
         if item.price < floor:
             return _apply(api, item, floor, r, settings, state, f"내 가격이 하한 아래라 하한으로 올림 (경쟁 최저가 {_won(lowest)})")
@@ -615,11 +643,10 @@ class SellEngine:
                 cycle += 1
                 order = 0
                 self._refresh(page, api, state, quiet=True)
-                pending = [i for i in self.items if self._rule(i).compete and self._rule(i).floor]
+                pending = [i for i in self.items if self.is_target(i)]
                 if not pending:
                     self._emit("status", f"{cycle}회차: 경쟁에 넣은 항목이 없음 - {CYCLE_GAP_SEC}초 뒤 다시")
-                    if not sleep_with_stop(CYCLE_GAP_SEC, self._stop_tick.is_set):
-                        continue
+                    sleep_with_stop(CYCLE_GAP_SEC, self._stop_tick.is_set)
                     continue
                 log.info("===== 판매 %d회차: 경쟁 대상 %d건 / 보관 %d건 =====", cycle, len(pending), len(self.items))
             item = pending.pop(0)
@@ -649,6 +676,11 @@ class SellEngine:
 
     def _rule(self, item: StockItem) -> SellRule:
         return self.rules.setdefault(item.ask_id, SellRule())
+
+    def is_target(self, item: StockItem) -> bool:
+        """경쟁을 돌릴 항목인지: 보관 기한을 넘겼거나(하한 없이 자동), 경쟁에 넣었고 하한이 있는 항목. 창의 표시와 [경쟁 시작] 도 이 판정을 쓴다."""
+        rule = self._rule(item)
+        return item.is_free_mode(self.settings) or (rule.compete and rule.floor is not None)
 
     def _refresh(self, page: Page, api: ApiClient, state: SellState, quiet: bool = False) -> None:
         """목록을 읽고 매입가를 붙여 GUI 로 보낸다. 매입가·하한 제안은 규칙에 채워 둔다 (경쟁 여부는 건드리지 않음)."""

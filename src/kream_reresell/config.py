@@ -66,6 +66,8 @@ class Settings:
     sell_cycles: int = field(default_factory=lambda: _int("SELL_CYCLES", 0))
     # [판매] 최저가가 내 가격과 같을 때 잠깐 올려 2등 가격을 읽는 탐침 (sell 머리글 4). 끄면 그대로 둔다
     sell_probe: bool = field(default_factory=lambda: _bool("SELL_PROBE", True))
+    # [판매] 창고 보관 이 일수까지는 하한대로, 그 다음 날부터는 하한 없이 최저가 경쟁 (첫 30일 무료 보관이 끝나기 전에 팔려고 - 사용자 결정 2026-09-17, 기본 15)
+    sell_free_after_days: int = field(default_factory=lambda: _int("SELL_FREE_AFTER_DAYS", 15))
     # 이미지/동영상/폰트를 받지 않아 페이지를 빨리 띄운다. 화면 확인이 필요하면 .env 에 BLOCK_IMAGES=0
     block_images: bool = field(default_factory=lambda: _bool("BLOCK_IMAGES", True))
     # 사이트 스로틀(IP 단위) 대응 - pacing 참고. 10분 창 안에 상품 API(sales 등) 요청을 이만큼까지만 보내고 넘으면 쉰다.
@@ -102,4 +104,6 @@ class Settings:
             raise ValueError(f"판매 반복 횟수는 0(계속) 또는 1 이상이어야 합니다: {self.sell_cycles}")
         if not 0 <= self.sell_margin_rate < 1:
             raise ValueError(f"판매 하한 마진율은 0 이상 1 미만이어야 합니다: {self.sell_margin_rate}")
+        if self.sell_free_after_days < 0:
+            raise ValueError(f"하한 없이 경쟁을 시작할 보관 일수는 0 이상이어야 합니다: {self.sell_free_after_days}")
         self.rules.validate()

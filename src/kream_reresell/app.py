@@ -338,6 +338,7 @@ def describe_sell_settings(settings: Settings) -> str:
             f"하한 = 매입가 × (1 + {settings.sell_margin_rate * 100:g}%) ÷ (1 − 판매 수수료율) 을 1,000원 단위로 올림. "
             f"시세 API 로 빠른배송 최저가를 읽어 목표가 = max(하한, 최저가 − {sell.STEP:,}원) 으로 판매 희망가를 바꿈 (review_live → set_live). "
             f"최저가가 내 가격과 같으면 {'잠깐 올려 2등을 확인(탐침)' if settings.sell_probe else '그대로 둠'}. "
+            f"보관 {settings.sell_free_after_days + 1}일째부터는 하한 없이 경쟁 (보관료 무료 30일 안에 팔려고). "
             f"시세 조회 간격 {settings.api_tick_sec:g}초, 사이클 사이 {sell.CYCLE_GAP_SEC}초, "
             f"{'중지할 때까지 반복' if not settings.sell_cycles else f'{settings.sell_cycles}회 돌고 끝'}")
 
