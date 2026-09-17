@@ -30,12 +30,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import queue
 import re
+import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
 from playwright.sync_api import BrowserContext, Page
@@ -44,7 +47,7 @@ from . import auth, hangwatch, pacing
 from . import market as market_mod
 from . import product as product_mod
 from .api import ApiClient, ApiError
-from .config import Settings
+from .config import DATA_DIR, Settings
 from .history import PurchaseRecord, fetch_purchases, load_purchase_details
 from .pacing import sleep_with_stop
 from .report import ProductResult, summarize
@@ -281,11 +284,13 @@ def _set(r: ProductResult, status: str, detail: str) -> ProductResult:
 
 
 def sell_one(item: StockItem, order: int, cycle: int, api: ApiClient, settings: Settings, state: SellState,
-             should_stop: Callable[[], bool] | None, on_status: Callable[[str], None] | None) -> ProductResult:
+             should_stop: Callable[[], bool] | None, on_status: Callable[[str], None] | None,
+             floor: int | None = None) -> ProductResult:
+    """항목 하나를 판정하고 필요하면 가격을 바꾼다. floor 를 주면(판매 관리 창의 항목별 하한) 그 값을, 아니면 매입가로 계산한 하한을 쓴다."""
     r = _result(item, order, cycle, settings)
     try:
-        if item.buy_price is None:
-            r.status, r.detail = "건너뜀", "매입 내역을 찾지 못해 하한을 정할 수 없음 (수동으로 산 상품이면 이 프로그램으로 팔지 않음)"
+        if floor is None and item.buy_price is None:
+            r.status, r.detail = "건너뜀", "매입 내역을 찾지 못해 하한을 정할 수 없음 (수동으로 산 상품이면 하한을 직접 넣거나 이 프로그램으로 팔지 않음)"
             return r
         expected = state.expected.get(item.ask_id)
         if expected is not None and expected != item.price:
@@ -293,7 +298,8 @@ def sell_one(item: StockItem, order: int, cycle: int, api: ApiClient, settings: 
                         item.ask_id, f"{expected:,}", f"{item.price:,}")
             r.detail = f"지난 사이클에 넣은 {expected:,}원이 아니라 {item.price:,}원으로 읽힘 (다른 프로그램이 바꿨는지 확인) - "
         state.base_price.setdefault(item.ask_id, item.price)
-        floor = floor_price(item.buy_price, settings.sell_margin_rate, item.fee_rate)
+        if floor is None:
+            floor = floor_price(item.buy_price, settings.sell_margin_rate, item.fee_rate)
         r.price_r = floor
 
         market = market_mod.fetch_market_paced(api, item.product_id, should_stop, on_status)
@@ -305,9 +311,9 @@ def sell_one(item: StockItem, order: int, cycle: int, api: ApiClient, settings: 
         lowest = entry.fast
         r.price_a = lowest
         live = item.status == "live"
-        log.info("[%d회차 %d번째] %s - 내 %s원 (%s), 빠른배송 최저가 %s, 하한 %s원 (매입 %s원 × %.0f%% ÷ 수수료 %.2f%%)",
+        log.info("[%d회차 %d번째] %s - 내 %s원 (%s), 빠른배송 최저가 %s, 하한 %s원 (매입 %s, 수수료 %.2f%%)",
                  cycle, order, item.label[:40], f"{item.price:,}", item.status_text, _won(lowest), f"{floor:,}",
-                 f"{item.buy_price:,}", (1 + settings.sell_margin_rate) * 100, item.fee_rate * 100)
+                 _won(item.buy_price), item.fee_rate * 100)
 
         if item.price < floor:
             return _apply(api, item, floor, r, settings, state, f"내 가격이 하한 아래라 하한으로 올림 (경쟁 최저가 {_won(lowest)})")
@@ -484,4 +490,201 @@ def run(context: BrowserContext, page: Page, settings: Settings,
     return results
 
 
-__all__ = ["run", "list_stock", "attach_buy_prices", "floor_price", "target_price", "set_price", "StockItem"]
+# ---------------------------------------------------------------- 판매 관리 창용: 항목별 규칙 + 명령 큐로 움직이는 엔진
+
+SELL_RULES_PATH = DATA_DIR / "sell_rules.json"   # 보관번호별 하한·경쟁 여부 (판매 관리 창에서 저장)
+
+
+@dataclass
+class SellRule:
+    floor: int | None = None        # 이 항목의 하한 (직접 넣었거나 매입가로 계산한 값). None = 아직 없음
+    compete: bool = False           # 최저가 경쟁에 넣었는지
+    buy_price: int | None = None    # 짝지은 매입가 (다음 실행에 구매 내역을 다시 읽지 않게)
+    buy_oid: str = ""
+
+
+def load_sell_rules() -> dict[int, SellRule]:
+    if not SELL_RULES_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(SELL_RULES_PATH.read_text(encoding="utf-8"))
+        return {int(k): SellRule(**v) for k, v in raw.items()}
+    except (ValueError, TypeError, KeyError):
+        log.exception("판매 규칙 파일을 읽지 못해 빈 상태로 시작: %s", SELL_RULES_PATH)
+        return {}
+
+
+def save_sell_rules(rules: dict[int, SellRule]) -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    SELL_RULES_PATH.write_text(json.dumps({str(k): asdict(v) for k, v in rules.items()}, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+class SellEngine:
+    """판매 관리 창이 쓰는 작업 스레드. 크롬(봇 프로필)을 창이 열려 있는 동안 붙들고 있고, 명령 큐로 움직인다.
+
+    Playwright 동기 API 는 만든 스레드에서만 부를 수 있어 브라우저·API 호출은 전부 이 스레드 안에서 한다.
+    명령: ("refresh",) 목록 다시 읽기 · ("start",) 경쟁 시작 · ("stop",) 경쟁 멈춤 · ("close",) 브라우저 닫고 끝.
+    경쟁 중에는 한 틱에 항목 하나씩(sell_one) 보고 그 사이사이 명령 큐를 본다. 대상은 rules 에서 compete 가 켜지고 하한이 있는 항목뿐.
+    이벤트(on_event(kind, payload), 다른 스레드에서 호출됨 - GUI 는 큐로 받을 것):
+      ("items", list[StockItem]) 목록 · ("result", (StockItem, ProductResult)) 판정 하나 · ("status", str) · ("running", bool) ·
+      ("error", str) · ("closed", None)
+    """
+
+    def __init__(self, settings: Settings, rules: dict[int, SellRule], on_event: Callable[[str, object], None]) -> None:
+        self.settings = settings
+        self.rules = rules              # GUI 와 공유 - 바꾸는 쪽은 GUI, 여기서는 읽고 매입가·하한 제안만 채운다 (dict 갱신은 원자적)
+        self.on_event = on_event
+        self.commands: queue.Queue = queue.Queue()
+        self.items: list[StockItem] = []
+        self.results: list[ProductResult] = []
+        self.thread = threading.Thread(target=self._main, name="sell-engine", daemon=True)
+        self._stop_tick = threading.Event()
+
+    # ---- GUI 스레드에서 부르는 것
+    def start(self) -> None:
+        self.thread.start()
+
+    def request(self, cmd: str) -> None:
+        if cmd in ("stop", "close"):
+            self._stop_tick.set()   # 사이클 사이 쉼(sleep_with_stop)이나 틱 대기를 바로 끊는다
+        self.commands.put(cmd)
+
+    # ---- 작업 스레드
+    def _emit(self, kind: str, payload: object = None) -> None:
+        try:
+            self.on_event(kind, payload)
+        except Exception:  # noqa: BLE001
+            log.exception("판매 관리 창 이벤트 처리 중 오류 (%s)", kind)
+
+    def _main(self) -> None:
+        from playwright.sync_api import sync_playwright
+        from .browser import real_chrome_context
+        s = self.settings
+        try:
+            s.validate()
+            with sync_playwright() as pw, real_chrome_context(pw, block_images=s.block_images, trim_api=s.trim_api,
+                                                                show_chrome=s.show_chrome) as context:
+                page = context.pages[0] if context.pages else context.new_page()
+                self._emit("status", "로그인 확인 중...")
+                auth.ensure_logged_in(page, s)
+                api = ApiClient(page, context)
+                log.info(pacing.API_PACER.describe_setup())
+                self._loop(page, api)
+        except Exception as e:  # noqa: BLE001
+            log.exception("판매 엔진 오류")
+            self._emit("error", f"{type(e).__name__}: {e}")
+        finally:
+            self._emit("closed")
+
+    def _loop(self, page: Page, api: ApiClient) -> None:
+        state = SellState()
+        running = False
+        cycle = 0
+        order = 0
+        pending: list[StockItem] = []
+        self._refresh(page, api, state)
+        while True:
+            # 경쟁 중이면 명령을 기다리지 않고 바로 다음 항목, 아니면 명령이 올 때까지 기다린다
+            try:
+                cmd = self.commands.get(timeout=0.2 if running else None)
+            except queue.Empty:
+                cmd = None
+            if cmd == "close":
+                return
+            if cmd == "refresh":
+                self._refresh(page, api, state)
+                pending = []
+                continue
+            if cmd == "stop":
+                running = False
+                pending = []
+                self._stop_tick.clear()
+                self._emit("running", False)
+                self._emit("status", "경쟁 멈춤")
+                continue
+            if cmd == "start":
+                running = True
+                pending = []
+                self._stop_tick.clear()
+                self._emit("running", True)
+                continue
+            if not running:
+                continue
+            if not pending:
+                # 사이클 시작: 목록을 다시 읽고(팔린 것 빠짐, 남이 바꾼 가격 반영) 경쟁 대상만 고른다
+                cycle += 1
+                order = 0
+                self._refresh(page, api, state, quiet=True)
+                pending = [i for i in self.items if self._rule(i).compete and self._rule(i).floor]
+                if not pending:
+                    self._emit("status", f"{cycle}회차: 경쟁에 넣은 항목이 없음 - {CYCLE_GAP_SEC}초 뒤 다시")
+                    if not sleep_with_stop(CYCLE_GAP_SEC, self._stop_tick.is_set):
+                        continue
+                    continue
+                log.info("===== 판매 %d회차: 경쟁 대상 %d건 / 보관 %d건 =====", cycle, len(pending), len(self.items))
+            item = pending.pop(0)
+            order += 1
+            rule = self._rule(item)
+            self._emit("status", f"{cycle}회차 {order}: {item.name[:24]} ({pacing.API_PACER.describe()})")
+            try:
+                with hangwatch.watching(page):
+                    r = sell_one(item, order, cycle, api, self.settings, state, self._stop_tick.is_set, None, floor=rule.floor)
+            except product_mod.LoginNeeded as e:
+                log.info("로그인이 풀림 (%s) - 다시 로그인하고 이 항목을 한 번 더 봄", e)
+                auth.ensure_logged_in(page, self.settings)
+                api.invalidate()
+                with hangwatch.watching(page):
+                    r = sell_one(item, order, cycle, api, self.settings, state, self._stop_tick.is_set, None, floor=rule.floor)
+            except Exception as e:  # noqa: BLE001
+                log.exception("보관 %s 처리 중 오류", item.ask_id)
+                r = _result(item, order, cycle, self.settings)
+                r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
+            r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log.info("[%d회차 %d번째] 결과: %s - %s", cycle, order, r.status, r.detail)
+            self.results.append(r)
+            self._emit("result", (item, r))
+            if not pending:
+                self._emit("status", f"{cycle}회차 끝 - {CYCLE_GAP_SEC}초 뒤 다시")
+                sleep_with_stop(CYCLE_GAP_SEC, self._stop_tick.is_set)
+
+    def _rule(self, item: StockItem) -> SellRule:
+        return self.rules.setdefault(item.ask_id, SellRule())
+
+    def _refresh(self, page: Page, api: ApiClient, state: SellState, quiet: bool = False) -> None:
+        """목록을 읽고 매입가를 붙여 GUI 로 보낸다. 매입가·하한 제안은 규칙에 채워 둔다 (경쟁 여부는 건드리지 않음)."""
+        if not quiet:
+            self._emit("status", "보관 목록 읽는 중...")
+        try:
+            with hangwatch.watching(page):
+                items = list_stock(api)
+                for i in items:
+                    rule = self._rule(i)
+                    if rule.buy_price:
+                        i.buy_price, i.buy_oid = rule.buy_price, rule.buy_oid
+                attach_buy_prices(api, items, state.known_buy)
+        except ApiError as e:
+            if e.is_auth_lost:
+                auth.ensure_logged_in(page, self.settings)
+                api.invalidate()
+                return self._refresh(page, api, state, quiet)
+            log.exception("보관 목록을 읽지 못함")
+            self._emit("error", f"보관 목록을 읽지 못함: {e}")
+            return
+        for i in items:
+            rule = self._rule(i)
+            if i.buy_price and not rule.buy_price:
+                rule.buy_price, rule.buy_oid = i.buy_price, i.buy_oid
+            if rule.floor is None and i.buy_price:
+                rule.floor = floor_price(i.buy_price, self.settings.sell_margin_rate, i.fee_rate)
+        gone = set(self.rules) - {i.ask_id for i in items}
+        for k in gone:   # 팔렸거나 취소된 항목의 규칙은 지운다
+            del self.rules[k]
+        save_sell_rules(self.rules)
+        self.items = items
+        self._emit("items", list(items))
+        if not quiet:
+            self._emit("status", f"보관 {len(items)}건 (매입가 있음 {sum(1 for i in items if i.buy_price)}건)")
+
+
+__all__ = ["run", "list_stock", "attach_buy_prices", "floor_price", "target_price", "set_price", "StockItem",
+           "SellRule", "SellEngine", "load_sell_rules", "save_sell_rules"]

@@ -16,6 +16,8 @@
 [내역] 은 달을 고르면 보관 판매(종료) 에서 그 달에 거래된 판매를 구매 내역(종료) 과 짝지어
 정산 시트 모양의 엑셀(바탕화면\\KREAM 내역 YYYY-MM.xlsx) 로 저장한다.
 [중지] 는 지금 보고 있는 상품(입찰)을 끝낸 뒤 멈춘다.
+[판매] 는 "판매 관리" 창(sellwin)을 연다 - 보관 판매 목록 표에서 행을 골라 경쟁에 넣고 [경쟁 시작] 을 누르면 하한(매입가 + 마진) 위에서
+최저가 경쟁으로 판매 희망가를 맞춘다 (README '판매 규칙'). 창이 열려 있는 동안은 크롬을 그 창이 쓰므로 다른 버튼은 잠긴다.
 """
 
 from __future__ import annotations
@@ -39,7 +41,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from kream_reresell import browser, pacing  # noqa: E402
-from kream_reresell.app import normalize_keywords, run_cancel_job, run_history_job, run_job, run_rebid_job, run_sell_job  # noqa: E402
+from kream_reresell.app import normalize_keywords, run_cancel_job, run_history_job, run_job, run_rebid_job  # noqa: E402
+from kream_reresell.sellwin import SellWindow  # noqa: E402
 from kream_reresell.config import LOG_DIR, RULES_PATH, Settings  # noqa: E402
 from kream_reresell.ranking import ALL_CATEGORIES, DEFAULT_CATEGORY  # noqa: E402
 from kream_reresell.report import REPORT_DIR, section_lines, summarize  # noqa: E402
@@ -625,35 +628,16 @@ class App:
         if rules is None:
             return
         dry = self.mode.get() == "dry"
-        if not dry and not messagebox.askyesno(
-                "판매", "마이페이지 > 보관 판매의 입찰중·판매대기 항목을 순서대로 보며, 항목마다 구매 내역에서 매입가(수수료 포함)를 찾아\n"
-                      f"하한 = 매입가 × (1 + {margin * 100:g}%) 을 정하고, 시세 API 로 빠른배송 최저가를 읽어\n"
-                      "판매 희망가를 max(하한, 최저가 − 1,000원) 으로 실제로 바꿉니다 (하한 아래로는 절대 안 내림).\n"
-                      "최저가가 내 가격과 같으면 잠깐 올려 2등 가격을 확인한 뒤 2등 − 1,000원으로 둡니다.\n\n"
-                      "※ No1 Seller Center 의 최저가 경쟁이 같은 항목에 켜져 있으면 서로 가격을 바꿉니다 - 그쪽 경쟁을 끄고 실행하세요.\n"
-                      "매입 내역을 못 찾는 항목(수동 구매)은 건드리지 않습니다.\n\n"
-                      "[중지] 를 누를 때까지 반복합니다.\n\n진행할까요?"):
-            return
         settings = self._make_settings(dry, rules, tick)
         settings.sell_margin_rate = margin
         settings.sell_cycles = 0
         self.stop_flag.clear()
-        self.last_report = None
-        self.open_report_button.configure(state="disabled")
-        self._set_busy(True, "판매 실행 중...")
-        self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 판매 시작: 하한 마진 {margin * 100:g}%, "
-                  f"{'판단만' if dry else '판매 희망가를 실제로 바꿈'}, [중지]까지 반복 =====")
-        self.worker = threading.Thread(target=self._sell_worker, args=(settings,), daemon=True)
-        self.worker.start()
-
-    def _sell_worker(self, settings: Settings) -> None:
-        try:
-            job = run_sell_job(settings, should_stop=self.stop_flag.is_set,
-                               on_status=lambda text: self.q.put(("status", text)))
-            self.q.put(("done", job))
-        except Exception as e:  # noqa: BLE001
-            logging.getLogger("gui").exception("판매 중 오류")
-            self.q.put(("error", f"{type(e).__name__}: {e}"))
+        self._set_busy(True, "판매 관리 창이 열려 있음 (크롬 사용 중)")
+        self.stop_button.configure(state="disabled")   # 창 안의 [정지] 로 멈춘다
+        self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 판매 관리 창 열림: 하한 마진 {margin * 100:g}%, "
+                  f"{'판단만' if dry else '경쟁 시작을 누르면 판매 희망가를 실제로 바꿈'} =====")
+        # 창이 크롬을 붙들고 있는 동안 다른 버튼은 잠근다 (프로필 하나). 창을 닫으면 풀린다
+        SellWindow(self.root, settings, on_close=lambda: self._set_busy(False, "대기 중"))
 
     def start_history(self) -> None:
         """[내역]: 달을 고르면 보관 판매 거래일시가 그 달인 판매를 구매 내역과 짝지어 엑셀로 저장한다."""

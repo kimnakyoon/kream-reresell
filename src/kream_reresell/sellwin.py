@@ -1,0 +1,301 @@
+"""판매 관리 창 - GUI [판매] 를 누르면 뜨는 tkinter 창 (No1 Seller Center 의 보관관리 화면을 본떠 필요한 것만, 사용자 요청 2026-09-17).
+
+구성:
+  위 줄: [새로고침] · 보기(전체/입찰중/판매대기) · 하한 마진(%) · [선택 행 하한을 매입가로] · [경쟁 등록] [경쟁 해제] · [경쟁 시작] [정지] · 상태
+  표: 순번 / 제품명 / 옵션 / 상태 / 판매 희망가 / 경쟁 최저가 / 매입가 / 하한 / 경쟁 / 처리 결과 / 시각
+      - 하한 칸을 두 번 누르면 직접 고친다. 경쟁 칸을 두 번 누르면 켜고 끈다. 여러 행을 골라 [경쟁 등록]/[해제].
+  아래: 가격 로그 (판정 결과가 쌓인다)
+동작은 sell.SellEngine (작업 스레드가 크롬을 붙들고 명령 큐로 움직임). 창을 닫으면 경쟁을 멈추고 크롬을 닫고, 결과가 있으면 엑셀 보고서를 남긴다.
+항목별 하한·경쟁 여부는 data/sell_rules.json 에 저장되어 다음에 창을 열어도 남는다.
+"""
+
+from __future__ import annotations
+
+import logging
+import queue
+import tkinter as tk
+from collections.abc import Callable
+from datetime import datetime
+from tkinter import messagebox, simpledialog, ttk
+
+from . import report, sell
+from .config import Settings
+from .report import ProductResult
+
+log = logging.getLogger(__name__)
+
+FONT = ("맑은 고딕", 9)
+COLUMNS = [
+    ("no", "순번", 44, "center"), ("name", "제품명", 330, "w"), ("option", "옵션", 90, "center"), ("status", "상태", 64, "center"),
+    ("price", "판매 희망가", 88, "e"), ("lowest", "경쟁 최저가", 88, "e"), ("buy", "매입가", 84, "e"), ("floor", "하한", 84, "e"),
+    ("compete", "경쟁", 48, "center"), ("result", "처리 결과", 300, "w"), ("time", "시각", 60, "center"),
+]
+WIDTH, HEIGHT = 1280, 740
+
+
+def _won(v: int | None) -> str:
+    return f"{v:,}" if v else ""
+
+
+class SellWindow:
+    def __init__(self, parent: tk.Tk, settings: Settings, on_close: Callable[[], None] | None = None) -> None:
+        self.settings = settings
+        self.on_close = on_close
+        self.rules = sell.load_sell_rules()
+        self.q: queue.Queue = queue.Queue()
+        self.items: list[sell.StockItem] = []
+        self.last: dict[int, tuple[int | None, str, str]] = {}   # 보관번호 → (경쟁 최저가, 처리 결과, 시각)
+        self.running = False
+        self.closing = False
+        self.engine = sell.SellEngine(settings, self.rules, lambda kind, payload: self.q.put((kind, payload)))
+
+        top = self.top = tk.Toplevel(parent)
+        top.title("판매 관리 - 보관 판매 최저가 경쟁" + (" (판단만 - 가격을 바꾸지 않음)" if settings.dry_run else ""))
+        sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+        w, h = min(WIDTH, sw - 40), min(HEIGHT, sh - 80)
+        top.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+        top.minsize(900, 520)
+        top.protocol("WM_DELETE_WINDOW", self.close)
+
+        self._build_toolbar(top)
+        self._build_table(top)
+        self._build_log(top)
+        top.after(200, self._poll)
+        self.engine.start()
+
+    # ------------------------------------------------------------ 화면
+    def _build_toolbar(self, top: tk.Toplevel) -> None:
+        bar = tk.Frame(top)
+        bar.pack(fill="x", padx=10, pady=(10, 4))
+        self.refresh_button = tk.Button(bar, text="새로고침", width=9, command=lambda: self.engine.request("refresh"))
+        self.refresh_button.pack(side="left")
+        tk.Label(bar, text="보기:", font=FONT).pack(side="left", padx=(14, 2))
+        self.view = tk.StringVar(value="all")
+        for text, value in (("전체", "all"), ("입찰중", "live"), ("판매대기", "in_storage")):
+            tk.Radiobutton(bar, text=text, variable=self.view, value=value, command=self._render, font=FONT).pack(side="left")
+        tk.Label(bar, text="하한 마진(%)", font=FONT).pack(side="left", padx=(14, 2))
+        self.margin = tk.Spinbox(bar, from_=0, to=99, width=4)
+        self.margin.delete(0, "end")
+        self.margin.insert(0, f"{self.settings.sell_margin_rate * 100:g}")
+        self.margin.pack(side="left")
+        tk.Button(bar, text="선택 행 하한을 매입가로", command=self._floor_from_buy).pack(side="left", padx=(6, 0))
+        tk.Button(bar, text="경쟁 등록", command=lambda: self._set_compete(True)).pack(side="left", padx=(14, 0))
+        tk.Button(bar, text="경쟁 해제", command=lambda: self._set_compete(False)).pack(side="left", padx=(4, 0))
+        self.start_button = tk.Button(bar, text="경쟁 시작", width=9, bg="#2E7D32", fg="white", activebackground="#43A047",
+                                      activeforeground="white", font=("맑은 고딕", 9, "bold"), command=self._start)
+        self.start_button.pack(side="left", padx=(14, 0))
+        self.stop_button = tk.Button(bar, text="정지", width=7, state="disabled", command=self._stop)
+        self.stop_button.pack(side="left", padx=(4, 0))
+        self.status = tk.Label(bar, text="크롬 여는 중...", fg="#555", font=FONT, anchor="w")
+        self.status.pack(side="left", padx=(14, 0), fill="x", expand=True)
+        hint = tk.Label(top, text="하한 = 매입가 × (1 + 하한 마진) ÷ (1 − 판매 수수료). 경쟁은 하한 위에서만 경쟁 최저가 − 1,000원으로 맞춥니다. "
+                                  "하한 칸 두 번 누름 = 직접 입력, 경쟁 칸 두 번 누름 = 켜기/끄기. "
+                                  f"시세 조회 간격 {self.settings.api_tick_sec:g}초, 사이클 사이 {sell.CYCLE_GAP_SEC}초. "
+                                  "※ No1 Seller Center 의 최저가 경쟁은 같은 항목에서 꺼 두세요.",
+                        fg="#777", font=("맑은 고딕", 8), anchor="w", justify="left", wraplength=WIDTH - 40)
+        hint.pack(fill="x", padx=12)
+
+    def _build_table(self, top: tk.Toplevel) -> None:
+        frame = tk.Frame(top)
+        frame.pack(fill="both", expand=True, padx=10, pady=4)
+        style = ttk.Style(top)
+        style.configure("Sell.Treeview", font=FONT, rowheight=22)
+        style.configure("Sell.Treeview.Heading", font=("맑은 고딕", 9, "bold"))
+        self.tree = ttk.Treeview(frame, columns=[c[0] for c in COLUMNS], show="headings", selectmode="extended", style="Sell.Treeview")
+        for key, title, width, anchor in COLUMNS:
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=width, minwidth=40, anchor=anchor, stretch=key in ("name", "result"))
+        ys = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=ys.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        ys.pack(side="right", fill="y")
+        self.tree.tag_configure("compete", background="#E8F5E9")
+        self.tree.tag_configure("below", foreground="#B00020")      # 지금 가격이 하한 아래
+        self.tree.tag_configure("nofloor", foreground="#888888")    # 하한 없음
+        self.tree.bind("<Double-1>", self._on_double_click)
+
+    def _build_log(self, top: tk.Toplevel) -> None:
+        frame = tk.LabelFrame(top, text="가격 로그")
+        frame.pack(fill="x", padx=10, pady=(0, 10))
+        self.log_box = tk.Text(frame, height=7, font=("맑은 고딕", 9), state="disabled", wrap="word")
+        ys = tk.Scrollbar(frame, command=self.log_box.yview)
+        self.log_box.configure(yscrollcommand=ys.set)
+        self.log_box.pack(side="left", fill="both", expand=True)
+        ys.pack(side="right", fill="y")
+
+    def _log(self, text: str) -> None:
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", f"{datetime.now():%H:%M:%S} {text}\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    # ------------------------------------------------------------ 표
+    def _render(self) -> None:
+        selected = {int(i) for i in self.tree.selection()}
+        self.tree.delete(*self.tree.get_children())
+        view = self.view.get()
+        for n, item in enumerate(self.items, start=1):
+            if view != "all" and item.status != view:
+                continue
+            rule = self.rules.get(item.ask_id) or sell.SellRule()
+            lowest, result, when = self.last.get(item.ask_id, (None, "", ""))
+            tags = []
+            if rule.compete:
+                tags.append("compete")
+            if rule.floor is None:
+                tags.append("nofloor")
+            elif item.price < rule.floor:
+                tags.append("below")
+            self.tree.insert("", "end", iid=str(item.ask_id), tags=tags, values=(
+                n, item.name, item.option if not item.is_one_size else "", item.status_text,
+                _won(item.price), _won(lowest), _won(item.buy_price), _won(rule.floor) or "(없음)",
+                "●" if rule.compete else "", result, when,
+            ))
+        keep = [str(a) for a in selected if self.tree.exists(str(a))]
+        if keep:
+            self.tree.selection_set(keep)
+
+    def _selected_items(self) -> list[sell.StockItem]:
+        ids = {int(i) for i in self.tree.selection()}
+        return [i for i in self.items if i.ask_id in ids]
+
+    def _on_double_click(self, event) -> None:
+        row = self.tree.identify_row(event.y)
+        col = self.tree.identify_column(event.x)
+        if not row:
+            return
+        key = COLUMNS[int(col[1:]) - 1][0]
+        item = next((i for i in self.items if str(i.ask_id) == row), None)
+        if item is None:
+            return
+        rule = self.rules.setdefault(item.ask_id, sell.SellRule())
+        if key == "floor":
+            value = simpledialog.askinteger("하한", f"{item.label}\n\n하한(원, 이 아래로는 안 내림)을 넣어주세요.\n"
+                                                    f"매입가 {_won(item.buy_price) or '모름'} / 지금 판매가 {item.price:,}",
+                                            parent=self.top, initialvalue=rule.floor or item.price, minvalue=1000)
+            if value:
+                rule.floor = int(round(value / 1000.0)) * 1000
+                self._save()
+        elif key == "compete":
+            if not rule.compete and rule.floor is None:
+                messagebox.showwarning("경쟁 등록", "하한이 없는 항목은 경쟁에 넣을 수 없습니다. 하한 칸을 두 번 눌러 넣거나 [선택 행 하한을 매입가로] 를 쓰세요.", parent=self.top)
+                return
+            rule.compete = not rule.compete
+            self._save()
+
+    def _floor_from_buy(self) -> None:
+        try:
+            margin = float(self.margin.get()) / 100.0
+        except ValueError:
+            messagebox.showerror("입력 오류", "하한 마진은 숫자(%)로 넣어주세요.", parent=self.top)
+            return
+        items = self._selected_items() or self.items
+        done = skipped = 0
+        for item in items:
+            if not item.buy_price:
+                skipped += 1
+                continue
+            self.rules.setdefault(item.ask_id, sell.SellRule()).floor = sell.floor_price(item.buy_price, margin, item.fee_rate)
+            done += 1
+        self.settings.sell_margin_rate = margin
+        self._save()
+        self._log(f"하한을 매입가 × {1 + margin:.2f} 로 다시 계산: {done}건" + (f", 매입가 없어 건너뜀 {skipped}건" if skipped else ""))
+
+    def _set_compete(self, on: bool) -> None:
+        items = self._selected_items()
+        if not items:
+            messagebox.showinfo("경쟁 등록" if on else "경쟁 해제", "표에서 행을 먼저 골라주세요 (Ctrl/Shift 로 여러 행).", parent=self.top)
+            return
+        skipped = 0
+        for item in items:
+            rule = self.rules.setdefault(item.ask_id, sell.SellRule())
+            if on and rule.floor is None:
+                skipped += 1
+                continue
+            rule.compete = on
+        self._save()
+        self._log(f"경쟁 {'등록' if on else '해제'}: {len(items) - skipped}건" + (f" (하한 없어 제외 {skipped}건)" if skipped else ""))
+
+    def _save(self) -> None:
+        sell.save_sell_rules(self.rules)
+        self._render()
+
+    # ------------------------------------------------------------ 경쟁
+    def _start(self) -> None:
+        targets = [i for i in self.items if (self.rules.get(i.ask_id) or sell.SellRule()).compete]
+        if not targets:
+            messagebox.showinfo("경쟁 시작", "경쟁에 넣은 항목이 없습니다. 행을 고르고 [경쟁 등록] 을 누르세요.", parent=self.top)
+            return
+        if not self.settings.dry_run and not messagebox.askyesno(
+                "경쟁 시작", f"경쟁에 넣은 {len(targets)}건의 판매 희망가를 실제로 바꿉니다 (하한 위에서 경쟁 최저가 − 1,000원).\n\n"
+                            "※ No1 Seller Center 의 최저가 경쟁이 이 항목들에 켜져 있으면 서로 가격을 바꿉니다 - 꺼져 있는지 확인하세요.\n\n"
+                            "시작할까요?", parent=self.top):
+            return
+        self._log(f"경쟁 시작: {len(targets)}건" + (" (판단만)" if self.settings.dry_run else ""))
+        self.engine.request("start")
+
+    def _stop(self) -> None:
+        self.stop_button.configure(state="disabled")
+        self.status.configure(text="지금 항목까지 보고 멈춥니다...")
+        self.engine.request("stop")
+
+    def _set_running(self, running: bool) -> None:
+        self.running = running
+        self.start_button.configure(state="disabled" if running else "normal")
+        self.stop_button.configure(state="normal" if running else "disabled")
+        self.refresh_button.configure(state="disabled" if running else "normal")
+
+    # ------------------------------------------------------------ 이벤트
+    def _poll(self) -> None:
+        try:
+            while True:
+                kind, payload = self.q.get_nowait()
+                if kind == "items":
+                    self.items = payload
+                    self._render()
+                elif kind == "result":
+                    item, r = payload
+                    self.last[item.ask_id] = (r.price_a, f"{r.status}: {r.detail}", r.time[11:16])
+                    self._render()
+                    self._log(f"[{item.label[:30]}] {r.status} - {r.detail}")
+                elif kind == "status":
+                    self.status.configure(text=payload)
+                elif kind == "running":
+                    self._set_running(bool(payload))
+                elif kind == "error":
+                    self._log(f"오류: {payload}")
+                    self.status.configure(text=f"오류: {payload}"[:120])
+                elif kind == "closed":
+                    self._finish()
+                    return
+        except queue.Empty:
+            pass
+        if not self.closing or self.top.winfo_exists():
+            self.top.after(200, self._poll)
+
+    # ------------------------------------------------------------ 닫기
+    def close(self) -> None:
+        if self.closing:
+            return
+        if self.running and not messagebox.askyesno("닫기", "경쟁이 돌고 있습니다. 창을 닫으면 멈추고 크롬도 닫습니다.\n\n닫을까요?", parent=self.top):
+            return
+        self.closing = True
+        self.status.configure(text="크롬 닫는 중...")
+        self.engine.request("stop")
+        self.engine.request("close")
+
+    def _finish(self) -> None:
+        results: list[ProductResult] = self.engine.results
+        if results:
+            try:
+                path = report.write_report(results, f"판매 관리 창 (하한 마진 {self.settings.sell_margin_rate * 100:g}%)",
+                                           "DRY-RUN (판단만)" if self.settings.dry_run else "실제 실행", kind="판매", section_label="회차")
+                log.info("판매 보고서: %s", path)
+            except Exception:  # noqa: BLE001
+                log.exception("판매 보고서 저장 실패")
+        try:
+            self.top.destroy()
+        except tk.TclError:
+            pass
+        if self.on_close:
+            self.on_close()
