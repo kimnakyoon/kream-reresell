@@ -19,6 +19,9 @@ LIMIT_SEC 넘게 남아 있으면 (코드의 시간 제한은 길어야 20초라
 멀쩡한 탭을 닫거나 (2026-09-08 17:41 [입찰] 아이웨어 31위: 97초 쉬는 사이 탭을 닫아 오류) '크롬 전체가 멈춘 듯함' 을 잘못
 띄웠다 (같은 날 08:24 [재입찰] 509초 쉼). 쉬는 곳은 pacing.sleep_with_stop 하나라 거기서 idle() 로 감싼다.
 
+감시는 Playwright 연결(작업 스레드)마다 하나다 - 버튼별 작업이 같은 크롬에 각자 연결로 붙어 동시에 돌기 때문 (browser 머리글, 2026-09-17).
+모듈 함수(start/stop/watching/idle/take_trip …)는 부른 스레드의 Watcher 를 쓴다 (threading.local). 감시자가 없는 스레드에서 부르면 아무것도 안 한다.
+
 Playwright 의 내부 속성(_connection._callbacks)을 읽으므로 버전이 바뀌어 속성이 없으면 감시를 끄고 경고만 남긴다.
 """
 
@@ -54,48 +57,137 @@ class Trip:
         return f"페이지가 {self.waited_sec}초 넘게 응답하지 않아 탭을 닫음 ({self.note})"
 
 
-_lock = threading.Lock()
-_thread: threading.Thread | None = None
-_stop = threading.Event()
-_context: BrowserContext | None = None
-_port: int | None = None
-_pages: list[Page] = []          # 지금 쓰는 탭 (안쪽이 마지막)
-_trip: Trip | None = None
-_disabled = False
-_idle = 0                        # 작업 스레드가 Playwright 호출 밖에서 쉬는 중 (idle() 중첩 수) - 이 동안은 세지 않는다
+_unsupported = False   # Playwright 내부 구조가 달라 감시를 못 쓴다 - 경고는 프로세스에서 한 번만
+
+
+class Watcher:
+    """작업 스레드(Playwright 연결) 하나의 감시 상태와 감시 스레드. context 없이 만들면 아무것도 감시하지 않는 빈 감시자 (_NULL)."""
+
+    def __init__(self, context: BrowserContext | None = None, port: int = 0) -> None:
+        self.context = context      # 연결의 '기다리는 요청' 을 읽는 원본 컨텍스트 (모든 탭이 보인다)
+        self.port = port
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.pages: list[Page] = []      # 지금 쓰는 탭 (안쪽이 마지막)
+        self.trip: Trip | None = None
+        self.idle = 0                    # 작업 스레드가 Playwright 호출 밖에서 쉬는 중 (idle() 중첩 수) - 이 동안은 세지 않는다
+        self.thread = threading.Thread(target=self._loop, name=f"hangwatch-{threading.current_thread().name}", daemon=True)
+
+    def _pending_ids(self) -> set[int] | None:
+        """드라이버 응답을 기다리는 요청 ID. 속성이 없으면(Playwright 내부가 바뀜) None."""
+        global _unsupported
+        try:
+            callbacks = self.context._impl_obj._connection._callbacks  # type: ignore[attr-defined]
+            return {i for i, cb in list(callbacks.items()) if not cb.no_reply and not cb.future.done()}
+        except RuntimeError:       # 다른 스레드가 dict 를 바꾸는 중 - 다음 틱에 다시
+            return set()
+        except AttributeError:
+            if not _unsupported:
+                _unsupported = True
+                log.warning("Playwright 내부 구조가 달라 멈춤 감시를 쓸 수 없습니다 (탭이 멈추면 [중지]가 듣지 않을 수 있음)")
+            return None
+
+    def _loop(self) -> None:
+        first_seen: dict[int, float] = {}
+        closed_for: tuple[int, float] | None = None     # (요청 ID, 닫은 시각)
+        while not self.stop_event.wait(TICK_SEC):
+            with self.lock:
+                page, idle = (self.pages[-1] if self.pages else None), self.idle > 0
+            if idle:
+                # 쉬는 동안 남아 있던 회신은 다음 호출 때 바로 처리되므로 기록을 비우고 다시 세기 시작한다
+                first_seen.clear()
+                continue
+            pending = self._pending_ids()
+            if pending is None:
+                return
+            now = time.monotonic()
+            for i in pending:
+                first_seen.setdefault(i, now)
+            for i in [k for k in first_seen if k not in pending]:
+                del first_seen[i]
+                if closed_for and closed_for[0] == i:
+                    closed_for = None
+            if not first_seen:
+                continue
+            oldest = min(first_seen, key=first_seen.get)
+            age = now - first_seen[oldest]
+            if closed_for and closed_for[0] == oldest:
+                if now - closed_for[1] > RECHECK_SEC:
+                    log.error("탭을 닫았는데도 %d초째 응답이 없음 - 크롬 전체가 멈춘 듯함. GUI 창을 닫고 다시 실행해 주세요", int(age))
+                    closed_for = (oldest, now)
+                continue
+            if age < LIMIT_SEC:
+                continue
+            if page is None:
+                log.warning("Playwright 요청이 %d초째 응답이 없는데 닫을 탭을 모름 - 그대로 둠", int(age))
+                closed_for = (oldest, now)
+                continue
+            try:
+                self._close_tab(page, int(age))
+            except Exception:  # noqa: BLE001
+                log.exception("멈춘 탭을 닫지 못함")
+            closed_for = (oldest, now)
+
+    def _close_tab(self, page: Page, age_sec: int) -> None:
+        url = page.url
+        targets = _list_targets(self.port)
+        pages = [t for t in targets if t.get("type") == "page"]
+        hit = [t for t in pages if t.get("url") == url]
+        note = "주소로 찾음"
+        if not hit:
+            # 주소가 막 바뀌는 중이었을 수 있다 - 다른 탭들(다른 작업의 탭 포함)의 주소에 없는 탭이 하나뿐이면 그것
+            others = {p.url for p in self.context.pages if p._impl_obj is not page._impl_obj}  # type: ignore[attr-defined]
+            rest = [t for t in pages if t.get("url") not in others]
+            if len(rest) == 1:
+                hit, note = rest, "다른 탭 주소를 빼고 찾음"
+        if not hit:
+            log.warning("Playwright 요청이 %d초째 응답이 없는데 닫을 탭(%s)을 디버깅 포트 목록에서 찾지 못함 - 그대로 둠", age_sec, url)
+            return
+        target_id = hit[0]["id"]
+        log.warning("페이지가 %d초 넘게 응답하지 않음 (크롬 렌더러가 멈춤) - 탭을 닫아 걸린 호출을 끝냄: %s", age_sec, url)
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json/close/{target_id}", timeout=5) as resp:
+            body = resp.read().decode("utf-8", "replace").strip()
+        log.info("탭 닫기 요청 응답: %s", body or "(없음)")
+        with self.lock:
+            self.trip = Trip(at=datetime.now(), url=url, waited_sec=age_sec, note=note)
+
+
+_local = threading.local()   # .watcher - 이 스레드의 Watcher (start 가 둔다)
+_NULL = Watcher()            # 감시자가 없는 스레드(감시 스레드를 안 띄운 빈 감시자)용 - 모듈 함수들이 None 검사 없이 같은 코드를 탄다
+
+
+def _current() -> Watcher:
+    return getattr(_local, "watcher", _NULL)
 
 
 def start(context: BrowserContext, port: int) -> None:
-    """크롬에 붙은 직후 부른다. 감시 스레드를 띄운다 (이미 떠 있으면 대상만 바꾼다)."""
-    global _thread, _context, _port, _trip, _disabled
-    with _lock:
-        _context, _port, _trip, _disabled = context, port, None, False
-        _pages.clear()
-    if _thread is not None and _thread.is_alive():
-        return
-    _stop.clear()
-    _thread = threading.Thread(target=_loop, name="hangwatch", daemon=True)
-    _thread.start()
+    """크롬에 붙은 직후 그 작업 스레드에서 부른다. 이 스레드의 감시 스레드를 띄운다 (이미 있으면 먼저 멈춘다)."""
+    stop()
+    w = Watcher(context, port)
+    _local.watcher = w
+    w.thread.start()
 
 
 def stop() -> None:
-    global _context, _port
-    _stop.set()
-    with _lock:
-        _context, _port = None, None
-        _pages.clear()
+    w = _current()
+    w.stop_event.set()
+    with w.lock:
+        w.pages.clear()
+    _local.watcher = _NULL
 
 
 def set_page(page: Page) -> None:
     """멈추면 닫을 탭을 알려 준다 (안 쓰게 되면 clear_page)."""
-    with _lock:
-        _pages.append(page)
+    w = _current()
+    with w.lock:
+        w.pages.append(page)
 
 
 def clear_page(page: Page) -> None:
-    with _lock:
+    w = _current()
+    with w.lock:
         with contextlib.suppress(ValueError):
-            _pages.remove(page)
+            w.pages.remove(page)
 
 
 @contextlib.contextmanager
@@ -110,111 +202,27 @@ def watching(page: Page):
 @contextlib.contextmanager
 def idle():
     """작업 스레드가 Playwright 호출 밖에서 쉬는 동안 감싼다 - 쉬는 사이에는 회신이 처리되지 않아 멈춘 것처럼 보인다 (머리글)."""
-    global _idle
-    with _lock:
-        _idle += 1
+    w = _current()
+    with w.lock:
+        w.idle += 1
     try:
         yield
     finally:
-        with _lock:
-            _idle -= 1
+        with w.lock:
+            w.idle -= 1
 
 
 def tripped() -> Trip | None:
     """탭을 닫은 기록이 있으면 그것 (지우지 않음)."""
-    return _trip
+    return _current().trip
 
 
 def take_trip() -> Trip | None:
     """탭을 닫은 기록을 돌려주고 지운다 - 부른 쪽이 새 탭으로 다시 시도할 때."""
-    global _trip
-    with _lock:
-        t, _trip = _trip, None
+    w = _current()
+    with w.lock:
+        t, w.trip = w.trip, None
     return t
-
-
-# ---------------------------------------------------------------- 감시 스레드
-
-def _pending_ids(context: BrowserContext) -> set[int] | None:
-    """드라이버 응답을 기다리는 요청 ID. 속성이 없으면(Playwright 내부가 바뀜) None."""
-    global _disabled
-    try:
-        callbacks = context._impl_obj._connection._callbacks  # type: ignore[attr-defined]
-        return {i for i, cb in list(callbacks.items()) if not cb.no_reply and not cb.future.done()}
-    except RuntimeError:       # 다른 스레드가 dict 를 바꾸는 중 - 다음 틱에 다시
-        return set()
-    except AttributeError:
-        if not _disabled:
-            _disabled = True
-            log.warning("Playwright 내부 구조가 달라 멈춤 감시를 쓸 수 없습니다 (탭이 멈추면 [중지]가 듣지 않을 수 있음)")
-        return None
-
-
-def _loop() -> None:
-    first_seen: dict[int, float] = {}
-    closed_for: tuple[int, float] | None = None     # (요청 ID, 닫은 시각)
-    while not _stop.wait(TICK_SEC):
-        with _lock:
-            context, port, page, idle = _context, _port, (_pages[-1] if _pages else None), _idle > 0
-        if context is None or port is None or idle:
-            # 쉬는 동안 남아 있던 회신은 다음 호출 때 바로 처리되므로 기록을 비우고 다시 세기 시작한다
-            first_seen.clear()
-            continue
-        pending = _pending_ids(context)
-        if pending is None:
-            return
-        now = time.monotonic()
-        for i in pending:
-            first_seen.setdefault(i, now)
-        for i in [k for k in first_seen if k not in pending]:
-            del first_seen[i]
-            if closed_for and closed_for[0] == i:
-                closed_for = None
-        if not first_seen:
-            continue
-        oldest = min(first_seen, key=first_seen.get)
-        age = now - first_seen[oldest]
-        if closed_for and closed_for[0] == oldest:
-            if now - closed_for[1] > RECHECK_SEC:
-                log.error("탭을 닫았는데도 %d초째 응답이 없음 - 크롬 전체가 멈춘 듯함. GUI 창을 닫고 다시 실행해 주세요", int(age))
-                closed_for = (oldest, now)
-            continue
-        if age < LIMIT_SEC:
-            continue
-        if page is None:
-            log.warning("Playwright 요청이 %d초째 응답이 없는데 닫을 탭을 모름 - 그대로 둠", int(age))
-            closed_for = (oldest, now)
-            continue
-        try:
-            _close_tab(context, page, port, int(age))
-        except Exception:  # noqa: BLE001
-            log.exception("멈춘 탭을 닫지 못함")
-        closed_for = (oldest, now)
-
-
-def _close_tab(context: BrowserContext, page: Page, port: int, age_sec: int) -> None:
-    global _trip
-    url = page.url
-    targets = _list_targets(port)
-    pages = [t for t in targets if t.get("type") == "page"]
-    hit = [t for t in pages if t.get("url") == url]
-    note = "주소로 찾음"
-    if not hit:
-        # 주소가 막 바뀌는 중이었을 수 있다 - 다른 탭들의 주소에 없는 탭이 하나뿐이면 그것
-        others = {p.url for p in context.pages if p._impl_obj is not page._impl_obj}  # type: ignore[attr-defined]
-        rest = [t for t in pages if t.get("url") not in others]
-        if len(rest) == 1:
-            hit, note = rest, "다른 탭 주소를 빼고 찾음"
-    if not hit:
-        log.warning("Playwright 요청이 %d초째 응답이 없는데 닫을 탭(%s)을 디버깅 포트 목록에서 찾지 못함 - 그대로 둠", age_sec, url)
-        return
-    target_id = hit[0]["id"]
-    log.warning("페이지가 %d초 넘게 응답하지 않음 (크롬 렌더러가 멈춤) - 탭을 닫아 걸린 호출을 끝냄: %s", age_sec, url)
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/close/{target_id}", timeout=5) as resp:
-        body = resp.read().decode("utf-8", "replace").strip()
-    log.info("탭 닫기 요청 응답: %s", body or "(없음)")
-    with _lock:
-        _trip = Trip(at=datetime.now(), url=url, waited_sec=age_sec, note=note)
 
 
 def _list_targets(port: int) -> list[dict]:

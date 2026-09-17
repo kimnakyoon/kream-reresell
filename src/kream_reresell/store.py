@@ -5,8 +5,12 @@ from __future__ import annotations
 import contextlib
 import csv
 import json
+import os
+import threading
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from pathlib import Path
 
 from .config import DATA_DIR
 
@@ -55,34 +59,51 @@ def load_bids() -> dict[str, BidRecord]:
 
 
 def _write_bids(bids: dict[str, BidRecord]) -> None:
+    _write_text(BIDS_PATH, json.dumps({k: asdict(v) for k, v in bids.items()}, ensure_ascii=False, indent=2))
+
+
+def _write_text(path: Path, text: str) -> None:
+    """파일을 통째로 바꾼다 - 임시 파일에 쓰고 교체하므로 잠금 없이 읽는 쪽(load_bids 등)도 늘 온전한 파일을 본다."""
     DATA_DIR.mkdir(exist_ok=True)
-    BIDS_PATH.write_text(
-        json.dumps({k: asdict(v) for k, v in bids.items()}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+# [입찰] 이 넣고 [재입찰] 이 지우는 식으로 작업들이 동시에 같은 파일을 읽고-고치고-쓰므로 (GUI 버튼 동시 실행, 2026-09-17) 그 구간을 잠근다
+_lock = threading.Lock()
+
+
+def _update_bids(mutate: Callable[[dict[str, BidRecord]], bool]) -> bool:
+    """이력을 읽어 mutate 가 True 를 돌려주면 저장한다 (읽고-고치고-쓰기 한 묶음)."""
+    with _lock:
+        bids = load_bids()
+        if not mutate(bids):
+            return False
+        _write_bids(bids)
+        return True
 
 
 def save_bid(record: BidRecord) -> None:
-    bids = load_bids()
-    bids[record.key] = record
-    _write_bids(bids)
+    _update_bids(lambda bids: bids.__setitem__(record.key, record) or True)
 
 
 def append_run_log(row: dict) -> None:
-    DATA_DIR.mkdir(exist_ok=True)
-    row = {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), **row}
-    new = not RUN_LOG_PATH.exists()
-    if not new:
-        with RUN_LOG_PATH.open(encoding="utf-8-sig") as f:
-            header = f.readline().strip().split(",")
-        if header != list(row.keys()):  # 컬럼 구성이 바뀌었으면 옛 파일을 옆에 두고 새로 시작
-            RUN_LOG_PATH.rename(RUN_LOG_PATH.with_name(f"run_log_old_{datetime.now():%Y%m%d_%H%M%S}.csv"))
-            new = True
-    with RUN_LOG_PATH.open("a", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if new:
-            w.writeheader()
-        w.writerow(row)
+    with _lock:
+        DATA_DIR.mkdir(exist_ok=True)
+        row = {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), **row}
+        new = not RUN_LOG_PATH.exists()
+        if not new:
+            with RUN_LOG_PATH.open(encoding="utf-8-sig") as f:
+                header = f.readline().strip().split(",")
+            if header != list(row.keys()):  # 컬럼 구성이 바뀌었으면 옛 파일을 옆에 두고 새로 시작
+                RUN_LOG_PATH.rename(RUN_LOG_PATH.with_name(f"run_log_old_{datetime.now():%Y%m%d_%H%M%S}.csv"))
+                new = True
+        with RUN_LOG_PATH.open("a", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if new:
+                w.writeheader()
+            w.writerow(row)
 
 
 def remove_bid(product_id: int, size: str = ONE_SIZE, price: int | None = None) -> bool:
@@ -91,15 +112,15 @@ def remove_bid(product_id: int, size: str = ONE_SIZE, price: int | None = None) 
     price 를 주면 기록의 희망가가 그 값일 때만 뺀다 (지우는 경로는 모두 지운 입찰의 희망가를 넘긴다) - 기한 만료된 옛 입찰을 지울 때
     같은 상품에 새로 넣은 입찰의 기록을 지우지 않게. 기록이 같은 입찰인지 알 열쇠가 상품 ID·size 뿐이라 희망가로 가려낸다.
     """
-    bids = load_bids()
     key = bid_key(product_id, size)
-    if key not in bids:
-        return False
-    if price is not None and bids[key].price != price:
-        return False
-    del bids[key]
-    _write_bids(bids)
-    return True
+
+    def drop(bids: dict[str, BidRecord]) -> bool:
+        if key not in bids or (price is not None and bids[key].price != price):
+            return False
+        del bids[key]
+        return True
+
+    return _update_bids(drop)
 
 
 # ---------------------------------------------------------------- 입찰번호 -> 상품 ID·옵션 (재입찰용 캐시)
@@ -138,8 +159,7 @@ def _load_json(path) -> dict:
 
 
 def _write_json(path, data: dict) -> None:
-    DATA_DIR.mkdir(exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    _write_text(path, json.dumps(data, ensure_ascii=False, indent=1))
 
 
 # ---------------------------------------------------------------- 사이트가 카테고리 단위로 거절한 입찰 (그날 하루 건너뜀)

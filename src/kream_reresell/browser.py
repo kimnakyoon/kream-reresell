@@ -19,6 +19,13 @@ KREAM 은 네이버 계열 사이트라 봇 탐지를 염두에 둬야 한다. a
   - 죽었음: 이전 실행이 남긴 크롬 (GUI 창을 닫거나 작업 관리자로 끝내면 작업 스레드가 정리를 못 해 남는다,
     2026-09-06 실측) → 정상 종료를 요청해 닫고(안 되면 강제 종료) 새로 띄운다
 또 띄운 크롬을 Job Object 에 넣어 이 python 이 어떻게 끝나든 크롬도 같이 끝나게 한다 (winproc 참고).
+
+한 프로세스 안에서는 크롬 하나를 여러 작업이 같이 쓴다 (2026-09-17, GUI 버튼 동시 실행): real_chrome_context 를 처음 부른 작업이 크롬을
+띄우고, 그 뒤에 부른 작업은 (자기 스레드의 sync_playwright 로) 같은 디버깅 포트에 따로 붙는다. 마지막 작업이 끝날 때만 크롬을 닫는다
+(참조 수). 동기 Playwright 객체는 만든 스레드에서만 쓸 수 있어 연결은 작업(스레드)마다 하나씩이고, 작업은 자기 탭만 쓴다 -
+SharedContext.new_page() 로 탭을 열면 이미지 차단·API route·접속 세기가 그 탭에만 붙는다 (context.route 는 다른 작업의 탭까지 두 번 가로채므로
+쓰지 않는다). 다른 연결이 연 탭도 이 연결의 컨텍스트에 보이지만 (Playwright 는 모든 탭에 붙는다) 건드리지 않는다. 요청·접속 예산(pacing)은
+프로세스 전체가 하나를 나눠 쓰므로 동시에 돌아도 사이트에 보내는 양은 그 예산 안이다.
 """
 
 from __future__ import annotations
@@ -29,6 +36,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -89,67 +97,32 @@ def _wait_for_port(port: int, timeout_sec: float) -> bool:
 # 판정에 전혀 쓰지 않는 리소스. 상품 페이지는 이미지가 용량의 대부분이라 이것만 안 받아도 훨씬 빠르다.
 BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
 
+# ---------------------------------------------------------------- 탭의 요청 처리 (사이트 스로틀 대응은 pacing 참고)
 
-def _abort_heavy(route) -> None:
-    if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
-        route.abort()
-    else:
-        route.continue_()
-
-
-def block_heavy_resources(context: BrowserContext) -> None:
-    context.route("**/*", _abort_heavy)
-
-
-# ---------------------------------------------------------------- 사이트 스로틀 대응 (pacing 참고)
-
-_trimming = False
-_trim_sales = False   # sales_trimmed() 안에서만 True - 상품 페이지가 여는 sales 요청도 빈 응답으로 채운다
 _CORS_HEADERS = {"access-control-allow-origin": "https://kream.co.kr", "access-control-allow-credentials": "true"}
 
 
-def _api_route(route) -> None:
-    """api.kream.co.kr 요청 하나를 처리한다 (스로틀 대응, pacing 참고):
-      - asks·bids·chart (프로그램이 안 봄): 서버에 보내지 않고 빈 목록(200)으로 채운다. abort 하면 사이트가 오류 표시로 바꾼다 (실측)
-      - sales 등 스로틀 대상: 세고 그대로 보낸다
-      - 나머지: 그대로
+def _route(route, block_images: bool, trim_api: bool) -> None:
+    """탭의 요청 하나를 처리한다 (탭마다 route 하나):
+      - api.kream.co.kr: trim_api 면 asks·bids·chart (프로그램이 안 봄) 를 서버에 보내지 않고 빈 목록(200)으로 채운다
+        (abort 하면 사이트가 오류 표시로 바꾼다 - 실측). sales 등 스로틀 대상은 세고(pacing.BUDGET) 그대로 보낸다
+      - 그 밖: block_images 면 이미지·동영상·폰트를 받지 않는다
 
     같은 sales 요청을 캐시해 돌려주는 것은 하지 않는다 - 응답 핸들러에서 response.body() 를 읽거나 route.fetch() 로 받으면
     페이지가 그 응답을 못 받아 표가 빈 채로 그려진다 (2026-09-05 실측, 옵션 전부 0건으로 세어질 뻔함).
     """
     request = route.request
-    path = urlparse(request.url).path
-    if _trimming and (pacing.TRIMMABLE_PATH_RE.match(path) or (_trim_sales and pacing.THROTTLED_PATH_RE.match(path))):
-        route.fulfill(status=200, content_type="application/json", body=pacing.TRIM_BODY, headers=_CORS_HEADERS)
+    if request.url.startswith(pacing.API_ORIGIN):
+        path = urlparse(request.url).path
+        if trim_api and pacing.TRIMMABLE_PATH_RE.match(path):
+            route.fulfill(status=200, content_type="application/json", body=pacing.TRIM_BODY, headers=_CORS_HEADERS)
+            return
+        if request.method == "GET" and pacing.THROTTLED_PATH_RE.match(path):
+            pacing.BUDGET.note(path)
+    elif block_images and request.resource_type in BLOCKED_RESOURCE_TYPES:
+        route.abort()
         return
-    if request.method == "GET" and pacing.THROTTLED_PATH_RE.match(path):
-        pacing.BUDGET.note(path)
     route.continue_()
-
-
-@contextlib.contextmanager
-def sales_trimmed():
-    """이 안에서 여는 상품 페이지의 sales 요청(스로틀 대상)도 서버에 보내지 않고 빈 응답으로 채운다.
-
-    체결 내역을 보지 않고 구매하기 모달의 A 와 구매 페이지의 B 만 읽을 때 쓴다 ([재입찰]의 밀리지 않은 입찰 확인) -
-    상품 페이지를 열면 sales 가 2건 나가는데 (pacing 참고) 그걸 0건으로 만든다. 본문의 체결 거래 표는 빈 표로 그려지지만
-    구매하기 모달·구매 페이지는 sales 를 쓰지 않아 A·B 는 그대로 읽힌다 (2026-09-06 실측). 체결 내역이 필요하면
-    이 밖에서 상품 페이지를 다시 열어야 한다 (패널을 열 때 sales 를 다시 요청하지만 안전하게 새로 연다).
-    trim 이 꺼져 있으면(watch_api_requests(trim=False)) 아무것도 하지 않는다.
-    """
-    global _trim_sales
-    _trim_sales = True
-    try:
-        yield
-    finally:
-        _trim_sales = False
-
-
-def watch_api_requests(context: BrowserContext, trim: bool = True) -> None:
-    """api.kream.co.kr 요청을 route 로 받아 스로틀 대상을 세고(pacing.BUDGET), trim 이면 안 보는 요청을 빈 응답으로 채운다."""
-    global _trimming
-    _trimming = trim
-    context.route(f"{pacing.API_ORIGIN}/**", _api_route)
 
 
 # 탭마다 마지막으로 센 주소 - 사이트가 같은 주소로 되풀이하는 replaceState 를 안 세려고 (pacing 대응 5 참고).
@@ -159,7 +132,10 @@ _last_visit: dict[Page, str] = {}
 
 
 def _count_visit(frame: Frame) -> None:
-    """메인 프레임이 kream.co.kr 의 다른 주소로 이동했으면(주소 안 이동 pushState 포함) 접속 예산에 하나 센다."""
+    """메인 프레임이 kream.co.kr 의 다른 주소로 이동했으면(주소 안 이동 pushState 포함) 접속 예산에 하나 센다.
+
+    호출 지점에서 세지 않고 여기서 세므로 상품·구매 페이지뿐 아니라 변경 화면, 입찰 상세, 재시도, 사이트 확인 페이지도 다 들어간다.
+    """
     if frame.parent_frame is not None:
         return
     url = frame.url
@@ -168,18 +144,33 @@ def _count_visit(frame: Frame) -> None:
         pacing.PAGE_BUDGET.count()
 
 
-def watch_page_visits(context: BrowserContext) -> None:
-    """이 컨텍스트의 모든 탭(지금 있는 것과 앞으로 열 것)의 페이지 이동을 접속 예산에 센다 (pacing 대응 5).
+class SharedContext:
+    """작업 하나의 탭 묶음 - 같은 크롬을 다른 작업과 나눠 쓰므로 자기 탭만 다룬다 (머리글).
 
-    호출 지점에서 세지 않고 여기서 세므로 상품·구매 페이지뿐 아니라 변경 화면, 입찰 상세, 재시도, 사이트 확인 페이지도 다 들어간다.
+    new_page() 로 연 탭에만 이미지 차단·API 요청 처리·접속 세기가 붙는다. 연결 전체(다른 작업의 탭 포함)의 이벤트가 필요하면
+    raw (원본 BrowserContext) 를 쓴다 - api.ApiClient 의 헤더 잡기. route 같은 컨텍스트 단위 조작은 일부러 열어 두지 않는다.
     """
-    def on_page(page: Page) -> None:
+
+    def __init__(self, context: BrowserContext, block_images: bool, trim_api: bool) -> None:
+        self.raw = context
+        self.block_images = block_images
+        self.trim_api = trim_api
+        self._pages: list[Page] = []
+
+    def new_page(self) -> Page:
+        page = self.raw.new_page()
+        page.route("**/*", lambda route: _route(route, self.block_images, self.trim_api))
         page.on("framenavigated", _count_visit)
         page.on("close", lambda p: _last_visit.pop(p, None))
+        self._pages.append(page)
+        return page
 
-    for page in context.pages:
-        on_page(page)
-    context.on("page", on_page)
+    def close_pages(self) -> None:
+        """연결을 끊어도 탭은 크롬에 남으므로 이 작업이 연 탭을 직접 닫는다."""
+        for page in self._pages:
+            with contextlib.suppress(Exception):
+                page.close()
+        self._pages.clear()
 
 
 # ---------------------------------------------------------------- 크롬 창 위치 (Windows 전용)
@@ -262,25 +253,30 @@ class ChromeWindow:
                 self.hide()
 
 
-_active_window: ChromeWindow | None = None
+def _window() -> ChromeWindow | None:
+    """지금 떠 있는 크롬의 창 (없으면 None)."""
+    return _shared.window if _shared is not None else None
 
 
 def show_window() -> bool:
     """지금 돌고 있는 크롬 창을 화면 안으로 불러온다 (GUI 의 '크롬 창 보기')."""
-    return bool(_active_window and _active_window.show())
+    window = _window()
+    return bool(window and window.show())
 
 
 def hide_window() -> bool:
-    return bool(_active_window and _active_window.hide())
+    window = _window()
+    return bool(window and window.hide())
 
 
 @contextlib.contextmanager
 def window_shown():
     """직접 로그인처럼 사람이 크롬 창을 봐야 하는 구간을 감싼다."""
-    if _active_window is None:
+    window = _window()
+    if window is None:
         yield
         return
-    with _active_window.shown():
+    with window.shown():
         yield
 
 
@@ -349,20 +345,22 @@ def reclaim_profile(playwright: Playwright, profile: Path) -> None:
         raise RuntimeError("남은 크롬을 닫았는데도 프로필이 아직 잠겨 있습니다. 잠시 뒤 다시 실행해 주세요.")
 
 
-@contextlib.contextmanager
-def real_chrome_context(playwright: Playwright, window_size: str = "1400,1000",
-                        profile_dir: Path | None = None, block_images: bool = True,
-                        show_chrome: bool = False, trim_api: bool = True):
-    """크롬을 직접 실행해 CDP 로 붙은 BrowserContext (with 문으로 쓴다).
+class _SharedChrome:
+    """이 프로세스가 띄운 크롬 하나 - 작업들이 참조 수로 나눠 쓴다 (머리글)."""
 
-    headless 는 봇 탐지 점수가 바닥이라 쓰지 않는다. 창은 항상 만들되, show_chrome 이 False 면
-    처음부터 화면 밖에 그린다 (작업표시줄에만 남음). 실행 중 show_window()/hide_window() 로 바꿀 수 있다.
-    block_images 가 True 면 이미지/동영상/폰트를 받지 않는다 (화면에 그림은 안 보이지만 동작은 같다).
-    trim_api 가 True 면 프로그램이 안 보는 상품 API(asks·bids·chart) 요청을 막는다 (사이트 스로틀 대응, pacing 참고).
-    """
-    global _active_window
-    profile = (profile_dir or PROFILE_DIR).resolve()  # 상대경로를 주면 크롬이 조용히 종료한다
-    profile.mkdir(parents=True, exist_ok=True)
+    def __init__(self, proc: subprocess.Popen, port: int, window: ChromeWindow) -> None:
+        self.proc = proc
+        self.port = port
+        self.window = window
+        self.refs = 0
+
+
+_shared: _SharedChrome | None = None
+_shared_lock = threading.Lock()   # 띄우기·닫기를 통째로 감싼다 - 닫는 중에 새 작업이 오면 다 닫힌 뒤 새로 띄운다
+
+
+def _launch(playwright: Playwright, profile: Path, window_size: str, show_chrome: bool) -> _SharedChrome:
+    """크롬을 띄우고 디버깅 포트가 열릴 때까지 기다린다."""
     reclaim_profile(playwright, profile)
     port = _free_port()
     args = [
@@ -380,43 +378,93 @@ def real_chrome_context(playwright: Playwright, window_size: str = "1400,1000",
     args.append("about:blank")
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     winproc.kill_with_this_process(proc.pid)   # 이 python 이 어떻게 끝나든 크롬도 같이 끝나게 (남으면 다음 실행이 막힌다)
+    if not _wait_for_port(port, CDP_READY_TIMEOUT_SEC):
+        _stop_process(proc)
+        # 같은 프로필을 쓰는 크롬이 이미 떠 있으면 새 크롬은 조용히 종료된다 (reclaim_profile 이 놓친 경우)
+        raise RuntimeError(f"크롬이 디버깅 포트({port})를 {CDP_READY_TIMEOUT_SEC}초 안에 열지 않았습니다. "
+                           "이 프로그램의 다른 실행(GUI 또는 명령행)이 아직 크롬을 쓰고 있지 않은지, "
+                           "작업 관리자에 chrome.exe 가 남아 있지 않은지 확인해 주세요.")
+    window = ChromeWindow(proc.pid, hidden=not show_chrome)
+    if not show_chrome:
+        if window.hide():  # 크롬이 시작 위치를 화면 안으로 당겼을 때를 대비해 한 번 더 옮긴다
+            log.info("크롬 창을 화면 밖에 두고 실행합니다 (작업표시줄의 크롬 아이콘으로 확인 가능)")
+        else:
+            log.warning("크롬 창을 찾지 못해 실행 중 창 보이기/숨기기를 쓸 수 없습니다")
+    return _SharedChrome(proc, port, window)
+
+
+def _stop_process(proc: subprocess.Popen) -> None:
+    """정상 종료를 이미 요청한 크롬 프로세스가 끝나기를 기다리고, 안 끝나면 강제 종료."""
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=10)
+    if proc.poll() is None:
+        with contextlib.suppress(Exception):
+            proc.terminate()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=10)
+    winproc.release(proc.pid)   # 그래도 살아 있으면 Job 핸들이 닫히며 죽는다
+
+
+def _disconnect(browser, shutdown: bool) -> None:
+    """이 작업의 연결을 끊는다. shutdown 이면 그 전에 크롬에 정상 종료를 요청한다 (그래야 프로필(쿠키)이 디스크에 남는다)."""
+    if browser is None:
+        return
+    if shutdown:
+        with contextlib.suppress(Exception):
+            browser.new_browser_cdp_session().send("Browser.close")
+    with contextlib.suppress(Exception):
+        browser.close()
+
+
+@contextlib.contextmanager
+def real_chrome_context(playwright: Playwright, window_size: str = "1400,1000",
+                        profile_dir: Path | None = None, block_images: bool = True,
+                        show_chrome: bool = False, trim_api: bool = True):
+    """크롬을 직접 실행(또는 이 프로세스가 이미 띄운 크롬에 합류)해 CDP 로 붙은 SharedContext (with 문으로 쓴다).
+
+    headless 는 봇 탐지 점수가 바닥이라 쓰지 않는다. 창은 항상 만들되, show_chrome 이 False 면
+    처음부터 화면 밖에 그린다 (작업표시줄에만 남음). 실행 중 show_window()/hide_window() 로 바꿀 수 있다.
+    block_images 가 True 면 이 작업이 여는 탭에서 이미지/동영상/폰트를 받지 않는다 (화면에 그림은 안 보이지만 동작은 같다).
+    trim_api 가 True 면 프로그램이 안 보는 상품 API(asks·bids·chart) 요청을 막는다 (사이트 스로틀 대응, pacing 참고).
+    playwright 는 부르는 스레드의 sync_playwright() 여야 한다 - 작업마다 자기 연결로 붙는다 (머리글).
+    크롬은 처음 부른 작업이 띄우고 (window_size·창 위치는 그때 값), 마지막 작업이 끝날 때 닫힌다.
+    """
+    global _shared
+    profile = (profile_dir or PROFILE_DIR).resolve()  # 상대경로를 주면 크롬이 조용히 종료한다
+    profile.mkdir(parents=True, exist_ok=True)
+    with _shared_lock:
+        if _shared is None:
+            _shared = _launch(playwright, profile, window_size, show_chrome)
+        else:
+            log.info("이 프로그램이 띄워 둔 크롬(포트 %d)에 합류합니다 (작업 %d개째)", _shared.port, _shared.refs + 1)
+        chrome = _shared
+        chrome.refs += 1
+        pacing.job_started()
     browser = None
+    context: SharedContext | None = None
     try:
-        if not _wait_for_port(port, CDP_READY_TIMEOUT_SEC):
-            # 같은 프로필을 쓰는 크롬이 이미 떠 있으면 새 크롬은 조용히 종료된다 (reclaim_profile 이 놓친 경우)
-            raise RuntimeError(f"크롬이 디버깅 포트({port})를 {CDP_READY_TIMEOUT_SEC}초 안에 열지 않았습니다. "
-                               "이 프로그램의 다른 실행(GUI 또는 명령행)이 아직 크롬을 쓰고 있지 않은지, "
-                               "작업 관리자에 chrome.exe 가 남아 있지 않은지 확인해 주세요.")
-        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
-        _active_window = ChromeWindow(proc.pid, hidden=not show_chrome)
-        if not show_chrome:
-            if _active_window.hide():  # 크롬이 시작 위치를 화면 안으로 당겼을 때를 대비해 한 번 더 옮긴다
-                log.info("크롬 창을 화면 밖에 두고 실행합니다 (작업표시줄의 크롬 아이콘으로 확인 가능)")
-            else:
-                log.warning("크롬 창을 찾지 못해 실행 중 창 보이기/숨기기를 쓸 수 없습니다")
-        context: BrowserContext = browser.contexts[0] if browser.contexts else browser.new_context()
-        context.set_default_timeout(15_000)
-        if block_images:
-            block_heavy_resources(context)
-        watch_api_requests(context, trim=trim_api)
-        watch_page_visits(context)
-        # 탭의 렌더러가 완전히 멈춰 호출이 영영 안 돌아오면 그 탭을 닫아 이어가게 한다 (hangwatch 참고, 2026-09-06 실측)
-        hangwatch.start(context, port)
+        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{chrome.port}")
+        if show_chrome and chrome.window.hidden:   # 나중에 합류한 작업이 창 보기를 켜 두었으면 불러온다
+            chrome.window.show()
+        raw: BrowserContext = browser.contexts[0] if browser.contexts else browser.new_context()
+        raw.set_default_timeout(15_000)
+        context = SharedContext(raw, block_images, trim_api)
+        # 탭의 렌더러가 완전히 멈춰 호출이 영영 안 돌아오면 그 탭을 닫아 이어가게 한다 (hangwatch 참고, 2026-09-06 실측) - 연결마다 하나
+        hangwatch.start(raw, chrome.port)
         yield context
     finally:
         hangwatch.stop()
-        _active_window = None
-        if browser is not None:
-            # 정상 종료를 요청해야 프로필(쿠키)이 디스크에 남는다
-            with contextlib.suppress(Exception):
-                browser.new_browser_cdp_session().send("Browser.close")
-            with contextlib.suppress(Exception):
-                browser.close()
-        with contextlib.suppress(Exception):
-            proc.wait(timeout=10)
-        if proc.poll() is None:
-            with contextlib.suppress(Exception):
-                proc.terminate()
-            with contextlib.suppress(Exception):
-                proc.wait(timeout=10)
-        winproc.release(proc.pid)   # 그래도 살아 있으면 Job 핸들이 닫히며 죽는다
+        if context is not None:
+            context.close_pages()
+        # 마지막 작업이면 크롬을 닫는데, 그동안 잠금을 쥔다 - 다 닫히기 전에 새 작업이 같은 프로필로 새 크롬을 띄우면 프로필 잠김에 걸린다
+        with _shared_lock:
+            chrome.refs -= 1
+            pacing.job_ended()
+            last = chrome.refs == 0
+            if last:
+                _shared = None
+            _disconnect(browser, shutdown=last)
+            if last:
+                _stop_process(chrome.proc)
+            else:
+                log.info("이 작업의 연결을 끊음 - 크롬은 남은 작업 %d개가 계속 씀", chrome.refs)

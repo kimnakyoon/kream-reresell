@@ -15,9 +15,13 @@
 끝나면 바탕화면\\KREAM 결과\\ 에 엑셀 보고서가 저장된다 (자동으로 열지는 않는다).
 [내역] 은 달을 고르면 보관 판매(종료) 에서 그 달에 거래된 판매를 구매 내역(종료) 과 짝지어
 정산 시트 모양의 엑셀(바탕화면\\KREAM 내역 YYYY-MM.xlsx) 로 저장한다.
-[중지] 는 지금 보고 있는 상품(입찰)을 끝낸 뒤 멈춘다.
+[중지] 는 지금 보고 있는 상품(입찰)을 끝낸 뒤 멈춘다 (여러 작업이 돌고 있으면 어느 것을 멈출지 고른다).
 [판매] 는 "판매 관리" 창(sellwin)을 연다 - 보관 판매 목록 표에서 행을 골라 경쟁에 넣고 [경쟁 시작] 을 누르면 하한(매입가 + 마진) 위에서
-최저가 경쟁으로 판매 희망가를 맞춘다 (README '판매 규칙'). 창이 열려 있는 동안은 크롬을 그 창이 쓰므로 다른 버튼은 잠긴다.
+최저가 경쟁으로 판매 희망가를 맞춘다 (README '판매 규칙').
+
+버튼은 서로 독립이다 (2026-09-17, 사용자 요청): [재입찰] 이 도는 동안 [입찰]·[내역]·[판매] 를 같이 돌릴 수 있다. 작업마다 자기 스레드가
+같은 크롬에 따로 붙어 자기 탭만 쓴다 (browser 머리글). 같은 버튼은 끝날 때까지 다시 누를 수 없고, 상태줄에 도는 작업이 전부 보인다.
+사이트에 보내는 요청·접속 예산과 시세 API 틱은 프로세스가 하나를 나눠 쓰므로 동시에 돌아도 사이트 쪽 속도는 그대로다 (대신 각 작업은 그만큼 느려진다).
 """
 
 from __future__ import annotations
@@ -28,6 +32,8 @@ import queue
 import sys
 import threading
 import tkinter as tk
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox
@@ -59,15 +65,47 @@ MAX_SECTION_LINES_IN_POPUP = 20   # [재입찰] 완료 창에 보여줄 회차�
 CATEGORY_COLUMNS = 6
 
 
+# 같은 것을 손대는 작업 쌍 - 같이 돌리려 하면 한 번 더 묻는다
+CONFLICTS = {
+    frozenset({"입찰취소", "재입찰"}): "둘 다 마이페이지 구매 입찰 목록을 순서대로 손대므로 같은 입찰을 서로 바꾸거나 지우려다\n"
+                                    "한쪽이 오류로 남을 수 있습니다 ([재입찰] 은 기준 미달 입찰도 지우므로 보통 [입찰취소] 를 따로 돌릴 필요가 없습니다).",
+}
+
+
 class QueueHandler(logging.Handler):
-    """로그를 GUI 스레드로 넘기기 위한 핸들러."""
+    """로그를 GUI 스레드로 넘기기 위한 핸들러 (큐 메시지는 모두 (종류, 작업 이름, 내용) 세 짝)."""
 
     def __init__(self, q: queue.Queue) -> None:
         super().__init__()
         self.q = q
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.q.put(("log", self.format(record)))
+        self.q.put(("log", None, self.format(record)))
+
+
+def tag_job_logs(job_names: tuple[str, ...]) -> None:
+    """작업 스레드(이름 = 버튼 이름)에서 난 로그 레코드에 '[재입찰] ' 같은 머리(record.job)를 붙인다 - 여러 작업이 동시에 돌 때 구분용."""
+    make = logging.getLogRecordFactory()
+
+    def factory(*args, **kwargs) -> logging.LogRecord:
+        record = make(*args, **kwargs)
+        record.job = f"[{record.threadName}] " if record.threadName in job_names else ""
+        return record
+
+    logging.setLogRecordFactory(factory)
+
+
+@dataclass
+class Job:
+    """돌고 있는 작업 하나 (버튼 하나)."""
+    name: str
+    status: str = ""
+    stop: threading.Event | None = None     # [중지] 로 멈추는 방법. None = 판매 관리 창처럼 자기 창 안에서만 멈춘다
+    on_done: Callable[[str, object], None] | None = None   # ("done", 이름, 결과) 가 오면 부른다 - 기본은 App._finish
+
+    @property
+    def stoppable(self) -> bool:
+        return self.stop is not None and not self.stop.is_set()
 
 
 def _place_right_center(root: tk.Tk) -> None:
@@ -83,8 +121,8 @@ class App:
         root.minsize(700, 620)  # 세 화면(랭킹·검색·SHOP) 모두 700px 을 요구 - 더 좁히면 라디오·버튼 행이 잘림
 
         self.q: queue.Queue = queue.Queue()
-        self.stop_flag = threading.Event()
-        self.worker: threading.Thread | None = None
+        self.jobs: dict[str, Job] = {}          # 돌고 있는 작업 (이름 → Job). 버튼은 자기 작업이 도는 동안만 잠긴다
+        self.last_status = "대기 중"            # 도는 작업이 없을 때 상태줄에 보일 문구 (마지막 완료 결과)
         self.last_report: Path | None = None
         self.base = Settings()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -255,16 +293,20 @@ class App:
             b.pack(side="left", padx=(0 if first else 8, 0))
             return b
 
-        self.run_button = big_button("입찰", "#222", "#444", self.start, first=True)
-        self.cancel_button = big_button("입찰취소", "#8B0000", "#B22222", self.start_cancel)
-        self.rebid_button = big_button("재입찰", "#B36B00", "#D98C1F", self.start_rebid)
-        self.history_button = big_button("내역", "#1F4E79", "#2E75B6", self.start_history)
-        self.sell_button = big_button("판매", "#2E7D32", "#43A047", self.start_sell)
+        # 작업 이름 → 버튼. 이름은 그대로 작업 스레드 이름·로그 머리·상태줄에 쓰인다 (sell.SellEngine 의 스레드 이름 "판매" 도 여기와 같아야 함)
+        self.buttons: dict[str, tk.Button] = {
+            "입찰": big_button("입찰", "#222", "#444", self.start, first=True),
+            "입찰취소": big_button("입찰취소", "#8B0000", "#B22222", self.start_cancel),
+            "재입찰": big_button("재입찰", "#B36B00", "#D98C1F", self.start_rebid),
+            "내역": big_button("내역", "#1F4E79", "#2E75B6", self.start_history),
+            "판매": big_button("판매", "#2E7D32", "#43A047", self.start_sell),
+        }
         self.stop_button = tk.Button(buttons, text="중지 (지금 것까지만)", width=18, height=2, state="disabled",
                                      command=self.request_stop)
         self.stop_button.pack(side="left", padx=(8, 0))
-        self.status = tk.Label(buttons, text="대기 중", fg="#333", anchor="w")  # 긴 문구는 뒤쪽만 잘리게
-        self.status.pack(side="left", padx=(16, 0))
+        # 상태줄은 버튼 아래 한 줄 - 여러 작업이 동시에 돌면 "[재입찰] … | [내역] …" 처럼 다 보인다
+        self.status = tk.Label(root, text="대기 중", fg="#333", anchor="w", justify="left", wraplength=WINDOW_WIDTH - 40)
+        self.status.pack(fill="x", padx=12, pady=(0, 2))
 
         # ---- 로그
         log_frame = tk.LabelFrame(root, text="진행 상황")
@@ -289,11 +331,12 @@ class App:
     # ------------------------------------------------------------ 로깅
     def _setup_logging(self) -> None:
         LOG_DIR.mkdir(exist_ok=True)
-        fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+        tag_job_logs(tuple(self.buttons))
+        fmt = "%(asctime)s %(levelname)s %(job)s%(message)s"
         handler = QueueHandler(self.q)
-        handler.setFormatter(fmt)
+        handler.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
         file_handler = logging.FileHandler(LOG_DIR / f"gui_{datetime.now():%Y%m%d_%H%M%S}.log", encoding="utf-8")
-        file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        file_handler.setFormatter(logging.Formatter(fmt))
         rootlog = logging.getLogger()
         rootlog.setLevel(logging.INFO)
         rootlog.addHandler(handler)
@@ -436,7 +479,7 @@ class App:
         return [name for name in ALL_CATEGORIES if self.category_vars[name].get()]
 
     def start(self) -> None:
-        if self.worker and self.worker.is_alive():
+        if "입찰" in self.jobs:
             return
         source = self.source.get()
         searching = source == "search"
@@ -500,31 +543,72 @@ class App:
             settings.search_quick_only = self.search_quick.get()
         if shopping:
             settings.shop_quick_only = self.shop_quick.get()
-        self.stop_flag.clear()
-        self.last_report = None
-        self.open_report_button.configure(state="disabled")
-        self._set_busy(True, "실행 중...")
         self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 시작: {log_head}, "
                   f"{'판단만' if dry else '실제 입찰'} =====\n입찰 기준: {rules.describe()}")
+        self._start_job("입찰", "실행 중...",
+                        lambda stop, status: run_job(settings, categories, keywords=keywords, shop_categories=shop_categories,
+                                                     should_stop=stop.is_set, on_status=status))
 
-        self.worker = threading.Thread(target=self._worker, args=(settings, categories, keywords, shop_categories),
-                                       daemon=True)
-        self.worker.start()
+    # ------------------------------------------------------------ 작업(스레드) 공통
+    def _start_job(self, name: str, status: str, target, on_done: Callable[[str, object], None] | None = None) -> None:
+        """target(stop, on_status) 를 이름이 name 인 스레드에서 돌린다. 끝나면 ("done", name, 결과) 또는 ("error", name, 문구) 가 큐로 온다.
 
-    def _worker(self, settings: Settings, categories: list[str], keywords: list[str],
-                shop_categories: list[str]) -> None:
-        try:
-            job = run_job(settings, categories, keywords=keywords, shop_categories=shop_categories,
-                          should_stop=self.stop_flag.is_set, on_status=lambda text: self.q.put(("status", text)))
-            self.q.put(("done", job))
-        except Exception as e:  # noqa: BLE001
-            logging.getLogger("gui").exception("실행 중 오류")
-            self.q.put(("error", f"{type(e).__name__}: {e}"))
+        같은 이름의 작업은 하나만 돈다 (버튼이 잠긴다). 다른 이름의 작업과는 동시에 돈다 - 크롬은 browser 가 나눠 쓴다.
+        """
+        job = Job(name, status, stop=threading.Event(), on_done=on_done or self._finish)
+        if not self._add_job(job):
+            return
+
+        def run() -> None:
+            try:
+                result = target(job.stop, lambda text: self.q.put(("status", name, text)))
+                self.q.put(("done", name, result))
+            except Exception as e:  # noqa: BLE001
+                logging.getLogger("gui").exception("%s 중 오류", name)
+                self.q.put(("error", name, f"{type(e).__name__}: {e}"))
+
+        threading.Thread(target=run, name=name, daemon=True).start()
+
+    def _add_job(self, job: Job) -> bool:
+        """작업을 장부에 올리고 버튼을 잠근다. 같은 이름이 이미 돌고 있으면 False."""
+        if job.name in self.jobs:
+            return False
+        self.jobs[job.name] = job
+        self._refresh_buttons()
+        return True
+
+    def _end_job(self, name: str, text: str) -> None:
+        """작업이 끝났다 - 버튼을 풀고 상태줄에 결과를 남긴다."""
+        if self.jobs.pop(name, None):
+            self.last_status = f"{name} {text}"
+        self._refresh_buttons()
+
+    def _refresh_buttons(self) -> None:
+        """버튼 잠금·[중지]·상태줄을 지금 도는 작업들에 맞춘다 (작업이 시작·종료·중지될 때)."""
+        for name, button in self.buttons.items():
+            button.configure(state="disabled" if name in self.jobs else "normal")
+        self.stop_button.configure(state="normal" if self._stoppable() else "disabled")
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        if self.jobs:
+            self.status.configure(text=" | ".join(f"[{j.name}] {j.status}" for j in self.jobs.values()))
+        else:
+            self.status.configure(text=self.last_status)
+
+    def _stoppable(self) -> list[Job]:
+        return [j for j in self.jobs.values() if j.stoppable]
+
+    def _confirm_conflicts(self, name: str) -> bool:
+        """name 과 같은 것을 손대는 작업(CONFLICTS)이 돌고 있으면 같이 돌릴지 묻는다."""
+        for other in self.jobs:
+            why = CONFLICTS.get(frozenset({name, other}))
+            if why and not messagebox.askyesno(name, f"[{other}] 이 지금 돌고 있습니다. {why}\n\n그래도 [{name}] 을 같이 돌릴까요?"):
+                return False
+        return True
 
     def start_cancel(self) -> None:
         """마이페이지 구매 입찰 목록을 순서대로 다시 판정해 기준 미달 입찰을 지운다."""
-        if self.worker and self.worker.is_alive():
-            return
         tick = self._read_tick_sec()
         if tick is None:
             return
@@ -538,28 +622,15 @@ class App:
                           f"{rules.describe()}).\n\n"
                           "기준에 못 미치는 입찰은 실제로 지웁니다 (되돌릴 수 없음).\n\n진행할까요?"):
             return
+        if not self._confirm_conflicts("입찰취소"):
+            return
         settings = self._make_settings(dry, rules, tick)
-        self.stop_flag.clear()
-        self.last_report = None
-        self.open_report_button.configure(state="disabled")
-        self._set_busy(True, "입찰취소 실행 중...")
         self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 입찰취소 시작: 구매 입찰 목록 전체, "
                   f"{'판단만' if dry else '기준 미달 입찰 지움'} =====\n입찰 기준: {rules.describe()}")
-        self.worker = threading.Thread(target=self._cancel_worker, args=(settings,), daemon=True)
-        self.worker.start()
-
-    def _cancel_worker(self, settings: Settings) -> None:
-        try:
-            job = run_cancel_job(settings, should_stop=self.stop_flag.is_set)
-            self.q.put(("done", job))
-        except Exception as e:  # noqa: BLE001
-            logging.getLogger("gui").exception("입찰취소 중 오류")
-            self.q.put(("error", f"{type(e).__name__}: {e}"))
+        self._start_job("입찰취소", "입찰취소 실행 중...", lambda stop, _status: run_cancel_job(settings, should_stop=stop.is_set))
 
     def start_rebid(self) -> None:
         """[재입찰]: 구매 입찰 목록을 정한 횟수만큼(0 이면 [중지] 까지) 돌며 밀린 입찰의 희망가를 [입찰 변경하기] 로 최신 B 로 올린다."""
-        if self.worker and self.worker.is_alive():
-            return
         try:
             cycles = int(self.rebid_cycles.get())
         except ValueError:
@@ -589,30 +660,17 @@ class App:
                         "기준에 못 미쳐 올릴 수 없는 입찰과, 밀렸는데 변경 화면이 예상과 달라 못 올린 입찰은 실제로 지웁니다 (되돌릴 수 없음).\n\n"
                         f"{repeat}합니다 (횟수는 설정의 '재입찰 횟수' 칸, 도는 중에도 [중지] 로 멈출 수 있음).\n\n진행할까요?"):
             return
+        if not self._confirm_conflicts("재입찰"):
+            return
         settings = self._make_settings(dry, rules, tick)
         settings.rebid_cycles = cycles
-        self.stop_flag.clear()
-        self.last_report = None
-        self.open_report_button.configure(state="disabled")
-        self._set_busy(True, "재입찰 실행 중...")
         self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 재입찰 시작: {repeat} "
                   f"({'판단만' if dry else '밀린 입찰의 희망가를 올림'}) =====\n입찰 기준: {rules.describe()}")
-        self.worker = threading.Thread(target=self._rebid_worker, args=(settings,), daemon=True)
-        self.worker.start()
-
-    def _rebid_worker(self, settings: Settings) -> None:
-        try:
-            job = run_rebid_job(settings, should_stop=self.stop_flag.is_set,
-                                on_status=lambda text: self.q.put(("status", text)))
-            self.q.put(("done", job))
-        except Exception as e:  # noqa: BLE001
-            logging.getLogger("gui").exception("재입찰 중 오류")
-            self.q.put(("error", f"{type(e).__name__}: {e}"))
+        self._start_job("재입찰", "재입찰 실행 중...",
+                        lambda stop, status: run_rebid_job(settings, should_stop=stop.is_set, on_status=status))
 
     def start_sell(self) -> None:
-        """[판매]: 보관 판매 항목의 희망가를 하한(매입가 + 마진) 위에서 최저가 경쟁으로 맞춘다 ([중지] 까지 반복)."""
-        if self.worker and self.worker.is_alive():
-            return
+        """[판매]: 판매 관리 창을 연다 - 보관 판매 항목의 희망가를 하한(매입가 + 마진) 위에서 최저가 경쟁으로 맞춘다."""
         try:
             margin = float(self.sell_margin.get()) / 100.0
         except ValueError:
@@ -631,48 +689,33 @@ class App:
         settings = self._make_settings(dry, rules, tick)
         settings.sell_margin_rate = margin
         settings.sell_cycles = 0
-        self.stop_flag.clear()
-        self._set_busy(True, "판매 관리 창이 열려 있음 (크롬 사용 중)")
-        self.stop_button.configure(state="disabled")   # 창 안의 [정지] 로 멈춘다
         self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 판매 관리 창 열림: 하한 마진 {margin * 100:g}%, "
                   f"{'판단만' if dry else '경쟁 시작을 누르면 판매 희망가를 실제로 바꿈'} =====")
-        # 창이 크롬을 붙들고 있는 동안 다른 버튼은 잠근다 (프로필 하나). 창을 닫으면 풀린다
-        SellWindow(self.root, settings, on_close=lambda: self._set_busy(False, "대기 중"))
+        # 창이 자기 스레드로 크롬에 붙는다 - 창 안의 [정지] 로 멈추고, 창을 닫으면 작업이 끝난다 ([중지] 대상이 아님)
+        if self._add_job(Job("판매", "판매 관리 창 열림")):
+            SellWindow(self.root, settings, on_close=lambda: self._end_job("판매", "관리 창 닫힘"))
 
     def start_history(self) -> None:
         """[내역]: 달을 고르면 보관 판매 거래일시가 그 달인 판매를 구매 내역과 짝지어 엑셀로 저장한다."""
-        if self.worker and self.worker.is_alive():
-            return
         choice = MonthDialog(self.root).show()
         if choice is None:
             return
         year, month = choice
         settings = Settings(show_chrome=self.show_chrome.get())
-        self.stop_flag.clear()
-        self.last_report = None
-        self.open_report_button.configure(state="disabled")
-        self._set_busy(True, f"{year}년 {month}월 내역 정리 중...")
         self._log(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 내역 정리 시작: {year}년 {month}월 "
                   f"(보관 판매 거래일시 기준, 구매 내역과 짝 맞춤) =====")
-        self.worker = threading.Thread(target=self._history_worker, args=(settings, year, month), daemon=True)
-        self.worker.start()
+        self._start_job("내역", f"{year}년 {month}월 내역 정리 중...",
+                        lambda stop, _status: run_history_job(settings, year, month, should_stop=stop.is_set),
+                        on_done=self._finish_history)
 
-    def _history_worker(self, settings: Settings, year: int, month: int) -> None:
-        try:
-            job = run_history_job(settings, year, month, should_stop=self.stop_flag.is_set)
-            self.q.put(("history_done", job))
-        except Exception as e:  # noqa: BLE001
-            logging.getLogger("gui").exception("내역 정리 중 오류")
-            self.q.put(("error", f"{type(e).__name__}: {e}"))
-
-    def _finish_history(self, job) -> None:
+    def _finish_history(self, name: str, job) -> None:
         self.last_report = job.report_path
         self.open_report_button.configure(state="normal")
         r = job.result
         summary = f"{r.year}년 {r.month}월 판매 {len(r.sales)}건"
         if r.unmatched:
             summary += f" (매입 내역 못 찾음 {len(r.unmatched)}건 - 엑셀의 노란 줄)"
-        self._set_busy(False, f"완료: {summary}")
+        self._end_job(name, f"완료: {summary}")
         self._log(f"===== 완료 - {summary}\n엑셀: {job.report_path}")
         messagebox.showinfo("내역 정리 완료", f"{summary}\n\n엑셀이 저장되었습니다:\n{job.report_path}")
 
@@ -702,58 +745,60 @@ class App:
             self._log("크롬 창을 화면으로 불러왔습니다 (창을 조작하지는 마세요)" if show else "크롬 창을 화면 밖으로 치웠습니다")
 
     def request_stop(self) -> None:
-        self.stop_flag.set()
-        self.status.configure(text="지금 것까지 보고 멈춥니다...")
-        self.stop_button.configure(state="disabled")
+        """[중지]: 도는 작업이 하나면 그것을, 여럿이면 어느 것을 멈출지 물어서 멈춘다 (판매 관리 창은 창 안의 [정지] 로)."""
+        stoppable = self._stoppable()
+        if not stoppable:
+            return
+        if len(stoppable) == 1:
+            self._stop_job(stoppable[0])
+            return
+        chosen = StopDialog(self.root, [j.name for j in stoppable]).show()
+        for job in stoppable:
+            if chosen in ("전부", job.name):
+                self._stop_job(job)
 
-    def _running(self) -> bool:
-        return bool(self.worker and self.worker.is_alive())
+    def _stop_job(self, job: Job) -> None:
+        job.stop.set()
+        job.status = "지금 것까지 보고 멈춥니다..."
+        self._refresh_buttons()
 
     def _on_close(self) -> None:
         """창 닫기. 실행 중이면 확인을 받고 끝낸다 - 작업 스레드는 daemon 이라 창이 닫히면 같이 사라지고, 크롬은 Job Object 로
         묶여 있어 이 프로세스가 끝나면 같이 닫힌다 (browser.py 참고). 멈춰 버린 실행도 이 경로로 끝낼 수 있다."""
-        if self._running() and not messagebox.askyesno(
-                "종료", "아직 실행 중입니다. 지금 끝내면 진행 중인 작업이 끊기고 크롬도 같이 닫힙니다.\n\n"
+        if self.jobs and not messagebox.askyesno(
+                "종료", f"아직 실행 중입니다 ({', '.join(self.jobs)}). 지금 끝내면 진행 중인 작업이 끊기고 크롬도 같이 닫힙니다.\n\n"
                         "([중지] 를 누르면 지금 보는 상품까지 마치고 멈춥니다)\n\n그래도 끝낼까요?"):
             return
-        self.stop_flag.set()
+        for job in self._stoppable():
+            job.stop.set()
         self.root.destroy()
-
-    def _set_busy(self, busy: bool, text: str = "") -> None:
-        self.run_button.configure(state="disabled" if busy else "normal")
-        self.cancel_button.configure(state="disabled" if busy else "normal")
-        self.rebid_button.configure(state="disabled" if busy else "normal")
-        self.history_button.configure(state="disabled" if busy else "normal")
-        self.sell_button.configure(state="disabled" if busy else "normal")
-        self.stop_button.configure(state="normal" if busy else "disabled")
-        self.status.configure(text=text or ("대기 중" if not busy else ""))
 
     # ------------------------------------------------------------ 큐 처리
     def _poll(self) -> None:
         try:
             while True:
-                kind, payload = self.q.get_nowait()
+                kind, name, payload = self.q.get_nowait()
                 if kind == "log":
                     self._log(payload)
                 elif kind == "status":
-                    if not self.stop_flag.is_set():   # 중지를 눌렀으면 "멈춥니다..." 표시를 유지
-                        self.status.configure(text=payload)
+                    job = self.jobs.get(name)
+                    if job and job.stoppable:   # 중지를 눌렀으면 "멈춥니다..." 표시를 유지
+                        job.status = payload
+                        self._refresh_status()
                 elif kind == "done":
-                    self._finish(payload)
-                elif kind == "history_done":
-                    self._finish_history(payload)
+                    self.jobs[name].on_done(name, payload)
                 elif kind == "error":
-                    self._set_busy(False, "오류로 중단")
-                    messagebox.showerror("오류", payload)
+                    self._end_job(name, "오류로 중단")
+                    messagebox.showerror(f"{name} 오류", payload)
         except queue.Empty:
             pass
         self.root.after(200, self._poll)
 
-    def _finish(self, job) -> None:
+    def _finish(self, name: str, job) -> None:
         self.last_report = job.report_path
         self.open_report_button.configure(state="normal")
         summary = summarize(job.results, unit="개")
-        self._set_busy(False, f"완료: {summary}")
+        self._end_job(name, f"완료: {summary}")
         # [재입찰]은 회차별로도 나눠 보여준다 (사용자 요청 2026-09-13). 회차가 많으면 완료 창에는 마지막 몇 회차만, 로그에는 전부
         lines = section_lines(job.results, unit="개") if job.section_label else []
         self._log(f"===== 완료 ({job.mode}) - 전체: {summary}" + "".join(f"\n  {line}" for line in lines)
@@ -775,20 +820,62 @@ class App:
             os.startfile(str(self.last_report))  # type: ignore[attr-defined]
 
 
-class MonthDialog:
-    """[내역] 을 누르면 뜨는 창: 연도와 달을 고르고 [실행] 으로 확인한다. 취소하면 None."""
+class Dialog:
+    """부모 창 위에 뜨는 작은 확인 창의 공통 뼈대: 크기 고정, 부모에 묶임(transient·grab), Escape·창 닫기 = 취소, show() 로 결과."""
 
-    def __init__(self, parent: tk.Tk) -> None:
-        self.result: tuple[int, int] | None = None
-        today = datetime.now()
-        # 보통 지난달을 정리하므로 지난달을 기본으로 둔다
-        last_year, last_month = (today.year - 1, 12) if today.month == 1 else (today.year, today.month - 1)
-
+    def __init__(self, parent: tk.Tk, title: str) -> None:
+        self.result = None
         self.top = tk.Toplevel(parent)
-        self.top.title("내역 정리 - 달 선택")
+        self.top.title(title)
         self.top.resizable(False, False)
         self.top.transient(parent)
         self.top.grab_set()
+        self.top.bind("<Escape>", lambda _e: self._cancel())
+        self.top.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def _center_on(self, parent: tk.Tk) -> None:
+        """위젯을 다 붙인 뒤 부른다 - 부모 창 가운데(조금 위)에 띄운다."""
+        self.top.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        w, h = self.top.winfo_width(), self.top.winfo_height()
+        self.top.geometry(f"+{px + (pw - w) // 2}+{py + (ph - h) // 3}")
+
+    def _pick(self, result) -> None:
+        self.result = result
+        self.top.destroy()
+
+    def _cancel(self) -> None:
+        self._pick(None)
+
+    def show(self):
+        self.top.wait_window()
+        return self.result
+
+
+class StopDialog(Dialog):
+    """[중지] 를 눌렀는데 작업이 여럿 돌고 있을 때: 어느 것을 멈출지 고른다. 작업 이름 / "전부" / 취소면 None."""
+
+    def __init__(self, parent: tk.Tk, names: list[str]) -> None:
+        super().__init__(parent, "중지 - 어느 작업을 멈출까요?")
+        tk.Label(self.top, text="지금 보는 것까지 마치고 멈춥니다.", anchor="w").pack(fill="x", padx=16, pady=(14, 8))
+        row = tk.Frame(self.top)
+        row.pack(fill="x", padx=16, pady=(0, 14))
+        for i, name in enumerate([*names, "전부"]):
+            tk.Button(row, text=name, width=9, font=("맑은 고딕", 10, "bold" if name == "전부" else "normal"),
+                      command=lambda n=name: self._pick(n)).pack(side="left", padx=(0 if i == 0 else 6, 0))
+        tk.Button(row, text="취소", width=7, command=self._cancel).pack(side="left", padx=(12, 0))
+        self._center_on(parent)
+
+
+class MonthDialog(Dialog):
+    """[내역] 을 누르면 뜨는 창: 연도와 달을 고르고 [실행] 으로 확인한다. 취소하면 None."""
+
+    def __init__(self, parent: tk.Tk) -> None:
+        super().__init__(parent, "내역 정리 - 달 선택")
+        today = datetime.now()
+        # 보통 지난달을 정리하므로 지난달을 기본으로 둔다
+        last_year, last_month = (today.year - 1, 12) if today.month == 1 else (today.year, today.month - 1)
 
         tk.Label(self.top, text="보관 판매 > 보관 상세의 거래일시가 고른 달인 판매를 정리합니다.\n"
                                 "구매 내역(종료) 에서 매입 건을 찾아 짝짓고, 바탕화면에 엑셀로 저장합니다.",
@@ -816,15 +903,7 @@ class MonthDialog:
                   command=self._ok).pack(side="left")
         tk.Button(buttons, text="취소", width=10, command=self._cancel).pack(side="left", padx=(8, 0))
         self.top.bind("<Return>", lambda _e: self._ok())
-        self.top.bind("<Escape>", lambda _e: self._cancel())
-        self.top.protocol("WM_DELETE_WINDOW", self._cancel)
-
-        # 부모 창 가운데에 띄운다
-        self.top.update_idletasks()
-        px, py = parent.winfo_rootx(), parent.winfo_rooty()
-        pw, ph = parent.winfo_width(), parent.winfo_height()
-        w, h = self.top.winfo_width(), self.top.winfo_height()
-        self.top.geometry(f"+{px + (pw - w) // 2}+{py + (ph - h) // 3}")
+        self._center_on(parent)
 
     def _ok(self) -> None:
         try:
@@ -836,23 +915,14 @@ class MonthDialog:
         if not messagebox.askyesno("내역 정리", f"{year}년 {month}월 판매 내역을 정리해 바탕화면에 엑셀로 저장합니다.\n\n"
                                             "실행할까요?", parent=self.top):
             return
-        self.result = (year, month)
-        self.top.destroy()
-
-    def _cancel(self) -> None:
-        self.result = None
-        self.top.destroy()
-
-    def show(self) -> tuple[int, int] | None:
-        self.top.wait_window()
-        return self.result
+        self._pick((year, month))
 
 
 def main() -> None:
     root = tk.Tk()
     app = App(root)
     root.mainloop()
-    if app._running():
+    if app.jobs:
         # 실행 중에 창을 닫은 것. Playwright 를 붙든 daemon 스레드가 인터프리터 종료를 붙잡을 수 있어 바로 끝낸다 (크롬은 Job 으로 같이 죽음)
         logging.shutdown()
         os._exit(0)

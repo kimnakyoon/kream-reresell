@@ -22,9 +22,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import urlparse
 
-from playwright.sync_api import BrowserContext, Page, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
 from . import pipeline
+from .browser import SharedContext
 from . import product as product_mod
 from .bid import StoppedBeforeSubmit
 from .config import Settings
@@ -361,7 +362,7 @@ def expired_reason(bid: OpenBid) -> str:
 
 # ---------------------------------------------------------------- 실행
 
-def review_bid(context: BrowserContext, bid: OpenBid, settings: Settings) -> ProductResult:
+def review_bid(context: SharedContext, bid: OpenBid, settings: Settings) -> ProductResult:
     """입찰 하나를 새 탭에서 다시 판정하고, 조건 미달이면 지운다. 기한이 지난 입찰은 판정 없이 지운다."""
     page: Page = context.new_page()
     r = ProductResult(rank=bid.order, product_id=bid.product_id or 0, name=bid.name, url=bid.url,
@@ -430,7 +431,7 @@ def review_bid(context: BrowserContext, bid: OpenBid, settings: Settings) -> Pro
             pass
 
 
-def run(context: BrowserContext, page: Page, settings: Settings,
+def run(context: SharedContext, page: Page, settings: Settings,
         should_stop: Callable[[], bool] | None = None,
         on_result: Callable[[ProductResult], None] | None = None) -> list[ProductResult]:
     """구매 입찰 목록 순서대로 전부 다시 판정한다. 끝나면 목록을 다시 읽어 지웠다는 것이 정말 사라졌는지 확인."""
@@ -494,7 +495,7 @@ class OpenBids:
         return None
 
 
-def open_bid_products(context: BrowserContext, page: Page) -> OpenBids:
+def open_bid_products(context: SharedContext, page: Page) -> OpenBids:
     """마이페이지 구매 입찰 목록을 읽어 상품 ID -> 입찰 로 돌려준다. 입찰할 때 이미 입찰 중인 상품을 건너뛰는 데 쓴다.
 
     목록 API 에는 상품 ID 가 없다. 이 프로그램이 넣은 입찰(bids.json)과 상품명·희망가가 같으면 그 ID 를 쓰고,

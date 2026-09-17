@@ -18,9 +18,10 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page
+from playwright.sync_api import Error as PlaywrightError, Page
 
 from . import auth, hangwatch
+from .browser import SharedContext
 from . import bid as bid_mod
 from . import market as market_mod
 from . import product as product_mod
@@ -183,7 +184,7 @@ def _prefilter(market: market_mod.ProductMarket, item: RankedProduct, settings: 
     return candidates
 
 
-def process_product(context: BrowserContext, item: RankedProduct, settings: Settings, api: ApiClient,
+def process_product(context: SharedContext, item: RankedProduct, settings: Settings, api: ApiClient,
                     open_bids: "OpenBids | None" = None, should_stop: Callable[[], bool] | None = None,
                     on_status: Callable[[str], None] | None = None,
                     rejected: CategoryRejections | None = None) -> list[ProductResult]:
@@ -441,7 +442,7 @@ def _open_bid_detail(ob: "OpenBid") -> str:
     return f"마이페이지에 이미 입찰 중 (입찰 #{ob.bid_id}{opt})"
 
 
-def run(context: BrowserContext, items: list[RankedProduct], settings: Settings, api: ApiClient,
+def run(context: SharedContext, items: list[RankedProduct], settings: Settings, api: ApiClient,
         should_stop: Callable[[], bool] | None = None,
         on_result: Callable[[ProductResult], None] | None = None,
         open_bids: "OpenBids | None" = None,
@@ -525,7 +526,7 @@ def _item_result(item: RankedProduct, **fields) -> ProductResult:
                          category=item.category, **fields)
 
 
-def _process_with_relogin(context: BrowserContext, page: Page | None, item: RankedProduct, settings: Settings,
+def _process_with_relogin(context: SharedContext, page: Page | None, item: RankedProduct, settings: Settings,
                           open_bids: "OpenBids | None", stop: Callable[[], bool],
                           status: Callable[[str], None], api: ApiClient,
                           rejected: CategoryRejections | None = None) -> list[ProductResult]:
@@ -551,7 +552,7 @@ def _process_with_relogin(context: BrowserContext, page: Page | None, item: Rank
         return _done([], _item_result(item, status="오류", detail=f"다시 로그인했는데도 {e2}"), item)
 
 
-def _site_gives_sales(context: BrowserContext, item: RankedProduct, settings: Settings, api: ApiClient) -> bool:
+def _site_gives_sales(context: SharedContext, item: RankedProduct, settings: Settings, api: ApiClient) -> bool:
     """사이트가 다시 주는지 - 시세 API 를 한 번 부르고, 막혔던 상품의 페이지를 새 탭에 열어 패널 표가 그려지는지 본다.
 
     그 사이 로그인이 풀렸으면 (시세 API 401, 또는 패널 대신 로그인 화면) 기다려도 소용없으니 여기서 다시 로그인하고 한 번 더 본다."""

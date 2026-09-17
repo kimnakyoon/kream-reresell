@@ -64,9 +64,10 @@ import time
 from collections.abc import Callable
 from datetime import datetime
 
-from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeout
 
 from . import auth, hangwatch, pipeline
+from .browser import SharedContext
 from . import bid as bid_mod
 from . import market as market_mod
 from . import product as product_mod
@@ -516,7 +517,7 @@ def _fill_details_via_api(bids: list[OpenBid], api: ApiClient) -> None:
             apply_bid_info(bid, body)
 
 
-def run(context: BrowserContext, page: Page, settings: Settings,
+def run(context: SharedContext, page: Page, settings: Settings,
         should_stop: Callable[[], bool] | None = None,
         on_result: Callable[[ProductResult], None] | None = None,
         on_status: Callable[[str], None] | None = None,
@@ -534,7 +535,7 @@ def run(context: BrowserContext, page: Page, settings: Settings,
     pid_cache = load_bid_products()
     tab: Page = context.new_page()   # 입찰마다 탭을 열고 닫지 않고 실행 내내 이 탭을 다시 쓴다
     # 시세·입찰 상세 API 는 그때의 작업 탭 안에서 부른다 (탭이 멈춰 바뀌어도 따라감). 헤더는 목록 페이지가 보내는 요청에서 받아 둔다
-    api = ApiClient(lambda: tab, context)
+    api = ApiClient(lambda: tab, context.raw)
     pacer = pacing.API_PACER
     log.info(pacer.describe_setup())
 

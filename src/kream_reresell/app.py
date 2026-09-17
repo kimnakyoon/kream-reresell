@@ -11,13 +11,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Page
 
 from datetime import datetime
 
 from . import auth, cancel, history, history_report, pacing, pipeline, ranking, rebid, report, search, sell, shop, store
 from .api import ApiClient
-from .browser import real_chrome_context
 from .config import Settings
 from .history import HistoryResult
 from .ranking import DEFAULT_CATEGORY
@@ -44,10 +43,7 @@ def run_history_job(settings: Settings, year: int, month: int,
                     should_stop: Callable[[], bool] | None = None) -> HistoryJobResult:
     """[내역]: 보관 판매 거래일시가 year-month 인 판매를 구매 내역과 짝지어 바탕화면에 엑셀로 저장한다."""
     log.info("판매 내역 정리: %d년 %d월 (보관 판매 거래일시 기준)", year, month)
-    with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images, trim_api=settings.trim_api,
-                                                        show_chrome=settings.show_chrome) as context:
-        page = context.pages[0] if context.pages else context.new_page()
-        auth.ensure_logged_in(page, settings)
+    with auth.session(settings) as (context, page):
         result = history.collect(page, year, month, should_stop=should_stop)
     path = history_report.write_history(result)
     log.info("판매 %d건, 매입 못 찾음 %d건 → %s", len(result.sales), len(result.unmatched), path)
@@ -234,13 +230,10 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
     log.info("%s | %s", mode, settings_line)
 
     results: list[ProductResult] = []
-    with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images, trim_api=settings.trim_api,
-                                                        show_chrome=settings.show_chrome) as context:
-        page = context.pages[0] if context.pages else context.new_page()
-        auth.ensure_logged_in(page, settings)
+    with auth.session(settings) as (context, page):
         # 마이페이지에 이미 입찰 중인 상품은 건너뛴다 (bids.json 과 별개로 실제 목록을 본다)
         # 시세 API (상품 상세) - 상품마다 한 번, 가격을 먼저 거른다 (pipeline 머리글). 헤더는 아래 목록 페이지가 보내는 요청에서 받아 둔다
-        api = ApiClient(page, context)
+        api = ApiClient(page, context.raw)
         log.info(pacing.API_PACER.describe_setup())
         log.info("마이페이지 구매 입찰 목록 확인 중...")
         open_bids = cancel.open_bid_products(context, page)
@@ -319,10 +312,7 @@ def run_cancel_job(settings: Settings,
     settings_line = describe_cancel_settings(settings)
     log.info("%s | %s", mode, settings_line)
 
-    with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images, trim_api=settings.trim_api,
-                                                        show_chrome=settings.show_chrome) as context:
-        page = context.pages[0] if context.pages else context.new_page()
-        auth.ensure_logged_in(page, settings)
+    with auth.session(settings) as (context, page):
         results = cancel.run(context, page, settings, should_stop=should_stop, on_result=on_result)
 
     log.info("==== 결과 ====")
@@ -379,10 +369,7 @@ def run_sell_job(settings: Settings,
         path = write(path)
 
     try:
-        with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images, trim_api=settings.trim_api,
-                                                            show_chrome=settings.show_chrome) as context:
-            page = context.pages[0] if context.pages else context.new_page()
-            auth.ensure_logged_in(page, settings)
+        with auth.session(settings) as (context, page):
             sell.run(context, page, settings, should_stop=should_stop, on_result=collect,
                      on_status=on_status, on_cycle=cycle_done, max_cycles=max_cycles)
     except KeyboardInterrupt:
@@ -452,10 +439,7 @@ def run_rebid_job(settings: Settings,
         path = _write_rebid_report(results, settings_line, mode, path)
 
     try:
-        with sync_playwright() as pw, real_chrome_context(pw, block_images=settings.block_images, trim_api=settings.trim_api,
-                                                            show_chrome=settings.show_chrome) as context:
-            page = context.pages[0] if context.pages else context.new_page()
-            auth.ensure_logged_in(page, settings)
+        with auth.session(settings) as (context, page):
             rebid.run(context, page, settings, should_stop=should_stop, on_result=collect,
                       on_status=on_status, on_cycle=cycle_done, max_cycles=max_cycles)
     except KeyboardInterrupt:

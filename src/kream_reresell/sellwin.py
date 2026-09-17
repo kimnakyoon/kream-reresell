@@ -8,7 +8,8 @@
       - 판매 하한가 칸을 두 번 누르면 직접 고친다. 경쟁 칸을 두 번 누르면 켜고 끈다.
       - 보관 일수가 '보관 N일부터 하한 없이' 를 넘긴 행은 주황 배경, 경쟁 칸 '자동' - 등록과 관계없이 하한 없이 경쟁한다 (sell 머리글 4).
   아래: 가격 로그 (판정 결과가 쌓인다)
-동작은 sell.SellEngine (작업 스레드가 크롬을 붙들고 명령 큐로 움직임). 창을 닫으면 경쟁을 멈추고 크롬을 닫고, 결과가 있으면 엑셀 보고서를 남긴다.
+동작은 sell.SellEngine (작업 스레드가 크롬에 자기 연결로 붙어 명령 큐로 움직임 - 다른 버튼과 동시에 돈다). 창을 닫으면 경쟁을 멈추고 연결을 끊고
+(크롬은 다른 작업이 없을 때만 닫힘), 결과가 있으면 엑셀 보고서를 남긴다.
 항목별 하한·경쟁 여부는 data/sell_rules.json 에 저장되어 다음에 창을 열어도 남는다.
 """
 
@@ -340,10 +341,10 @@ class SellWindow:
     def close(self) -> None:
         if self.closing:
             return
-        if self.running and not messagebox.askyesno("닫기", "경쟁이 돌고 있습니다. 창을 닫으면 멈추고 크롬도 닫습니다.\n\n닫을까요?", parent=self.top):
+        if self.running and not messagebox.askyesno("닫기", "경쟁이 돌고 있습니다. 창을 닫으면 멈춥니다.\n\n닫을까요?", parent=self.top):
             return
         self.closing = True
-        self.status.configure(text="크롬 닫는 중...")
+        self.status.configure(text="닫는 중...")
         self.engine.request("stop")
         self.engine.request("close")
 

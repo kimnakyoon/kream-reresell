@@ -28,7 +28,7 @@
   6. 목록 끝까지 가면 한 사이클. CYCLE_GAP_SEC 쉬고 반복 (횟수는 settings.sell_cycles, 0 이면 [중지]까지).
 
 주의: No1 Seller Center 의 최저가 경쟁이 같은 항목에 켜져 있으면 둘이 번갈아 가격을 바꾼다 - 여기서 다루는 항목은 그쪽 경쟁을 꺼야 한다.
-다른 버튼과 같은 크롬 프로필을 쓰므로 [재입찰] 등과 동시에는 못 돈다.
+[재입찰] 등 다른 버튼과 동시에 돌 수 있다 (크롬을 나눠 쓴다 - browser 머리글, 2026-09-17).
 """
 
 from __future__ import annotations
@@ -44,9 +44,10 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
-from playwright.sync_api import BrowserContext, Page
+from playwright.sync_api import Page
 
 from . import auth, hangwatch, pacing
+from .browser import SharedContext
 from . import market as market_mod
 from . import product as product_mod
 from .api import ApiClient, ApiError
@@ -437,7 +438,7 @@ def _probe_or_hold(api: ApiClient, item: StockItem, floor: int, r: ProductResult
 
 # ---------------------------------------------------------------- 사이클 반복
 
-def run(context: BrowserContext, page: Page, settings: Settings,
+def run(context: SharedContext, page: Page, settings: Settings,
         should_stop: Callable[[], bool] | None = None,
         on_result: Callable[[ProductResult], None] | None = None,
         on_status: Callable[[str], None] | None = None,
@@ -447,7 +448,7 @@ def run(context: BrowserContext, page: Page, settings: Settings,
     stop = should_stop or (lambda: False)
     status = on_status or (lambda _t: None)
     results: list[ProductResult] = []
-    api = ApiClient(page, context)
+    api = ApiClient(page, context.raw)
     state = SellState()
     pacer = pacing.API_PACER
     log.info(pacer.describe_setup())
@@ -565,7 +566,8 @@ class SellEngine:
         self.commands: queue.Queue = queue.Queue()
         self.items: list[StockItem] = []
         self.results: list[ProductResult] = []
-        self.thread = threading.Thread(target=self._main, name="sell-engine", daemon=True)
+        # 스레드 이름 "판매" = GUI 의 [판매] 버튼 이름 - 로그 앞에 [판매] 머리가 붙는다 (gui.App.buttons)
+        self.thread = threading.Thread(target=self._main, name="판매", daemon=True)
         self._stop_tick = threading.Event()
 
     # ---- GUI 스레드에서 부르는 것
@@ -585,17 +587,12 @@ class SellEngine:
             log.exception("판매 관리 창 이벤트 처리 중 오류 (%s)", kind)
 
     def _main(self) -> None:
-        from playwright.sync_api import sync_playwright
-        from .browser import real_chrome_context
         s = self.settings
         try:
             s.validate()
-            with sync_playwright() as pw, real_chrome_context(pw, block_images=s.block_images, trim_api=s.trim_api,
-                                                                show_chrome=s.show_chrome) as context:
-                page = context.pages[0] if context.pages else context.new_page()
-                self._emit("status", "로그인 확인 중...")
-                auth.ensure_logged_in(page, s)
-                api = ApiClient(page, context)
+            self._emit("status", "로그인 확인 중...")
+            with auth.session(s) as (context, page):
+                api = ApiClient(page, context.raw)
                 log.info(pacing.API_PACER.describe_setup())
                 self._loop(page, api)
         except Exception as e:  # noqa: BLE001

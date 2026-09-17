@@ -18,13 +18,13 @@
     비었고 5분 쉬니 풀렸다. 사용자 판단: 정해진 '응답 안 주는 시간대' 는 없고 계속 접속해서 막히는 것.
 
 대응 (사용자 결정, 2026-09-05 / 접속 예산은 2026-09-07):
-  1. 프로그램이 안 보는 asks·bids·chart 요청을 서버에 보내지 않고 빈 응답으로 채운다 (browser.watch_api_requests) - 호출이 1/4 로 준다.
+  1. 프로그램이 안 보는 asks·bids·chart 요청을 서버에 보내지 않고 빈 응답으로 채운다 (browser.SharedContext.new_page 의 route) - 호출이 1/4 로 준다.
   2. 옵션 사이·상품 사이에 사람 속도의 무작위 간격을 둔다 (OPTION_PAUSE_SEC, PRODUCT_PAUSE_SEC).
   3. 스로틀 대상 API 로 나간 요청을 세서 창(WINDOW_SEC) 안에 LIMIT 을 넘기면 알아서 쉰다 (RequestBudget).
   4. 옵션 상품은 '모든 옵션' 표(첫 페이지는 공짜)에서 정해지는 옵션을 먼저 거르고 남은 옵션만 하나씩 고른다
      (product.count_sales_by_option) - 거래가 적은 상품은 옵션 요청이 0건이 된다.
   5. 접속 예산: kream.co.kr 메인 프레임의 페이지 이동(주소 안 이동 포함 - 상품 페이지, 구매 페이지, 변경 화면, 재시도, 확인 페이지 전부)을
-     브라우저 층에서 세서(browser.watch_page_visits → PAGE_BUDGET. 사이트가 같은 주소로 되풀이하는 replaceState 는 안 센다 -
+     브라우저 층에서 세서(browser._count_visit → PAGE_BUDGET. 사이트가 같은 주소로 되풀이하는 replaceState 는 안 센다 -
      2026-09-08 실측: 그걸 세면 입찰 하나가 10번쯤으로 세져 상품 8개 만에 예산이 끝나 525초씩 쉬었다) 창 안에 PAGE_LIMIT 을 넘기면 상품(입찰) 하나를 보기 전에 쉰다
      (before_product → RequestBudget.pace). 예산은 창 안에 고르게 나눠 쓴다 - 이동 하나에 창/한도 초(기본 6초)씩, 직전 상품이 실제로 쓴
      이동 수만큼 간격을 두고 다음 상품을 시작해(보통 2번 = 12초) 몰아 쓰고 몇 분씩 쉬는 일이 없게 (2026-09-08 11:58 실측: 한도 80 에서
@@ -33,7 +33,7 @@
      한도 100 은 2026-09-07 실측에서 안 막혔던 '한 시간 600번' 수준 (막힐 때는 직전 1시간 900번쯤) - 더 올리면 막힐 수 있다.
      막혔다 풀리면(sitewait) 남은 실행은 한도를 반으로 줄인다 - 한 번 막힌 뒤에는 더 적은 양으로 또 막힌다.
   (패널을 열 때 사이트가 페이지 로드 때와 똑같은 sales 요청을 한 번 더 보내는데, 이를 브라우저에서 캐시해 돌려주는 것은
-   실패했다 - browser._api_route 참고. 그래서 패널 열기는 sales 2건이다.)
+   실패했다 - browser._route 참고. 그래서 패널 열기는 sales 2건이다.)
   6. 시세 API 틱 (2026-09-13, No1 Seller Center 조사 뒤 사용자 결정): A·B 는 페이지를 열지 않고 상품 상세 API 한 번(market.fetch_market)으로
      읽는다. 그 호출은 고정 간격(ApiPacer, 기본 6초)으로 하나씩 보내고, 분당 상한(20건)을 넘지 않으며, 차단 신호(무응답·5xx 등)를 맞으면
      간격을 두 배로 늘렸다가 조용해지면 되돌린다. 근거: 시간당 페이지 이동 600번(이동 하나가 API 수십 건)이 안 막혔고, No1 이 같은 호출을
@@ -109,12 +109,12 @@ class RequestBudget:
         if THROTTLED_PATH_RE.match(path):
             self.count()
 
-    def count(self) -> None:
-        """하나 센다."""
+    def count(self, at: float | None = None) -> None:
+        """하나 센다. at 을 주면 그 시각(monotonic)으로 - ApiPacer 가 앞으로의 호출 자리를 예약할 때."""
         with self._lock:
             now = time.monotonic()
             self._prune(now)
-            self._times.append(now)
+            self._times.append(now if at is None else at)
             self.total += 1
 
     def used(self) -> int:
@@ -176,8 +176,8 @@ class RequestBudget:
         log.warning("막혔다 풀린 뒤라 %s 예산을 %s으로 줄임", self.what, self._span())
 
 
-# 실행 하나가 쓰는 예산. 둘 다 브라우저 층에서 센다 (browser.watch_api_requests / watch_page_visits) - 프로세스 안에서 [입찰] · [재입찰] 을
-# 이어 돌면 창 안의 기록은 그대로 이어진다
+# 프로세스가 쓰는 예산. 둘 다 브라우저 층에서 센다 (browser.SharedContext.new_page 가 탭마다 붙이는 route·framenavigated) - 동시에 도는
+# 작업들이 하나를 나눠 쓰고, [입찰] · [재입찰] 을 이어 돌아도 창 안의 기록은 그대로 이어진다
 BUDGET = RequestBudget()
 PAGE_BUDGET = RequestBudget(limit=DEFAULT_PAGE_LIMIT, what="접속")
 
@@ -208,8 +208,9 @@ class ApiPacer:
         self.current = tick_sec
         self.calm = 0
         self.blocks = 0
-        self._last_started = 0.0
+        self._last_started = 0.0     # 마지막으로 예약된 호출 시각 (monotonic) - 다음 호출은 이보다 current 초 뒤
         self._minute = RequestBudget(limit=API_MAX_PER_MINUTE, window_sec=60, what="시세 조회")
+        self._lock = threading.Lock()
 
     def configure(self, tick_sec: float) -> None:
         """실행 시작마다 (Settings.validate) 틱을 설정값으로 둔다. 늘어나 있던 간격도 되돌린다."""
@@ -226,14 +227,20 @@ class ApiPacer:
 
     def wait_turn(self, should_stop: Callable[[], bool] | None = None,
                   on_status: Callable[[str], None] | None = None) -> bool:
-        """다음 시세 API 호출 직전에 부른다 - 틱과 분당 상한을 지켜 쉰다. 중지 요청이면 False."""
-        wait = max(self._last_started + self.current - time.monotonic(), self._minute.seconds_until_room())
+        """다음 시세 API 호출 직전에 부른다 - 틱과 분당 상한을 지켜 쉰다. 중지 요청이면 False.
+
+        동시에 도는 작업들([입찰]·[재입찰]·[판매])이 틱 하나를 나눠 쓴다: 잠금 안에서 자기 호출 시각(직전 예약 + 틱, 분당 상한 안)을
+        예약만 하고 잠금 밖에서 그때까지 쉰다 - 예약 순서대로 한 틱에 하나씩 나간다.
+        """
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._last_started + self.current, now + self._minute.seconds_until_room())
+            self._last_started = slot
+            self._minute.count(at=slot)
+        wait = slot - now
         if wait >= ANNOUNCE_SEC:
             _announce(f"시세 조회 {self.describe()}", wait, on_status)
-        ok = sleep_with_stop(wait, should_stop)
-        self._last_started = time.monotonic()
-        self._minute.count()
-        return ok
+        return sleep_with_stop(wait, should_stop)
 
     def report_ok(self) -> None:
         """호출이 정상으로 끝났다. 늘어나 있던 간격은 조용한 틱 API_CALM_TICKS 번마다 한 계단 되돌린다."""
@@ -265,8 +272,27 @@ def _announce(what: str, wait: float, on_status: Callable[[str], None] | None) -
         on_status(f"사이트 차단 방지: {what}에 맞춰 {int(wait) + 1}초 쉬는 중")
 
 
+_active_jobs = 0   # 크롬에 붙어 도는 작업 수 (browser.real_chrome_context 가 센다)
+
+
+def job_started() -> None:
+    global _active_jobs
+    _active_jobs += 1
+
+
+def job_ended() -> None:
+    global _active_jobs
+    _active_jobs -= 1
+
+
 def configure(limit: int, page_limit: int, tick_sec: float = API_TICK_SEC) -> None:
-    """실행 시작마다 (Settings.validate) 한도를 설정값으로 둔다 - tighten 으로 줄였던 것도 되돌린다. 창 안의 기록은 남긴다."""
+    """실행 시작마다 (Settings.validate) 한도를 설정값으로 둔다 - tighten 으로 줄였던 것도 되돌린다. 창 안의 기록은 남긴다.
+
+    다른 작업이 도는 중이면 건드리지 않는다 - 그 작업이 차단 신호를 맞아 물러나 있는 한도·틱을 새 작업의 시작이 되돌리면 안 된다.
+    """
+    if _active_jobs:
+        log.info("다른 작업이 도는 중이라 예산·틱 설정을 바꾸지 않음 (%s 예산 %s, %s)", BUDGET.what, BUDGET._span(), API_PACER.describe())
+        return
     BUDGET.limit = limit
     PAGE_BUDGET.limit = page_limit
     API_PACER.configure(tick_sec)

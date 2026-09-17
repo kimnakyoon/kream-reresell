@@ -7,12 +7,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import threading
 import time
 
-from playwright.sync_api import Page
+from playwright.sync_api import Page, sync_playwright
 
-from . import browser
+from . import browser, hangwatch
 from .config import Settings
 
 log = logging.getLogger(__name__)
@@ -21,6 +23,7 @@ HOME = "https://kream.co.kr/"
 LOGIN_URL = "https://kream.co.kr/login"
 EMAIL_LOGIN_URL = "https://kream.co.kr/login/email?returnUrl=/"
 MANUAL_LOGIN_WAIT_SEC = 300
+_login_lock = threading.Lock()   # 동시에 도는 작업들이 한꺼번에 로그인하지 않게 - 잠금을 잡은 뒤 다시 확인한다
 
 
 class LoginFailed(Exception):
@@ -78,10 +81,30 @@ def email_login(page: Page, email: str, password: str) -> bool:
 
 
 def ensure_logged_in(page: Page, settings: Settings) -> None:
-    if _check_home(page):
-        log.info("로그인 상태 확인됨")
-        return
+    """로그인 상태가 아니면 로그인한다. 작업들이 크롬(세션)을 나눠 쓰므로 확인·로그인은 한 번에 한 작업만 (다른 작업이 먼저 로그인했으면 확인만)."""
+    # 다른 작업이 로그인하는 동안(직접 로그인이면 몇 분) 기다리는 것은 Playwright 호출 밖의 쉼이라 멈춤 감시를 쉬게 한다 (hangwatch 머리글)
+    with hangwatch.idle():
+        _login_lock.acquire()
+    try:
+        if _check_home(page):
+            log.info("로그인 상태 확인됨")
+            return
+        _login(page, settings)
+    finally:
+        _login_lock.release()
 
+
+@contextlib.contextmanager
+def session(settings: Settings):
+    """작업 하나의 브라우저 세션: (이 프로세스가 띄운) 크롬에 붙어 이 작업의 탭을 열고 로그인까지 확인한 (context, page) - 작업 진입점 공용."""
+    with sync_playwright() as pw, browser.real_chrome_context(pw, block_images=settings.block_images, trim_api=settings.trim_api,
+                                                                show_chrome=settings.show_chrome) as context:
+        page = context.new_page()
+        ensure_logged_in(page, settings)
+        yield context, page
+
+
+def _login(page: Page, settings: Settings) -> None:
     log.info("로그인이 필요합니다")
     if settings.kream_id and settings.kream_pw:
         log.info("이메일 자동 로그인 시도: %s", settings.kream_id)
