@@ -2,8 +2,10 @@
 
 API 는 브라우저 밖에서 부르면 막히지만(요청 서명, 2026-09-04 실측 - curl 은 늘 10초 뒤 500), 페이지 안에서 사이트가 실제로 보낸
 요청의 헤더(authorization, x-kream-*)를 그대로 붙여 fetch 하면 된다 (credentials 는 omit 이어야 CORS 를 통과한다).
-헤더는 사이트가 보내는 요청에서 복사한다: 컨텍스트를 주면 어느 탭이든 사이트가 API 요청을 보낼 때 조용히 받아 두고(페이지 이동 없음),
-그때까지 하나도 못 받았으면 마이페이지로 한 번 이동해 잡는다. 시각 헤더만 매번 새로 넣는다.
+헤더는 사이트가 보내는 요청 중 200 을 받은 것에서 복사한다: 컨텍스트를 주면 어느 탭이든 사이트의 API 요청이 200 을 받을 때마다 조용히
+갈아 둔다(페이지 이동 없음 - 항상 방금 통한 토큰). 하나도 못 받았거나 401 을 맞으면 마이페이지로 한 번 이동해 잡는다. 시각 헤더만 매번 새로 넣는다.
+토큰은 로그인 2시간마다 바뀐다 (2026-09-14·17·18 실측: 401 이 정확히 2시간 간격). 바뀌는 순간 탭의 SPA 가 먼저 옛 토큰으로 한 번 보내고
+401 을 받은 뒤 새 토큰으로 다시 보내므로, '첫 요청' 을 잡으면 옛 토큰이 잡힌다 - 그래서 200 응답을 받은 요청만 본다.
 
 시간 제한: 사이트가 막으면 요청이 10초쯤 응답 없이 붙들렸다 끊긴다 (2026-09-05 실측, pacing 참고). 그래서 fetch 에 TIMEOUT_MS 를 두어
 그 상태를 '무응답' (ApiError.kind == "timeout") 으로 바로 알린다 - 부르는 쪽(pacing.ApiPacer)이 차단 신호로 세어 간격을 늘린다.
@@ -16,7 +18,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-from playwright.sync_api import BrowserContext, Page, Request, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import BrowserContext, Page, Request, Response, TimeoutError as PlaywrightTimeout
 
 from .product import on_login_page
 
@@ -98,8 +100,13 @@ def _is_api_request(request: Request) -> bool:
     return request.url.startswith(API_BASE) and "authorization" in request.headers and "notification" not in request.url
 
 
+def _is_ok_api_response(response: Response) -> bool:
+    """인증 헤더를 달고 나가 200 을 받은 API 응답인지 - 이 요청의 토큰은 지금 통하는 것이다."""
+    return response.status == 200 and _is_api_request(response.request)
+
+
 class ApiClient:
-    """페이지 안에서 fetch 로 KREAM API 를 부른다. 헤더는 사이트가 실제로 보낸 요청에서 복사한다.
+    """페이지 안에서 fetch 로 KREAM API 를 부른다. 헤더는 사이트가 실제로 보내 200 을 받은 요청에서 복사한다 (모듈 머리글).
 
     page: fetch 를 실행할 탭, 또는 그 탭을 돌려주는 함수 (탭을 바꿔 쓰는 [재입찰] - 닫힌 탭이면 새 탭을 만들어 두고 함수가 그것을 돌려준다).
     context: 주면 어느 탭이든 사이트가 API 요청을 보낼 때 헤더를 받아 둔다 - 로그인 뒤 목록 페이지를 여는 동안 저절로 잡혀 마이페이지 이동이 필요 없다.
@@ -110,35 +117,39 @@ class ApiClient:
         self.headers: dict[str, str] = {}
         self.calls = 0          # 이 클라이언트로 보낸 요청 수 (로그용)
         if context is not None:
-            context.on("request", self._sniff)
+            context.on("response", self._sniff)
 
     @property
     def page(self) -> Page:
         return self._page() if callable(self._page) else self._page
 
-    def _sniff(self, request: Request) -> None:
-        """사이트가 보낸 API 요청에서 헤더를 받아 둔다 (컨텍스트의 request 이벤트 - 다른 스레드에서 올 수 있어 dict 를 통째로 바꾼다)."""
-        if not self.headers and _is_api_request(request):
-            self.headers = {k: v for k, v in request.headers.items()
+    def _sniff(self, response: Response) -> None:
+        """200 을 받은 API 요청의 헤더를 받아 둔다 - 방금 통한 토큰이라 늘 최신으로 갈아 둔다
+        (컨텍스트의 response 이벤트 - 다른 스레드에서 올 수 있어 dict 를 통째로 바꾼다)."""
+        if _is_ok_api_response(response):
+            self.headers = {k: v for k, v in response.request.headers.items()
                             if k.lower().startswith("x-kream") or k.lower() in HEADER_KEEP}
-            log.debug("API 헤더 %d개 확보 (사이트 요청에서)", len(self.headers))
+            log.debug("API 헤더 %d개 확보 (200 을 받은 사이트 요청에서)", len(self.headers))
 
     def invalidate(self) -> None:
         """로그인을 다시 했다 - 옛 세션의 헤더를 버린다 (다음 호출이 새로 잡는다)."""
         self.headers = {}
 
     def capture_headers(self, url: str = INVENTORY_FINISHED_URL) -> None:
-        """url 로 이동하면서 사이트가 API 에 보내는 헤더를 잡아 둔다 (페이지 이동 1번 - 저절로 못 잡았을 때만).
+        """url 로 이동하면서 사이트가 API 에 보내 200 을 받은 요청의 헤더를 잡아 둔다 (페이지 이동 1번 - 저절로 못 잡았거나 401 을 맞았을 때).
 
+        갖고 있던 헤더는 먼저 버린다 - 401 뒤에 옛 토큰을 들고 있으면 다시 잡아도 그대로라 재시도가 반드시 401 이었다 (2026-09-17·18 실측:
+        토큰이 바뀌는 2시간째마다 [판매] 가 '다시 로그인했는데도 401' 로 죽음).
         세션이 끊기면 마이페이지가 /login 으로 넘어가 인증된 API 요청이 하나도 안 나간다 - 사이트가 막은 게 아니라 다시 로그인할 일이라
         status 401 (is_auth_lost) 로 올린다 (2026-09-14 10:35 실측: 이 시간 제한을 차단 신호로 세어 사이트 대기에 들어가 20분 동안 안 풀렸다).
         이동 직후 이미 로그인 화면이면 20초를 기다리지 않는다 - with 블록 안의 예외는 대기를 취소한다 (Playwright 1.62 _sync_base.EventContextManager).
         """
+        self.invalidate()
         try:
-            with self.page.expect_request(_is_api_request, timeout=20_000) as req:
+            with self.page.expect_response(_is_ok_api_response, timeout=20_000) as res:
                 self.page.goto(url, wait_until="domcontentloaded")
                 self._raise_if_login_page()
-            self._sniff(req.value)
+            self._sniff(res.value)
         except PlaywrightTimeout as e:
             self._raise_if_login_page(e)   # SPA 라우팅으로 늦게 넘어간 경우
             raise ApiError("KREAM API 요청 헤더를 잡지 못했습니다 (로그인 상태와 페이지를 확인)", kind="page") from e

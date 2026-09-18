@@ -437,6 +437,36 @@ def _probe_or_hold(api: ApiClient, item: StockItem, floor: int, r: ProductResult
     return r
 
 
+def sell_with_relogin(page: Page, item: StockItem, order: int, cycle: int, api: ApiClient, settings: Settings, state: SellState,
+                      should_stop: Callable[[], bool] | None, on_status: Callable[[str], None] | None,
+                      floor: int | None = None) -> ProductResult:
+    """sell_one 을 부르되 로그인이 풀렸으면(LoginNeeded) 다시 로그인하고 한 번 더 본다 - rebid._rebid_with_relogin 과 같은 꼴.
+
+    두 번째도 풀렸으면 '확인필요' 로 적고 돌려준다 (다음 항목은 새 토큰으로 통한다). 예전에는 두 번째 LoginNeeded 가 그대로 올라가
+    [판매] 엔진이 죽었다 (2026-09-17 20:23 · 09-18 11:58 실측 - 토큰이 바뀌는 로그인 2시간째마다). 다른 예외는 '오류' 로 적는다.
+    """
+    def once() -> ProductResult:
+        with hangwatch.watching(page):
+            return sell_one(item, order, cycle, api, settings, state, should_stop, on_status, floor=floor)
+
+    r = _result(item, order, cycle, settings)
+    try:
+        try:
+            return once()
+        except product_mod.LoginNeeded as e:
+            log.info("로그인이 풀림 (%s) - 다시 로그인하고 이 항목을 한 번 더 봄", e)
+            auth.ensure_logged_in(page, settings)
+            api.invalidate()
+            try:
+                return once()
+            except product_mod.LoginNeeded as e2:
+                r.status, r.detail = "확인필요", f"{NOT_LOADED_PREFIX} - 올리지 않음: 다시 로그인했는데도 {e2}"
+    except Exception as e:  # noqa: BLE001
+        log.exception("보관 %s 처리 중 오류", item.ask_id)
+        r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
+    return r
+
+
 # ---------------------------------------------------------------- 사이클 반복
 
 def run(context: SharedContext, page: Page, settings: Settings,
@@ -485,19 +515,7 @@ def run(context: SharedContext, page: Page, settings: Settings,
                 log.info("사용자 요청으로 중지 - 남은 항목 %d건은 보지 않음", len(items) - len(cycle_results))
                 break
             status(f"판매 {cycle}회차: {order}/{len(items)} {item.name[:24]} ({pacer.describe()})")
-            try:
-                with hangwatch.watching(page):
-                    r = sell_one(item, order, cycle, api, settings, state, stop, status)
-            except product_mod.LoginNeeded as e:
-                log.info("로그인이 풀림 (%s) - 다시 로그인하고 이 항목을 한 번 더 봄", e)
-                auth.ensure_logged_in(page, settings)
-                api.invalidate()
-                with hangwatch.watching(page):
-                    r = sell_one(item, order, cycle, api, settings, state, stop, status)
-            except Exception as e:  # noqa: BLE001
-                log.exception("보관 %s 처리 중 오류", item.ask_id)
-                r = _result(item, order, cycle, settings)
-                r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
+            r = sell_with_relogin(page, item, order, cycle, api, settings, state, stop, status)
             r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             log.info("[%d회차 %d번째] 결과: %s - %s", cycle, order, r.status, r.detail)
             cycle_results.append(r)
@@ -549,6 +567,7 @@ def save_sell_rules(rules: dict[int, SellRule]) -> None:
     SELL_RULES_PATH.write_text(json.dumps({str(k): asdict(v) for k, v in rules.items()}, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+RECONNECT_SEC = 30          # 엔진이 예외로 튕겼을 때 브라우저 세션을 다시 열기까지 쉼
 NEW_STOCK_CHECK_SEC = 120   # 경쟁을 돌리지 않는 동안 새 입고를 보러 보관 목록을 다시 읽는 간격 (목록 API 는 스로틀 대상이 아님, 한 번에 2건)
 
 
@@ -573,9 +592,11 @@ class SellEngine:
         self.commands: queue.Queue = queue.Queue()
         self.items: list[StockItem] = []
         self.results: list[ProductResult] = []
+        self.running = False            # 경쟁 중인지 - 세션이 튕겨 다시 열 때 이어서 돌기 위해 기억
         # 스레드 이름 "판매" = GUI 의 [판매] 버튼 이름 - 로그 앞에 [판매] 머리가 붙는다 (gui.App.buttons)
         self.thread = threading.Thread(target=self._main, name="판매", daemon=True)
         self._stop_tick = threading.Event()
+        self._closed = threading.Event()    # "close" 가 왔다 - 다시 연결하려고 쉬는 중이면 바로 끝낸다
 
     # ---- GUI 스레드에서 부르는 것
     def start(self) -> None:
@@ -584,6 +605,8 @@ class SellEngine:
     def request(self, cmd: str) -> None:
         if cmd in ("stop", "close"):
             self._stop_tick.set()   # 항목 하나를 보는 중(sell_one)의 틱 대기를 바로 끊는다
+        if cmd == "close":
+            self._closed.set()
         self.commands.put(cmd)
 
     # ---- 작업 스레드
@@ -594,14 +617,23 @@ class SellEngine:
             log.exception("판매 관리 창 이벤트 처리 중 오류 (%s)", kind)
 
     def _main(self) -> None:
+        """브라우저 세션을 열고 _loop 를 돈다. 세션이 열린 뒤 _loop 가 예외로 튕기면 창을 닫지 않고 RECONNECT_SEC 뒤 세션을 다시 열어
+        이어서 돈다 (경쟁 중이었으면 경쟁도 그대로, self.running). 세션 자체를 못 여는 것(크롬·로그인 실패)은 다시 해도 같으니 창을 닫는다."""
         s = self.settings
         try:
             s.validate()
-            self._emit("status", "로그인 확인 중...")
-            with auth.session(s) as (context, page):
-                api = ApiClient(page, context.raw)
-                log.info(pacing.API_PACER.describe_setup())
-                self._loop(page, api)
+            while not self._closed.is_set():
+                self._emit("status", "로그인 확인 중...")
+                with auth.session(s) as (context, page):
+                    api = ApiClient(page, context.raw)
+                    log.info(pacing.API_PACER.describe_setup())
+                    try:
+                        self._loop(page, api)
+                        return
+                    except Exception as e:  # noqa: BLE001
+                        log.exception("판매 엔진 오류 - %d초 뒤 브라우저 세션을 다시 열어 이어서 돕니다", RECONNECT_SEC)
+                        self._emit("error", f"{type(e).__name__}: {e} - {RECONNECT_SEC}초 뒤 다시 연결")
+                sleep_with_stop(RECONNECT_SEC, self._closed.is_set)
         except Exception as e:  # noqa: BLE001
             log.exception("판매 엔진 오류")
             self._emit("error", f"{type(e).__name__}: {e}")
@@ -610,7 +642,6 @@ class SellEngine:
 
     def _loop(self, page: Page, api: ApiClient) -> None:
         state = SellState()
-        running = False
         cycle = 0
         order = 0
         pending: list[StockItem] = []   # 이 사이클에서 아직 안 본 경쟁 대상
@@ -627,11 +658,11 @@ class SellEngine:
                 pending, wait, manual = [], 0.0, True
                 continue
             if cmd in ("start", "stop"):
-                running = cmd == "start"
-                pending, wait = [], (0.0 if running else NEW_STOCK_CHECK_SEC)
+                self.running = cmd == "start"
+                pending, wait = [], (0.0 if self.running else NEW_STOCK_CHECK_SEC)
                 self._stop_tick.clear()
-                self._emit("running", running)
-                if not running:
+                self._emit("running", self.running)
+                if not self.running:
                     self._emit("status", "경쟁 멈춤")
                 continue
             if pending:
@@ -646,7 +677,7 @@ class SellEngine:
             self._refresh(page, api, state, manual)
             manual = False
             wait = NEW_STOCK_CHECK_SEC
-            if running:
+            if self.running:
                 cycle += 1
                 order = 0
                 pending = [i for i in self.items if self.is_target(i)]
@@ -657,22 +688,10 @@ class SellEngine:
                     self._emit("status", f"{cycle}회차: 경쟁에 넣은 항목이 없음 - {CYCLE_GAP_SEC}초 뒤 다시")
 
     def _sell_one(self, page: Page, api: ApiClient, state: SellState, item: StockItem, cycle: int, order: int) -> None:
-        """항목 하나를 판정하고 결과를 창에 보낸다 (로그인이 풀렸으면 다시 로그인하고 한 번 더)."""
+        """항목 하나를 판정하고 결과를 창에 보낸다 (로그인이 풀렸으면 sell_with_relogin 이 다시 로그인하고 한 번 더)."""
         rule = self._rule(item)
         self._emit("status", f"{cycle}회차 {order}: {item.name[:24]} ({pacing.API_PACER.describe()})")
-        try:
-            with hangwatch.watching(page):
-                r = sell_one(item, order, cycle, api, self.settings, state, self._stop_tick.is_set, None, floor=rule.floor)
-        except product_mod.LoginNeeded as e:
-            log.info("로그인이 풀림 (%s) - 다시 로그인하고 이 항목을 한 번 더 봄", e)
-            auth.ensure_logged_in(page, self.settings)
-            api.invalidate()
-            with hangwatch.watching(page):
-                r = sell_one(item, order, cycle, api, self.settings, state, self._stop_tick.is_set, None, floor=rule.floor)
-        except Exception as e:  # noqa: BLE001
-            log.exception("보관 %s 처리 중 오류", item.ask_id)
-            r = _result(item, order, cycle, self.settings)
-            r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
+        r = sell_with_relogin(page, item, order, cycle, api, self.settings, state, self._stop_tick.is_set, None, floor=rule.floor)
         r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log.info("[%d회차 %d번째] 결과: %s - %s", cycle, order, r.status, r.detail)
         self.results.append(r)
