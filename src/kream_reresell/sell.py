@@ -68,6 +68,7 @@ PROBE_CEILING = 1.3         # 탐침으로 오르는 상한 = 실행 시작 때 
 MAX_PAGES = 20              # 보관 목록 페이지 상한
 PER_PAGE = 50
 SET_PAUSE_SEC = (1.0, 2.0)  # review → set 사이, 가격 변경 뒤 쉼 (판매자 API 는 스로틀 대상 상품 API 와 다르지만 사람 속도로)
+DEFAULT_FEE_RATE = 0.005    # 판매 수수료율 - 항목에 price_breakdown 이 없을 때 (가격이 아직 없는 판매대기 항목, 2026-09-17 실측 0.5%)
 NOT_LOADED_PREFIX = "판단 불가"
 STOCK_QUERIES = (("live", "입찰중"), ("in_storage", "판매대기"))
 
@@ -122,8 +123,10 @@ def parse_stock_item(raw: dict, status_text: str) -> StockItem | None:
     release = (raw.get("product") or {}).get("release") or {}
     option = raw.get("product_option") or {}
     breakdown = raw.get("price_breakdown") or {}
+    # 판매대기 항목은 아직 판매 희망가가 없다 (price·price_breakdown 이 null) - price 0 으로 받는다. 예전에는 가격이 없으면 버려서
+    # 판매대기 24건이 통째로 빠지고 새 입고 알림도 안 떴다 (2026-09-18 실측)
     price = _int(raw.get("price"))
-    if not raw.get("id") or not raw.get("product_id") or not price:
+    if not raw.get("id") or not raw.get("product_id"):
         return None
     fee = abs(_int((breakdown.get("processing_fee") or {}).get("value")))
     return StockItem(
@@ -133,7 +136,7 @@ def parse_stock_item(raw: dict, status_text: str) -> StockItem | None:
         size=str(option.get("key") or ONE_SIZE),
         price=price, status=str(raw.get("status") or ""),
         status_text=str(((raw.get("status_display_item") or {}).get("text")) or status_text),
-        fee_rate=(fee / price) if price else 0.0,
+        fee_rate=(fee / price) if price and fee else DEFAULT_FEE_RATE,
         expires_at=str(raw.get("expires_at") or ""), oid=str(raw.get("oid") or ""),
         stored_at=parse_utc(raw.get("date_shipment_available")),
     )
@@ -327,7 +330,8 @@ def sell_one(item: StockItem, order: int, cycle: int, api: ApiClient, settings: 
             log.warning("보관 %s: 지난번에 %s원으로 바꿨는데 목록은 %s원 - 다른 프로그램(No1 최저가 경쟁?)이 바꿨거나 반영 안 됨",
                         item.ask_id, f"{expected:,}", f"{item.price:,}")
             r.detail += f"지난 사이클에 넣은 {expected:,}원이 아니라 {item.price:,}원으로 읽힘 (다른 프로그램이 바꿨는지 확인) - "
-        state.base_price.setdefault(item.ask_id, item.price)
+        if item.price:   # 가격이 아직 없는 판매대기 항목은 등록된 뒤의 가격을 기준으로 삼는다 (0 이면 탐침 상한이 0 이 된다)
+            state.base_price.setdefault(item.ask_id, item.price)
         if floor is None:
             floor = floor_price(item.buy_price, settings.sell_margin_rate, item.fee_rate)
         r.price_r = None if free else floor
@@ -345,7 +349,7 @@ def sell_one(item: StockItem, order: int, cycle: int, api: ApiClient, settings: 
                  cycle, order, item.label[:40], f"{item.price:,}", item.status_text, _won(lowest),
                  "없음 (보관료 기한)" if free else f"{floor:,}원", _won(item.buy_price), item.fee_rate * 100, item.stored_days or "?")
 
-        if item.price < floor:
+        if item.price and item.price < floor:
             return _apply(api, item, floor, r, settings, state, f"내 가격이 하한 아래라 하한으로 올림 (경쟁 최저가 {_won(lowest)})")
         if live and lowest is not None and lowest == item.price:
             return _probe_or_hold(api, item, floor, r, settings, state, should_stop, on_status)

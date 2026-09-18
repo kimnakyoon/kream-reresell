@@ -179,7 +179,7 @@ class SellWindow:
                 tags.append("compete")
             if rule.floor is None:
                 tags.append("nofloor")
-            elif item.price < rule.floor and not free:
+            elif item.price and item.price < rule.floor and not free:
                 tags.append("below")
             days = item.stored_days
             self.tree.insert("", "end", iid=str(item.ask_id), tags=tags, values=(
@@ -245,7 +245,7 @@ class SellWindow:
         if key == "floor":
             value = simpledialog.askinteger("판매 하한가", f"{item.label}\n\n판매 하한가(원, 이 아래로는 안 내림)를 넣어주세요.\n"
                                                     f"매입가 {_won(item.buy_price) or '모름'} / 지금 판매가 {item.price:,}",
-                                            parent=self.top, initialvalue=rule.floor or item.price, minvalue=1000)
+                                            parent=self.top, initialvalue=rule.floor or item.price or None, minvalue=1000)
             if value:
                 rule.floor = int(round(value / 1000.0)) * 1000
                 self._save()
@@ -413,5 +413,8 @@ class SellWindow:
             self.top.destroy()
         except tk.TclError:
             pass
+        # Tk 변수는 여기(GUI 스레드)서 놓는다 - 창 객체가 순환 참조로 남았다가 작업 스레드의 GC 에서 지워지면 Variable.__del__ 이
+        # 그 스레드에서 Tk 를 불러 GUI 스레드가 한가해질 때까지 작업이 멈춘다 (2026-09-18 실측: [입찰] 이 보고서를 쓰다 거기서 기다림)
+        self.view = None
         if self.on_close:
             self.on_close()

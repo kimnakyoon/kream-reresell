@@ -59,7 +59,9 @@ WINDOW_WIDTH = 720  # '상품 고르기' 라디오 세 개(약 670px)가 한 줄
 WINDOW_HEIGHT = 900
 RIGHT_MARGIN = 40
 
-MAX_SECTION_LINES_IN_POPUP = 20   # [재입찰] 완료 창에 보여줄 회차별 요약 줄 수 (100회면 창이 화면을 넘어감 - 나머지는 로그에)
+LOG_BOX_MAX_LINES = 5000          # 로그 상자에 남기는 줄 수 - 넘으면 위에서부터 지운다 (전체는 logs/gui_*.log)
+POLL_MAX_MESSAGES = 2000          # _poll 한 번에 처리하는 큐 메시지 수 - 넘으면 창에 차례를 돌려준 뒤 이어서
+MAX_SECTION_LINES_IN_POPUP = 20   #[재입찰] 완료 창에 보여줄 회차별 요약 줄 수 (100회면 창이 화면을 넘어감 - 나머지는 로그에)
 
 # 랭킹 체크박스는 랭킹 칩 순서(ALL_CATEGORIES)대로 나열하고, 체크한 것을 그 순서대로 실행한다.
 CATEGORY_COLUMNS = 6
@@ -344,8 +346,16 @@ class App:
         logging.getLogger("kream_reresell").setLevel(logging.INFO)
 
     def _log(self, text: str) -> None:
+        """로그 상자에 text(여러 줄이어도 됨)를 한 번에 넣고 LOG_BOX_MAX_LINES 줄만 남긴다 (전체는 logs/gui_*.log 에 있다).
+
+        예전에는 한 줄마다 insert + see 를 했고 상자가 끝없이 자랐다 - 3만 줄이 쌓인 상자에 [중지] 뒤 결과 요약 7,800줄이 한꺼번에 오면
+        창이 3분 넘게 멈췄고, 그동안 작업 스레드도 Tk 호출을 기다리느라 보고서를 못 끝냈다 (2026-09-18 18:14 실측).
+        """
         self.log_box.configure(state="normal")
         self.log_box.insert("end", text + "\n")
+        extra = int(self.log_box.index("end-1c").split(".")[0]) - LOG_BOX_MAX_LINES
+        if extra > 0:
+            self.log_box.delete("1.0", f"{extra + 1}.0")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
@@ -775,12 +785,23 @@ class App:
 
     # ------------------------------------------------------------ 큐 처리
     def _poll(self) -> None:
+        """큐에 쌓인 것을 처리한다. 로그는 모아서 한 번에 넣고(_log), 한 번에 POLL_MAX_MESSAGES 개까지만 보고 창에 차례를 돌려준다."""
+        lines: list[str] = []
+
+        def flush() -> None:
+            if lines:
+                self._log("\n".join(lines))
+                lines.clear()
+
+        busy = False
         try:
-            while True:
+            for _ in range(POLL_MAX_MESSAGES):
                 kind, name, payload = self.q.get_nowait()
                 if kind == "log":
-                    self._log(payload)
-                elif kind == "status":
+                    lines.append(payload)
+                    continue
+                flush()   # 로그와 다른 이벤트(완료 창 등)의 순서를 지킨다
+                if kind == "status":
                     job = self.jobs.get(name)
                     if job and job.stoppable:   # 중지를 눌렀으면 "멈춥니다..." 표시를 유지
                         job.status = payload
@@ -790,9 +811,11 @@ class App:
                 elif kind == "error":
                     self._end_job(name, "오류로 중단")
                     messagebox.showerror(f"{name} 오류", payload)
+            busy = True   # 아직 남았다 - 바로 이어서
         except queue.Empty:
             pass
-        self.root.after(200, self._poll)
+        flush()
+        self.root.after(10 if busy else 200, self._poll)
 
     def _finish(self, name: str, job) -> None:
         self.last_report = job.report_path
