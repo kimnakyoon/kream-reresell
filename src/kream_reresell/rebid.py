@@ -68,7 +68,7 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
 from . import auth, hangwatch, pipeline
 from . import tab as tab_mod
-from .browser import SharedContext
+from .browser import LiveTab, SharedContext
 from . import bid as bid_mod
 from . import market as market_mod
 from . import product as product_mod
@@ -192,15 +192,17 @@ def _page_room(should_stop: Callable[[], bool] | None, on_status: Callable[[str]
 
 # ---------------------------------------------------------------- 입찰 하나
 
-def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, api: ApiClient,
+def rebid_one(work: LiveTab, bid: OpenBid, settings: Settings, cycle: int, api: ApiClient,
               should_stop: Callable[[], bool] | None = None, on_status: Callable[[str], None] | None = None) -> ProductResult:
     """입찰 하나를 본다: 시세 API 로 A·즉시 판매가 → 밀렸는지 → B 를 정해 처음 입찰 기준으로 다시 판정 → [입찰 변경하기] 로 희망가를 B 로 (또는 기준 미달이면 지움).
 
-    page 는 실행 내내 같은 탭을 다시 쓴다 (입찰마다 탭을 열고 닫는 시간을 아낀다. 페이지가 필요한 단계마다 goto 로 시작하므로 앞 입찰의 화면이 남지 않는다).
+    work 는 작업 탭 - 실행 내내 같은 탭을 다시 쓴다 (입찰마다 탭을 열고 닫는 시간을 아낀다. 페이지가 필요한 단계마다 goto 로 시작하므로 앞 입찰의 화면이
+    남지 않는다). 탭이 멈추면 버린다 (work.closed 가 참이 되어 run 이 새 탭에서 한 번 더 본다).
     api 는 시세·입찰 상세 API 클라이언트. 로그인이 풀린 것이 보이면 다시 로그인하고 한 번 더 본다.
     """
     r = ProductResult(rank=bid.order, product_id=bid.product_id or 0, name=bid.name, url=bid.url,
                       category=f"{cycle}회차", bid_price=bid.price, option="" if bid.is_one_size else bid.option)
+    page = work()
     try:
         try:
             _rebid_with_relogin(page, bid, settings, cycle, r, api, should_stop, on_status)
@@ -208,7 +210,7 @@ def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, api: Api
             # 탭이 응답하지 않아 버튼을 못 누른 것 - 상품·사이트 문제가 아니다. 같은 페이지가 풀리길 기다려도 소용없어
             # (2026-09-07 실측 5건: 90초 안에 안 풀림) 탭을 닫는다 - run 이 새 탭을 열어 한 번 더 본다 (hangwatch 가 닫았을 때와 같은 경로)
             log.warning("[%d회차 %d번째] %s (지금 주소 %s) - 탭을 닫음", cycle, bid.order, e, page.url)
-            tab_mod.close_quietly(page)
+            work.drop()   # 닫기가 실패해도 그 탭을 다시 쓰지 않는다
             r.status, r.detail = "확인필요", f"{NOT_LOADED_PREFIX}: {e} - 탭을 닫음"
     finally:
         r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -466,12 +468,12 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
 
 # ---------------------------------------------------------------- 사이클 반복
 
-def _wait_for_site(api: ApiClient, probe: OpenBid, live_tab: Callable[[], Page], settings: Settings,
+def _wait_for_site(api: ApiClient, probe: OpenBid, work: LiveTab, settings: Settings,
                    should_stop: Callable[[], bool], on_status: Callable[[str], None]) -> bool:
     """사이트가 응답을 안 줄 때 다시 줄 때까지 멈춘다. PROBE_SEC 마다 마지막에 막힌 입찰의 시세 API 를 한 번 불러 보고
     응답이 오면 돌아온다 (True). 중지 요청이면 False.
 
-    확인은 그때마다 live_tab() (열려 있는 작업 탭, 닫혔으면 새 탭) 에서 한다 - 확인 중 탭이 멈추면(PageStalled, 또는 감시 스레드가 닫음)
+    확인은 그때마다 work() (열려 있는 작업 탭, 닫혔으면 새 탭) 에서 한다 - 확인 중 탭이 멈추면(PageStalled, 또는 감시 스레드가 닫음)
     그 탭을 닫아 두어 다음 확인이 새 탭에서 되게 한다 (멈춘 탭을 그대로 들고 있으면 5분마다 같은 탭에서 실패만 되풀이한다).
 
     확인 중 로그인이 풀린 것이 보이면 (시세 API 401 → product.LoginNeeded) 기다려도 소용없으니 여기서 다시 로그인하고 한 번 더 부른다
@@ -492,15 +494,13 @@ def _wait_for_site(api: ApiClient, probe: OpenBid, live_tab: Callable[[], Page],
     def check() -> bool:
         if not probe.product_id:   # 확인할 상품을 모르면 (상세를 못 읽은 입찰) 한 번 쉰 뒤 그냥 이어서 본다 - 또 막히면 다시 멈춘다
             return True
-        page = live_tab()
+        page = work()
         try:
-            with hangwatch.watching(page):
+            with hangwatch.watching(work):
                 fetch_with_relogin(page)
         except PageStalled:
-            tab_mod.close_quietly(page)
+            work.drop()
             raise
-        finally:
-            hangwatch.take_trip()
         return True
 
     return wait_until_site_back(check, should_stop, on_status, what="시세")
@@ -530,7 +530,7 @@ def _fill_details_via_api(bids: list[OpenBid], api: ApiClient) -> None:
             apply_bid_info(bid, body)
 
 
-def run(context: SharedContext, page: Page, settings: Settings,
+def run(context: SharedContext, tab: LiveTab, settings: Settings,
         should_stop: Callable[[], bool] | None = None,
         on_result: Callable[[ProductResult], None] | None = None,
         on_status: Callable[[str], None] | None = None,
@@ -546,24 +546,20 @@ def run(context: SharedContext, page: Page, settings: Settings,
     results: list[ProductResult] = []
     # 입찰번호 -> 상품 ID. 파일(data/bid_products.json)에 남겨 두어 프로그램이 넣지 않은 입찰도 상세는 처음 한 번만 읽는다
     pid_cache = load_bid_products()
-    tab: Page = context.new_page()   # 입찰마다 탭을 열고 닫지 않고 실행 내내 이 탭을 다시 쓴다
-    # 시세·입찰 상세 API 는 그때의 작업 탭 안에서 부른다 (탭이 멈춰 바뀌어도 따라감). 헤더는 목록 페이지가 보내는 요청에서 받아 둔다
-    api = ApiClient(lambda: tab, context.raw)
+    listing = tab             # 목록 탭 (auth.session 이 준 작업 탭)
+    work = LiveTab(context)   # 입찰을 보는 탭: 입찰마다 열고 닫지 않고 실행 내내 다시 쓴다. (멈춰서) 닫혔으면 다음에 부를 때 새 탭
+    # 시세·입찰 상세 API 는 그때의 작업 탭 안에서 부른다 (탭이 멈춰 바뀌어도 따라감). 헤더는 목록 페이지가 보내는 요청에서 받아 둔다.
+    # same 을 넘긴다 - 입찰 하나를 보는 도중에는 새 탭을 열지 않아야 아래의 '탭이 닫혔으면 새 탭에서 한 번 더' 판정이 산다
+    api = ApiClient(work.same, context.raw)
     pacer = pacing.API_PACER
     log.info(pacer.describe_setup())
 
-    def live_tab() -> Page:
-        """작업 탭. (멈춰서) 닫혀 있으면 새로 연다 - api 도 tab 을 따라온다."""
-        nonlocal tab
-        tab = context.live_page(tab)
-        return tab
-
     def look(bid: OpenBid, cycle: int) -> tuple[ProductResult, hangwatch.Trip | None]:
         """입찰 하나를 본다. 보는 동안 감시 스레드가 탭을 닫았으면 그 기록도 돌려준다."""
-        current = live_tab()
-        with hangwatch.watching(current):
-            r = rebid_one(current, bid, settings, cycle, api, should_stop=stop, on_status=status)
-        return r, hangwatch.take_trip()
+        work()   # (멈춰서) 닫혀 있었으면 여기서 새 탭
+        with hangwatch.watching(work) as watch:
+            r = rebid_one(work, bid, settings, cycle, api, should_stop=stop, on_status=status)
+        return r, watch.trip
 
     cycle = 0
     list_failures = 0
@@ -573,14 +569,13 @@ def run(context: SharedContext, page: Page, settings: Settings,
         api_calls_before = pacing.BUDGET.total
         market_calls_before = api.calls
         status(f"재입찰 {cycle}회차: 구매 입찰 목록 읽는 중...")
-        page = context.live_page(page)   # 목록 탭도 멈춰 닫혔으면 새 탭에서 읽는다 (작업 탭과 같은 규칙)
         try:
-            with hangwatch.watching(page):
-                bids = _list_bids(page, settings)
+            with hangwatch.watching(listing):
+                bids = _list_bids(listing(), settings)
             list_failures = 0
         except Exception as e:  # noqa: BLE001
             if isinstance(e, PageStalled):
-                tab_mod.close_quietly(page)   # 같은 탭으로 다시 읽어 봐야 소용없다 - 다음 시도는 새 탭에서
+                listing.drop()   # 같은 탭으로 다시 읽어 봐야 소용없다 - 다음 시도는 새 탭에서
             list_failures += 1
             log.exception("%d회차: 구매 입찰 목록을 읽지 못함 (%d/%d)", cycle, list_failures, MAX_LIST_FAILURES)
             if list_failures >= MAX_LIST_FAILURES:
@@ -602,7 +597,8 @@ def run(context: SharedContext, page: Page, settings: Settings,
         for stale in [k for k in pid_cache if k not in live_ids]:
             del pid_cache[stale]
             cache_dirty = True
-        with hangwatch.watching(tab):
+        work()
+        with hangwatch.watching(work):
             _fill_details_via_api(bids, api)
         log.info("===== 재입찰 %d회차: 구매 입찰 %d건 (기한 만료라 바로 지울 입찰 %d건, 상세 페이지를 열어야 하는 입찰 %d건) =====",
                  cycle, len(bids), sum(1 for b in bids if b.expired), sum(1 for b in bids if b.needs_detail_for_judgement))
@@ -615,12 +611,12 @@ def run(context: SharedContext, page: Page, settings: Settings,
                 break
             status(f"재입찰 {cycle}회차: {bid.order}/{len(bids)} {bid.name[:24]} ({pacer.describe()})")
             r, trip = look(bid, cycle)
-            if tab.is_closed():
+            if work.closed:
                 # 탭이 멈춰 닫힌 것 (감시 스레드가 닫았거나 rebid_one 이 PageStalled 로 닫음) - 새 탭을 열어 그 입찰을 한 번 더 본다
                 log.warning("[%d회차 %d번째] 탭이 멈춰 닫힘 (%s) - 새 탭을 열어 한 번 더 봄",
                             cycle, bid.order, trip.describe() if trip else r.detail)
                 r, trip = look(bid, cycle)
-                if tab.is_closed():
+                if work.closed:
                     log.warning("[%d회차 %d번째] 새 탭에서도 멈춤 - 이 입찰은 확인필요로 두고 다음으로 감", cycle, bid.order)
             if bid.product_id and bid.size_value and r.status != "입찰취소":   # 지운 입찰은 다음 회차에 목록에서 빠져 캐시에서도 빠진다
                 entry = {"product_id": bid.product_id, "size": bid.size_value, "option": bid.option or ONE_SIZE}
@@ -638,12 +634,12 @@ def run(context: SharedContext, page: Page, settings: Settings,
                 trouble_streak = 0
                 log.warning("판단 불가·오류가 %d건 연달아 남 - 사이트가 응답을 안 주는 듯해 멈춤. %d분마다 확인하고 "
                             "다시 주면 로그인 상태를 확인한 뒤 이어서 봄", TROUBLE_STREAK, PROBE_SEC // 60)
-                back = _wait_for_site(api, bid, live_tab, settings, stop,
+                back = _wait_for_site(api, bid, work, settings, stop,
                                       lambda t: status(f"재입찰 {cycle}회차 ({bid.order}/{len(bids)} 까지 봄): {t}"))
                 if not back:
                     break
                 try:
-                    auth.ensure_logged_in(live_tab(), settings)
+                    auth.ensure_logged_in(work(), settings)
                 except Exception:  # noqa: BLE001
                     log.exception("쉬고 나서 로그인 상태를 확인하지 못함 - 그대로 이어서 봄")
         if cache_dirty:
@@ -671,5 +667,5 @@ def run(context: SharedContext, page: Page, settings: Settings,
             log.info("이번 사이클 %d초 걸림 - 목록을 다시 읽기 전 %d초 둠", int(elapsed), int(wait))
         status(f"재입찰 {cycle}회차 끝({int(elapsed)}초): {summary} - 바로 다음 사이클")
         sleep_with_stop(wait, stop)
-    tab_mod.close_quietly(tab)
+    work.drop()
     return results

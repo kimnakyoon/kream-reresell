@@ -72,6 +72,7 @@ class ApiError(Exception):
 
     @property
     def is_block_signal(self) -> bool:
+        # kind "closed" (탭이 멈춰 닫혀 호출이 끊김) 는 사이트로 나간 요청이 아니라 차단 신호가 아니다 - 세면 시세 틱만 두 배로 늘어난다
         return self.kind in ("timeout", "network", "page") or self.status in (429, 403) or self.status >= 500
 
     @property
@@ -98,11 +99,12 @@ def _is_ok_api_response(response: Response) -> bool:
 class ApiClient:
     """페이지 안에서 fetch 로 KREAM API 를 부른다. 헤더는 사이트가 실제로 보내 200 을 받은 요청에서 복사한다 (모듈 머리글).
 
-    page: fetch 를 실행할 탭, 또는 그 탭을 돌려주는 함수 (탭을 바꿔 쓰는 [재입찰] - 닫힌 탭이면 새 탭을 만들어 두고 함수가 그것을 돌려준다).
+    page: fetch 를 실행할 탭을 돌려주는 함수 - 부를 때마다 지금 쓸 탭. 보통 browser.LiveTab (닫혔으면 새 탭), 닫힌 탭을 그대로 받아야 하는
+    [재입찰] 은 LiveTab.same. 어느 쪽인지는 넘기는 쪽이 정한다.
     context: 주면 어느 탭이든 사이트가 API 요청을 보낼 때 헤더를 받아 둔다 - 로그인 뒤 목록 페이지를 여는 동안 저절로 잡혀 마이페이지 이동이 필요 없다.
     """
 
-    def __init__(self, page: Page | Callable[[], Page], context: BrowserContext | None = None) -> None:
+    def __init__(self, page: Callable[[], Page], context: BrowserContext | None = None) -> None:
         self._page = page
         self.headers: dict[str, str] = {}
         self.calls = 0          # 이 클라이언트로 보낸 요청 수 (로그용)
@@ -111,7 +113,7 @@ class ApiClient:
 
     @property
     def page(self) -> Page:
-        return self._page() if callable(self._page) else self._page
+        return self._page()
 
     def _sniff(self, response: Response) -> None:
         """200 을 받은 API 요청의 헤더를 받아 둔다 - 방금 통한 토큰이라 늘 최신으로 갈아 둔다
@@ -180,12 +182,24 @@ class ApiClient:
         인증이 끊긴 항목(401/403)은 헤더를 한 번만 다시 잡고 그 항목들만 한 번 더 보낸다 (POST 도 같다 - 가격 변경은 멱등이라 다시 보내도 된다)."""
         self.calls += len(reqs)
         paths = [p for p, _, _ in reqs]
+        page = self.page
         try:
-            results = self.page.evaluate(_FETCH_MANY_JS, [[{"url": self._url(p), "method": m, "body": b} for p, m, b in reqs],
-                                                          self._request_headers(), TIMEOUT_MS])
+            if page.is_closed():
+                raise RuntimeError("탭이 닫혀 있음")
+            results = page.evaluate(_FETCH_MANY_JS, [[{"url": self._url(p), "method": m, "body": b} for p, m, b in reqs],
+                                                     self._request_headers(), TIMEOUT_MS])
         except ApiError as e:
             return [e] * len(reqs)
         except Exception as e:  # noqa: BLE001
+            if page.is_closed():
+                # 탭이 (멈춰서) 닫혀 호출이 끊긴 것 - 사이트 문제가 아니다. 넘겨받은 함수가 새 탭을 주면(LiveTab) 거기서 한 번 더 보낸다
+                # (수백 건을 읽는 [내역] 이 통째로 버려지지 않게). 닫힌 탭을 그대로 주면([재입찰] 의 LiveTab.same) 부른 쪽이 새 탭에서 다시 본다
+                if retry and self.page is not page:
+                    log.info("탭이 닫혀 API 호출이 끊김 - 새 탭에서 한 번 더 보냄 (%s)", paths[0])
+                    self.calls -= len(reqs)
+                    return self._send(reqs, retry=False)
+                return [ApiError(f"API 호출 실패 ({p}): 탭이 닫힘 ({str(e).splitlines()[0] if str(e) else type(e).__name__})", kind="closed")
+                        for p in paths]
             return [ApiError(f"API 호출 실패 ({p}): {e}", kind="page") for p in paths]
         out: list[dict | ApiError] = []
         redo: list[int] = []

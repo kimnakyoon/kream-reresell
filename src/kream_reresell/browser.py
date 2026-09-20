@@ -195,6 +195,16 @@ class LiveTab:
         self.page = self.context.live_page(self.page)
         return self.page
 
+    def same(self) -> Page:
+        """갈아 끼우지 않고 지금 탭 그대로 (닫혔어도 그대로. 아직 없을 때만 연다) - 탭이 닫힌 것을 closed 로 읽어 멈춤을 판정하는 쪽이
+        일 하나를 하는 동안 쓴다: 그 사이 누가 조용히 새 탭을 열면 closed 가 거짓이 되어 멈춘 것을 놓친다."""
+        return self.page if self.page is not None else self()
+
+    @property
+    def closed(self) -> bool:
+        """지금 탭이 (멈춰서) 닫혔거나 버려졌는지 - 다음에 부르면 새 탭이 된다."""
+        return self.page is None or self.page.is_closed()
+
     def drop(self) -> None:
         """멈춘 탭을 버린다 - 다음에 부르면 새 탭 (닫기가 실패해도 그 탭을 다시 쓰지 않는다. 남은 탭은 close_pages 가 정리)."""
         if self.page is not None:

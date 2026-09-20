@@ -17,7 +17,7 @@ from playwright.sync_api import Page, sync_playwright
 from . import browser, hangwatch
 from .config import Settings
 from .errors import PageStalled
-from .tab import close_quietly, goto_with_retry, on_login_page, on_site
+from .tab import goto_with_retry, on_login_page, on_site
 
 log = logging.getLogger(__name__)
 
@@ -109,19 +109,21 @@ def ensure_logged_in(page: Page, settings: Settings) -> None:
 
 @contextlib.contextmanager
 def session(settings: Settings):
-    """작업 하나의 브라우저 세션: (이 프로세스가 띄운) 크롬에 붙어 이 작업의 탭을 열고 로그인까지 확인한 (context, page) - 작업 진입점 공용."""
+    """작업 하나의 브라우저 세션: (이 프로세스가 띄운) 크롬에 붙어 이 작업의 탭을 열고 로그인까지 확인한 (context, tab) - 작업 진입점 공용.
+
+    tab 은 browser.LiveTab - 부르면 작업 탭, (멈춰서) 닫혔으면 새 탭. 작업은 이것을 그대로 들고 다닌다 (Page 로 풀어 들고 있으면
+    닫힌 탭을 계속 쓰게 된다)."""
     with sync_playwright() as pw, browser.real_chrome_context(pw, block_images=settings.block_images, trim_api=settings.trim_api,
                                                                 show_chrome=settings.show_chrome) as context:
-        page = context.new_page()
+        tab = browser.LiveTab(context)
         try:
-            ensure_logged_in(page, settings)
+            ensure_logged_in(tab(), settings)
         except PageStalled as e:
-            # 탭이 응답하지 않는 것 - 같은 탭에서 기다려도 소용없다. 탭을 닫고 새 탭에서 한 번만 더 확인한다
+            # 탭이 응답하지 않는 것 - 같은 탭에서 기다려도 소용없다. 그 탭을 버리고 새 탭에서 한 번만 더 확인한다
             log.warning("로그인 확인 중 %s - 탭을 닫고 새 탭에서 다시 확인", e)
-            close_quietly(page)
-            page = context.new_page()
-            ensure_logged_in(page, settings)
-        yield context, page
+            tab.drop()
+            ensure_logged_in(tab(), settings)
+        yield context, tab
 
 
 def _login(page: Page, settings: Settings) -> None:

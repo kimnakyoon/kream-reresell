@@ -26,7 +26,8 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
 from . import pipeline
 from . import tab as tab_mod
-from .browser import SharedContext
+from . import hangwatch
+from .browser import LiveTab, SharedContext
 from . import product as product_mod
 from .bid import StoppedBeforeSubmit
 from .config import Settings
@@ -368,72 +369,76 @@ def review_bid(context: SharedContext, bid: OpenBid, settings: Settings) -> Prod
     page: Page = context.new_page()
     r = ProductResult(rank=bid.order, product_id=bid.product_id or 0, name=bid.name, url=bid.url,
                       category="구매입찰", bid_price=bid.price, option="" if bid.is_one_size else bid.option)
-    try:
-        if bid.expired:
-            # 상세를 읽지 않는다 (스로틀 대상) - delete_bid 는 입찰 상세 주소와 희망가만 쓴다
-            bid.fill_result(r)
-            reason = expired_reason(bid)
-            log.info("[입찰 %d번째] %s - %s → 지움", bid.order, bid.label, reason)
-        else:
-            if not bid.needs_detail:
-                log.info("입찰 #%d: 상품 %d%s (bids.json 기록과 일치, 상세 생략), 희망가 %s원, 마감 %s",
-                         bid.bid_id, bid.product_id, f" [{bid.option}]" if not bid.is_one_size else "",
-                         f"{bid.price:,}" if bid.price else "?", bid.deadline)
+    # 탭이 멈추면 감시 스레드가 닫는다 (이 입찰은 오류로 끝나고 다음 입찰은 새 탭) - 감시가 없으면 걸린 호출이 영영 안 돌아온다
+    with hangwatch.watching(page):
+        try:
+            if bid.expired:
+                # 상세를 읽지 않는다 (스로틀 대상) - delete_bid 는 입찰 상세 주소와 희망가만 쓴다
+                bid.fill_result(r)
+                reason = expired_reason(bid)
+                log.info("[입찰 %d번째] %s - %s → 지움", bid.order, bid.label, reason)
             else:
-                open_bid_detail(page, bid)
-            bid.fill_result(r)
-            log.info("[입찰 %d번째] %s (%s)", bid.order, bid.label, bid.product_url)
-            # 거래량이 모자라도 A/B 까지 읽어 보고서에 남긴다 (지운 이유를 나중에 볼 수 있게)
-            # 상품 금액 상한은 새로 입찰할 때만 쓰는 규칙이라 이미 넣은 입찰에는 적용하지 않는다
-            reason = pipeline.evaluate(page, bid.product_url, r, settings, stop_early=False, price_limit=False,
-                                       option=bid.eval_option, my_price=bid.price)
-            when = f"마감 {bid.deadline or bid.expires_at[:10]}"
-            if reason is None:
-                r.status, r.detail = "입찰유지", f"조건 충족 ({when})"
+                if not bid.needs_detail:
+                    log.info("입찰 #%d: 상품 %d%s (bids.json 기록과 일치, 상세 생략), 희망가 %s원, 마감 %s",
+                             bid.bid_id, bid.product_id, f" [{bid.option}]" if not bid.is_one_size else "",
+                             f"{bid.price:,}" if bid.price else "?", bid.deadline)
+                else:
+                    open_bid_detail(page, bid)
+                bid.fill_result(r)
+                log.info("[입찰 %d번째] %s (%s)", bid.order, bid.label, bid.product_url)
+                # 거래량이 모자라도 A/B 까지 읽어 보고서에 남긴다 (지운 이유를 나중에 볼 수 있게)
+                # 상품 금액 상한은 새로 입찰할 때만 쓰는 규칙이라 이미 넣은 입찰에는 적용하지 않는다
+                reason = pipeline.evaluate(page, bid.product_url, r, settings, stop_early=False, price_limit=False,
+                                           option=bid.eval_option, my_price=bid.price)
+                when = f"마감 {bid.deadline or bid.expires_at[:10]}"
+                if reason is None:
+                    r.status, r.detail = "입찰유지", f"조건 충족 ({when})"
+                    return r
+                reason = f"{reason} ({when})"
+            if settings.dry_run:
+                r.status, r.detail = "취소대상", f"dry-run: {reason}"
                 return r
-            reason = f"{reason} ({when})"
-        if settings.dry_run:
-            r.status, r.detail = "취소대상", f"dry-run: {reason}"
+            delete_bid(page, bid, settings)
+            if bid.product_id:
+                remove_bid(bid.product_id, bid.size_value, price=bid.price)
+            r.status, r.detail = "입찰취소", f"{reason} -> 입찰 #{bid.bid_id} 지움"
             return r
-        delete_bid(page, bid, settings)
-        if bid.product_id:
-            remove_bid(bid.product_id, bid.size_value, price=bid.price)
-        r.status, r.detail = "입찰취소", f"{reason} -> 입찰 #{bid.bid_id} 지움"
-        return r
-    except product_mod.SkipProduct as e:
-        r.status, r.detail = "확인필요", f"판단 불가 - 지우지 않음: {e}"
-        return r
-    except StoppedBeforeSubmit as e:
-        r.status, r.detail = "중단", str(e)
-        return r
-    except CancelAborted as e:
-        r.status, r.detail = "중단", f"안전장치: {e}"
-        return r
-    except CancelUncertain as e:
-        r.status, r.detail = "확인필요", f"{e} - 마이페이지 구매 입찰 탭에서 확인"
-        return r
-    except Exception as e:  # noqa: BLE001
-        dump(page, f"bid{bid.bid_id}_error")
-        log.exception("입찰 #%d 처리 중 오류", bid.bid_id)
-        r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
-        return r
-    finally:
-        r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log.info("[입찰 %d번째] 결과: %s - %s", bid.order, r.status, r.detail)
-        append_run_log({
-            "category": r.category, "rank": r.rank, "product_id": r.product_id, "name": r.name, "option": r.option,
-            "fast_sales": r.fast_sales if r.fast_sales is not None else "",
-            "price_a": r.price_a or "", "price_r": r.price_r or "", "price_b": r.price_b or "",
-            "status": r.status, "detail": r.detail,
-        })
-        tab_mod.close_quietly(page)
+        except product_mod.SkipProduct as e:
+            r.status, r.detail = "확인필요", f"판단 불가 - 지우지 않음: {e}"
+            return r
+        except StoppedBeforeSubmit as e:
+            r.status, r.detail = "중단", str(e)
+            return r
+        except CancelAborted as e:
+            r.status, r.detail = "중단", f"안전장치: {e}"
+            return r
+        except CancelUncertain as e:
+            r.status, r.detail = "확인필요", f"{e} - 마이페이지 구매 입찰 탭에서 확인"
+            return r
+        except Exception as e:  # noqa: BLE001
+            dump(page, f"bid{bid.bid_id}_error")
+            log.exception("입찰 #%d 처리 중 오류", bid.bid_id)
+            r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
+            return r
+        finally:
+            r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log.info("[입찰 %d번째] 결과: %s - %s", bid.order, r.status, r.detail)
+            append_run_log({
+                "category": r.category, "rank": r.rank, "product_id": r.product_id, "name": r.name, "option": r.option,
+                "fast_sales": r.fast_sales if r.fast_sales is not None else "",
+                "price_a": r.price_a or "", "price_r": r.price_r or "", "price_b": r.price_b or "",
+                "status": r.status, "detail": r.detail,
+            })
+            tab_mod.close_quietly(page)
 
 
-def run(context: SharedContext, page: Page, settings: Settings,
+def run(context: SharedContext, tab: LiveTab, settings: Settings,
         should_stop: Callable[[], bool] | None = None,
         on_result: Callable[[ProductResult], None] | None = None) -> list[ProductResult]:
-    """구매 입찰 목록 순서대로 전부 다시 판정한다. 끝나면 목록을 다시 읽어 지웠다는 것이 정말 사라졌는지 확인."""
-    bids = list_open_bids(page)
+    """구매 입찰 목록 순서대로 전부 다시 판정한다. 끝나면 목록을 다시 읽어 지웠다는 것이 정말 사라졌는지 확인.
+    tab 은 목록을 읽는 작업 탭 (auth.session 이 준 것). 입찰마다의 판정은 review_bid 가 탭을 따로 열고 닫는다."""
+    with hangwatch.watching(tab):
+        bids = list_open_bids(tab())
     known = load_bids()
     for bid in bids:
         apply_known(bid, match_known_bid(bid, known))
@@ -452,7 +457,8 @@ def run(context: SharedContext, page: Page, settings: Settings,
 
     if deleted:
         try:
-            remaining = {b.bid_id for b in list_open_bids(page)}
+            with hangwatch.watching(tab):
+                remaining = {b.bid_id for b in list_open_bids(tab())}
         except Exception as e:  # noqa: BLE001
             log.warning("지운 뒤 목록 재확인 실패: %s", e)
             remaining = set()
@@ -518,16 +524,17 @@ def open_bid_products(context: SharedContext, page: Page) -> OpenBids:
             unknown.append(bid)
     if unknown:
         log.info("bids.json 에 없는 입찰 %d건은 상세를 열어 상품 ID 를 읽음", len(unknown))
-        tab = context.new_page()
+        detail = LiveTab(context)   # 상세를 읽다 탭이 멈춰 닫히면 다음 입찰은 새 탭에서
         try:
             for bid in unknown:
                 try:
-                    ensure_product_id(tab, bid)
+                    with hangwatch.watching(detail):
+                        ensure_product_id(detail(), bid)
                 except Exception as e:  # noqa: BLE001
                     log.warning("입찰 #%d 상세를 읽지 못함: %s", bid.bid_id, e)
                 out.add(bid)
         finally:
-            tab_mod.close_quietly(tab)
+            detail.drop()
     log.info("마이페이지에 입찰 중인 상품 %d개: %s", len(out.by_product),
              ", ".join(f"{pid}({'/'.join(opts)})" if list(opts) != [ONE_SIZE] else str(pid)
                        for pid, opts in out.by_product.items()) or "-")

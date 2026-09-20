@@ -68,7 +68,7 @@ class Watcher:
         self.port = port
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
-        self.pages: list[Page] = []      # 지금 쓰는 탭 (안쪽이 마지막)
+        self.pages: list = []            # 지금 쓰는 탭 (안쪽이 마지막). Page 또는 browser.LiveTab - LiveTab 이면 그때의 탭(.page)을 따라간다
         self.trip: Trip | None = None
         self.idle = 0                    # 작업 스레드가 Playwright 호출 밖에서 쉬는 중 (idle() 중첩 수) - 이 동안은 세지 않는다
         self.thread = threading.Thread(target=self._loop, name=f"hangwatch-{threading.current_thread().name}", daemon=True)
@@ -92,7 +92,10 @@ class Watcher:
         closed_for: tuple[int, float] | None = None     # (요청 ID, 닫은 시각)
         while not self.stop_event.wait(TICK_SEC):
             with self.lock:
-                page, idle = (self.pages[-1] if self.pages else None), self.idle > 0
+                target, idle = (self.pages[-1] if self.pages else None), self.idle > 0
+            page = getattr(target, "page", target)   # LiveTab 이면 지금 탭 (버려졌으면 None)
+            if page is not None and page.is_closed():
+                page = None
             if idle:
                 # 쉬는 동안 남아 있던 회신은 다음 호출 때 바로 처리되므로 기록을 비우고 다시 세기 시작한다
                 first_seen.clear()
@@ -176,27 +179,46 @@ def stop() -> None:
     _local.watcher = _NULL
 
 
-def set_page(page: Page) -> None:
-    """멈추면 닫을 탭을 알려 준다 (안 쓰게 되면 clear_page)."""
+def set_page(page) -> None:
+    """멈추면 닫을 탭(Page 또는 browser.LiveTab)을 알려 준다 (안 쓰게 되면 clear_page)."""
     w = _current()
     with w.lock:
         w.pages.append(page)
 
 
-def clear_page(page: Page) -> None:
+def clear_page(page) -> None:
     w = _current()
     with w.lock:
         with contextlib.suppress(ValueError):
             w.pages.remove(page)
 
 
+@dataclass
+class Watch:
+    """watching 구간 하나. trip = 이 구간에서 감시 스레드가 탭을 닫은 기록 (없으면 None) - 구간 안에서도 나온 뒤에도 같은 이름으로 읽는다."""
+    left: bool = False              # 구간을 나왔는지
+    kept: Trip | None = None        # 나올 때 걷어 둔 기록
+
+    @property
+    def trip(self) -> Trip | None:
+        return self.kept if self.left else tripped()
+
+
 @contextlib.contextmanager
-def watching(page: Page):
+def watching(page, watch: Watch | None = None):
+    """page (Page 또는 browser.LiveTab) 를 쓰는 동안 감싼다. 구간을 나올 때 탭을 닫은 기록을 걷어 Watch 에 넘긴다 - 부른 쪽마다
+    take_trip() 을 챙기지 않아도 낡은 기록이 남아 뒤의 무관한 오류가 '탭이 멈춰 닫힘' 으로 읽히지 않는다.
+
+    LiveTab 을 넘기면 구간 도중 탭이 갈려도 새 탭을 감시한다 (Page 를 넘기면 그 탭만 - 닫히면 그 뒤는 감시 밖).
+    watch: 구간 밖(except 절)에서 기록을 읽을 쪽이 미리 만들어 넘기는 상자. 안 주면 새로 만든다."""
+    watch = watch if watch is not None else Watch()
+    watch.left, watch.kept = False, None
     set_page(page)
     try:
-        yield
+        yield watch
     finally:
         clear_page(page)
+        watch.kept, watch.left = take_trip(), True
 
 
 @contextlib.contextmanager

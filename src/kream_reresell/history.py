@@ -21,9 +21,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from playwright.sync_api import Page
+from playwright.sync_api import BrowserContext
 
 from .api import KST, ApiClient, ApiError
+from .browser import LiveTab
 
 log = logging.getLogger(__name__)
 
@@ -411,12 +412,13 @@ def _norm(text: str) -> str:
 
 # ---------------------------------------------------------------- 실행
 
-def collect(page: Page, year: int, month: int,
-            should_stop: Callable[[], bool] | None = None) -> HistoryResult:
-    """보관 판매 + 구매 내역을 읽고 짝을 맞춘 결과. page 는 로그인된 KREAM 탭."""
-    client = ApiClient(page)
+def collect(tab: LiveTab, year: int, month: int,
+            should_stop: Callable[[], bool] | None = None, context: BrowserContext | None = None) -> HistoryResult:
+    """보관 판매 + 구매 내역을 읽고 짝을 맞춘 결과. tab 은 로그인된 KREAM 작업 탭 (auth.session 이 준 것).
+    context (원본 BrowserContext) 를 주면 사이트가 보낸 요청에서 헤더를 저절로 받아 둔다 - 마이페이지 이동 1번을 아낀다."""
+    client = ApiClient(tab, context)
     log.info("보관 판매 목록을 읽는 중...")
-    client.capture_headers()
+    # 헤더가 없으면 첫 호출이 마이페이지로 가서 잡는다 (ApiClient._request_headers) - 여기서 따로 잡지 않는다
     sales, seen = fetch_sales(client, year, month, should_stop)
     result = HistoryResult(year=year, month=month, sales=sales, sales_seen=seen)
     if not sales:

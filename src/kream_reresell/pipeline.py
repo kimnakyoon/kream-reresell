@@ -22,13 +22,14 @@ from playwright.sync_api import Error as PlaywrightError, Page
 
 from . import auth, hangwatch
 from . import tab as tab_mod
-from .browser import SharedContext
+from .browser import LiveTab, SharedContext
 from . import bid as bid_mod
 from . import market as market_mod
 from . import product as product_mod
 from .api import ApiClient
 from .config import Settings
 from .debug import dump
+from .errors import PageStalled
 from .ranking import RankedProduct
 from .report import ProductResult
 from . import pacing
@@ -227,104 +228,108 @@ def process_product(context: SharedContext, item: RankedProduct, settings: Setti
             _done(results, cr, item)
         return results
     page: Page = context.new_page()
-    hangwatch.set_page(page)   # 탭이 아예 멈추면 감시 스레드가 닫는다 (이 상품은 오류로 끝나고 다음 상품은 새 탭) - hangwatch 참고
-    try:
+    # 탭이 아예 멈추면 감시 스레드가 닫는다 (이 상품은 판단 불가로 끝나고 다음 상품은 새 탭) - hangwatch 참고
+    with hangwatch.watching(page) as watch:
         try:
-            name = product_mod.open_product(page, item.url)
-            for _, cr in candidates:
-                cr.name = name or cr.name
-            if settings.inspect:
-                dump(page, f"{pid}_0_product")
-            pacing.before_sales_request(should_stop, on_status=on_status)
-            product_mod.open_sales_panel(page)
-        except product_mod.SkipProduct as e:
-            for _, cr in candidates:
-                cr.status, cr.detail = "건너뜀", _skip_detail(e)
+            try:
+                name = product_mod.open_product(page, item.url)
+                for _, cr in candidates:
+                    cr.name = name or cr.name
+                if settings.inspect:
+                    dump(page, f"{pid}_0_product")
+                pacing.before_sales_request(should_stop, on_status=on_status)
+                product_mod.open_sales_panel(page)
+            except product_mod.SkipProduct as e:
+                for _, cr in candidates:
+                    cr.status, cr.detail = "건너뜀", _skip_detail(e)
+                    _done(results, cr, item)
+                return results
+
+            if market.is_one_size:
+                opt, cr = candidates[0]
+                try:
+                    stats = product_mod.count_sales(page, settings.lookback_days, settings.min_fast_sales)
+                    product_mod.close_sales_panel(page)
+                except product_mod.SkipProduct as e:
+                    product_mod.raise_if_login_lost(page, "체결 내역 확인", e)
+                    cr.status, cr.detail = "건너뜀", _skip_detail(e)
+                    return _done(results, cr, item)
+                _judge_sales_and_bid(page, cr, stats, opt, item, settings, open_bids)
+                return _done(results, cr, item)
+
+            labels = [opt.label for opt, _ in candidates]
+            log.info("가격 기준을 통과한 옵션 %d개의 거래량을 셈: %s", len(labels), ", ".join(labels))
+            # 옵션 상품: 먼저 패널에서 옵션마다 거래량을 센다 (페이지 이동 없음). 모든 옵션 표에서 정해지지 않은 옵션만 하나씩 고른다
+            stats_by_option: dict[str, product_mod.SalesStats | str] = {}
+
+            def before_page() -> None:   # 모든 옵션 표를 한 페이지 더 넘기기 전 (sales 요청 1건) - 옵션을 고를 때와 같은 간격·예산
+                pacing.pause(pacing.PAGE_PAUSE_SEC, should_stop)
+                pacing.before_sales_request(should_stop, on_status=on_status)
+
+            try:
+                pre, _pages = product_mod.count_sales_by_option(page, settings.lookback_days, settings.min_fast_sales, labels,
+                                                                before_page=before_page)
+                stats_by_option.update(pre)
+            except product_mod.SkipProduct as e:
+                log.info("모든 옵션 표를 읽지 못함 (%s) - 옵션을 하나씩 봄", e)
+            for label in labels:
+                if label in stats_by_option:
+                    continue
+                pacing.pause(pacing.OPTION_PAUSE_SEC, should_stop)   # 옵션을 바꿀 때마다 sales 요청이 나간다 - 사람 속도로
+                if should_stop and should_stop():
+                    stats_by_option[label] = "중지 요청"
+                    continue
+                pacing.before_sales_request(should_stop, on_status=on_status)
+                try:
+                    product_mod.select_option(page, label)
+                    stats_by_option[label] = product_mod.count_sales(page, settings.lookback_days, settings.min_fast_sales, label)
+                except product_mod.SkipProduct as e:
+                    stats_by_option[label] = _skip_detail(e) if isinstance(e, product_mod.SalesNotLoaded) else f"거래량을 세지 못함: {e}"
+            try:
+                product_mod.close_sales_panel(page)
+            except product_mod.SkipProduct:
+                pass
+            for opt, cr in candidates:
+                st = stats_by_option[opt.label]
+                if isinstance(st, str):
+                    cr.status, cr.detail = "건너뜀", st
+                else:
+                    _judge_sales_and_bid(page, cr, st, opt, item, settings, open_bids)
                 _done(results, cr, item)
             return results
-
-        if market.is_one_size:
-            opt, cr = candidates[0]
-            try:
-                stats = product_mod.count_sales(page, settings.lookback_days, settings.min_fast_sales)
-                product_mod.close_sales_panel(page)
-            except product_mod.SkipProduct as e:
-                product_mod.raise_if_login_lost(page, "체결 내역 확인", e)
-                cr.status, cr.detail = "건너뜀", _skip_detail(e)
-                return _done(results, cr, item)
-            _judge_sales_and_bid(page, cr, stats, opt, item, settings, open_bids)
-            return _done(results, cr, item)
-
-        labels = [opt.label for opt, _ in candidates]
-        log.info("가격 기준을 통과한 옵션 %d개의 거래량을 셈: %s", len(labels), ", ".join(labels))
-        # 옵션 상품: 먼저 패널에서 옵션마다 거래량을 센다 (페이지 이동 없음). 모든 옵션 표에서 정해지지 않은 옵션만 하나씩 고른다
-        stats_by_option: dict[str, product_mod.SalesStats | str] = {}
-
-        def before_page() -> None:   # 모든 옵션 표를 한 페이지 더 넘기기 전 (sales 요청 1건) - 옵션을 고를 때와 같은 간격·예산
-            pacing.pause(pacing.PAGE_PAUSE_SEC, should_stop)
-            pacing.before_sales_request(should_stop, on_status=on_status)
-
-        try:
-            pre, _pages = product_mod.count_sales_by_option(page, settings.lookback_days, settings.min_fast_sales, labels,
-                                                            before_page=before_page)
-            stats_by_option.update(pre)
-        except product_mod.SkipProduct as e:
-            log.info("모든 옵션 표를 읽지 못함 (%s) - 옵션을 하나씩 봄", e)
-        for label in labels:
-            if label in stats_by_option:
-                continue
-            pacing.pause(pacing.OPTION_PAUSE_SEC, should_stop)   # 옵션을 바꿀 때마다 sales 요청이 나간다 - 사람 속도로
-            if should_stop and should_stop():
-                stats_by_option[label] = "중지 요청"
-                continue
-            pacing.before_sales_request(should_stop, on_status=on_status)
-            try:
-                product_mod.select_option(page, label)
-                stats_by_option[label] = product_mod.count_sales(page, settings.lookback_days, settings.min_fast_sales, label)
-            except product_mod.SkipProduct as e:
-                stats_by_option[label] = _skip_detail(e) if isinstance(e, product_mod.SalesNotLoaded) else f"거래량을 세지 못함: {e}"
-        try:
-            product_mod.close_sales_panel(page)
-        except product_mod.SkipProduct:
-            pass
-        for opt, cr in candidates:
-            st = stats_by_option[opt.label]
-            if isinstance(st, str):
-                cr.status, cr.detail = "건너뜀", st
-            else:
-                _judge_sales_and_bid(page, cr, st, opt, item, settings, open_bids)
-            _done(results, cr, item)
-        return results
-    except product_mod.LoginNeeded as e:
-        if any(x.status == "입찰완료" for x in results):
-            # 이 상품에 이미 입찰을 넣은 뒤 풀렸다 - 다시 보면 같은 옵션에 또 입찰할 수 있어 (open_bids 는 실행 시작 때 목록) 여기서 끝냄.
-            # 다음 상품에서 다시 로그인한다
+        except product_mod.LoginNeeded as e:
+            if any(x.status == "입찰완료" for x in results):
+                # 이 상품에 이미 입찰을 넣은 뒤 풀렸다 - 다시 보면 같은 옵션에 또 입찰할 수 있어 (open_bids 는 실행 시작 때 목록) 여기서 끝냄.
+                # 다음 상품에서 다시 로그인한다
+                r = _item_result(item)
+                r.status, r.detail = "오류", f"앞 옵션을 입찰한 뒤 {e} - 남은 옵션은 보지 않음"
+                return _done(results, r, item)
+            raise   # _process_with_relogin 이 다시 로그인하고 이 상품을 다시 본다 (결과를 남기지 않음)
+        except bid_mod.BidRejected as e:
+            # 마지막 '입찰하기' 를 서버가 거절 (bid 머리글) - _judge_sales_and_bid 가 그 옵션의 결과를 채우고 올렸다. 카테고리 제한이면 오늘 기록하고
+            # (store 머리글), 같은 상품의 남은 옵션도 구매 페이지를 열지 않는다 (같은 거절만 또 받는다)
+            if e.is_category_limit:
+                rejected.reject(market.category, str(e))
+                log.info("카테고리 '%s' 는 오늘(%s) 더 입찰하지 않음 - 같은 카테고리 상품은 전부 건너뜀", market.category, rejected.today)
+            for _, cr in candidates:
+                if not cr.status:
+                    cr.status, cr.detail = "건너뜀", f"같은 상품의 앞 옵션 입찰을 사이트가 거절해 시도하지 않음 ({e})"
+                if not any(x is cr for x in results):
+                    _done(results, cr, item)
+            return results
+        except Exception as e:  # noqa: BLE001
             r = _item_result(item)
-            r.status, r.detail = "오류", f"앞 옵션을 입찰한 뒤 {e} - 남은 옵션은 보지 않음"
+            if watch.trip is not None:
+                # 감시 스레드가 멈춘 탭을 닫아 걸려 있던 호출이 오류로 끝난 것 - 상품·사이트 문제가 아니다 ([재입찰]·[판매] 와 같은 분류)
+                log.warning("상품 %s: %s", pid, watch.trip.describe())
+                r.status, r.detail = "건너뜀", f"{NOT_LOADED_PREFIX}: {watch.trip.describe()}"
+                return _done(results, r, item)
+            dump(page, f"{pid}_error")
+            log.exception("상품 %s 처리 중 오류", pid)
+            r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
             return _done(results, r, item)
-        raise   # _process_with_relogin 이 다시 로그인하고 이 상품을 다시 본다 (결과를 남기지 않음)
-    except bid_mod.BidRejected as e:
-        # 마지막 '입찰하기' 를 서버가 거절 (bid 머리글) - _judge_sales_and_bid 가 그 옵션의 결과를 채우고 올렸다. 카테고리 제한이면 오늘 기록하고
-        # (store 머리글), 같은 상품의 남은 옵션도 구매 페이지를 열지 않는다 (같은 거절만 또 받는다)
-        if e.is_category_limit:
-            rejected.reject(market.category, str(e))
-            log.info("카테고리 '%s' 는 오늘(%s) 더 입찰하지 않음 - 같은 카테고리 상품은 전부 건너뜀", market.category, rejected.today)
-        for _, cr in candidates:
-            if not cr.status:
-                cr.status, cr.detail = "건너뜀", f"같은 상품의 앞 옵션 입찰을 사이트가 거절해 시도하지 않음 ({e})"
-            if not any(x is cr for x in results):
-                _done(results, cr, item)
-        return results
-    except Exception as e:  # noqa: BLE001
-        dump(page, f"{pid}_error")
-        log.exception("상품 %s 처리 중 오류", pid)
-        r = _item_result(item)
-        r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
-        return _done(results, r, item)
-    finally:
-        hangwatch.clear_page(page)
-        hangwatch.take_trip()
-        tab_mod.close_quietly(page)
+        finally:
+            tab_mod.close_quietly(page)
 
 
 def _done(results: list[ProductResult], r: ProductResult, item: RankedProduct) -> list[ProductResult]:
@@ -444,7 +449,7 @@ def run(context: SharedContext, items: list[RankedProduct], settings: Settings, 
         should_stop: Callable[[], bool] | None = None,
         on_result: Callable[[ProductResult], None] | None = None,
         open_bids: "OpenBids | None" = None,
-        page: Page | None = None,
+        tab: LiveTab | None = None,
         on_status: Callable[[str], None] | None = None,
         rejected: CategoryRejections | None = None) -> list[ProductResult]:
     """open_bids: 마이페이지 구매 입찰 탭에 지금 살아 있는 입찰 (cancel.OpenBids). rejected: 오늘 사이트가 카테고리 단위로 거절한 입찰 (store 머리글) -
@@ -459,7 +464,7 @@ def run(context: SharedContext, items: list[RankedProduct], settings: Settings, 
     더 열지 않고 멈춘 채 5분마다 확인, 다시 주면 그 상품들부터 다시 본다 (앞서 남긴 판단 불가 결과는 바꿔 넣는다. 확인이 패널을
     열어 보는 것이라 로그인 확인을 겸한다). 사용자가 중지할 때까지 기다린다.
     로그인이 풀리면 (product.LoginNeeded) 다시 로그인하고 그 상품을 한 번 더 본다 (_process_with_relogin). 또 풀리면 오류.
-    api: 시세·입찰 상세 API 클라이언트 (app.run_job 이 만든다). page: 다시 로그인할 때 쓰는 메인 탭 (없거나 닫혔으면 새 탭). on_status: GUI 상태 한 줄.
+    api: 시세·입찰 상세 API 클라이언트 (app.run_job 이 만든다). tab: 다시 로그인할 때 쓰는 작업 탭 (auth.session 이 준 것. 없으면 새로 만든다). on_status: GUI 상태 한 줄.
     """
     stop = should_stop or (lambda: False)
     status = on_status or (lambda _t: None)
@@ -489,7 +494,7 @@ def run(context: SharedContext, items: list[RankedProduct], settings: Settings, 
                 on_result(results[-1])
             continue
         status(f"[{item.category}] {item.rank}위 {item.name[:24]} 확인 중 ({done}/{len(items)}, 시세 {pacing.API_PACER.describe()})")
-        product_results = _process_with_relogin(context, page, item, settings, open_bids, stop, status, api, rejected)
+        product_results = _process_with_relogin(context, tab, item, settings, open_bids, stop, status, api, rejected)
         for r in product_results:
             results.append(r)
             if on_result:
@@ -524,7 +529,7 @@ def _item_result(item: RankedProduct, **fields) -> ProductResult:
                          category=item.category, **fields)
 
 
-def _process_with_relogin(context: SharedContext, page: Page | None, item: RankedProduct, settings: Settings,
+def _process_with_relogin(context: SharedContext, tab: LiveTab | None, item: RankedProduct, settings: Settings,
                           open_bids: "OpenBids | None", stop: Callable[[], bool],
                           status: Callable[[str], None], api: ApiClient,
                           rejected: CategoryRejections | None = None) -> list[ProductResult]:
@@ -534,15 +539,15 @@ def _process_with_relogin(context: SharedContext, page: Page | None, item: Ranke
     except product_mod.LoginNeeded as e:
         log.warning("[%d위] %s - 다시 로그인하고 한 번 더 봄", item.rank, e)
         status("로그인이 풀려 다시 로그인하는 중")
-        tab = context.live_page(page)
+        tab = tab if tab is not None else LiveTab(context)
         try:
-            auth.ensure_logged_in(tab, settings)
+            with hangwatch.watching(tab):
+                auth.ensure_logged_in(tab(), settings)
         except Exception as e2:  # noqa: BLE001
             log.exception("다시 로그인하지 못함")
+            if isinstance(e2, PageStalled):
+                tab.drop()   # 다음 상품의 다시 로그인은 새 탭에서
             return _done([], _item_result(item, status="오류", detail=f"로그인이 풀렸는데 다시 로그인하지 못함: {e2}"), item)
-        finally:
-            if tab is not page:
-                tab_mod.close_quietly(tab)
         api.invalidate()
     try:
         return process_product(context, item, settings, api, open_bids, stop, status, rejected)
@@ -556,6 +561,15 @@ def _site_gives_sales(context: SharedContext, item: RankedProduct, settings: Set
     그 사이 로그인이 풀렸으면 (시세 API 401, 또는 패널 대신 로그인 화면) 기다려도 소용없으니 여기서 다시 로그인하고 한 번 더 본다."""
     tab = context.new_page()
     try:
+        return _site_check(tab, item, settings, api)
+    finally:
+        tab_mod.close_quietly(tab)
+
+
+def _site_check(tab: Page, item: RankedProduct, settings: Settings, api: ApiClient) -> bool:
+    """_site_gives_sales 의 확인 한 번 (tab 은 그 확인만 쓰고 닫는 탭). 탭이 멈추면 감시 스레드가 닫아 오류로 끝난다 - wait_until_site_back 이
+    '아직 안 줌' 으로 보고 다음 확인은 새 탭에서 한다 (감시가 없으면 걸린 호출이 영영 안 돌아와 [중지] 도 안 듣는다)."""
+    with hangwatch.watching(tab):
         def relogin(e: product_mod.LoginNeeded) -> None:
             log.warning("확인 중 %s - 다시 로그인하고 한 번 더 확인", e)
             auth.ensure_logged_in(tab, settings)
@@ -576,5 +590,3 @@ def _site_gives_sales(context: SharedContext, item: RankedProduct, settings: Set
             ok, note = product_mod.sales_available(tab, item.url)
         log.info("확인: %s", note)
         return ok
-    finally:
-        tab_mod.close_quietly(tab)

@@ -45,8 +45,6 @@ from typing import TypeVar
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
-from playwright.sync_api import Page
-
 from . import auth, hangwatch, pacing
 from .browser import LiveTab, SharedContext
 from . import market as market_mod
@@ -456,8 +454,10 @@ def sell_with_relogin(tab: LiveTab, item: StockItem, order: int, cycle: int, api
     탭이 멈춘 것(PageStalled, 또는 감시 스레드가 탭을 닫음)은 상품·사이트 문제가 아니다 - 그 탭을 버리고 '확인필요' 로 적는다.
     다음 항목은 새 탭에서 본다 (멈춘 탭을 그대로 들고 있으면 남은 항목이 전부 같은 오류로 끝난다).
     """
+    watch = hangwatch.Watch()   # 감시 스레드가 탭을 닫았는지 - 아래 except 에서 읽는다
+
     def once() -> ProductResult:
-        with hangwatch.watching(tab()):
+        with hangwatch.watching(tab, watch):
             return sell_one(item, order, cycle, api, settings, state, should_stop, on_status, floor=floor)
 
     r = _result(item, order, cycle, settings)
@@ -477,7 +477,7 @@ def sell_with_relogin(tab: LiveTab, item: StockItem, order: int, cycle: int, api
         tab.drop()
         r.status, r.detail = "확인필요", f"{NOT_LOADED_PREFIX} - 올리지 않음: {e}"
     except Exception as e:  # noqa: BLE001
-        trip = hangwatch.tripped()
+        trip = watch.trip
         if trip is not None:
             # 감시 스레드가 멈춘 탭을 닫아 걸려 있던 호출이 오류로 끝난 것 - PageStalled 와 같은 사건이다 ([재입찰] 과 같은 분류)
             log.warning("보관 %s: %s (다음 항목은 새 탭에서)", item.ask_id, trip.describe())
@@ -485,8 +485,6 @@ def sell_with_relogin(tab: LiveTab, item: StockItem, order: int, cycle: int, api
         else:
             log.exception("보관 %s 처리 중 오류", item.ask_id)
             r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
-    finally:
-        hangwatch.take_trip()
     return r
 
 
@@ -510,19 +508,17 @@ def _read_with_relogin(tab: LiveTab, api: ApiClient, settings: Settings, read: C
     (부른 쪽이 쉬었다 다시 읽는다. 쉼 없이 로그인만 되풀이하지 않게)."""
     for again in (False, True):
         try:
-            with hangwatch.watching(tab()):
+            with hangwatch.watching(tab):
                 return read()
         except ApiError as e:
             if again or not e.is_auth_lost or not _relogin(tab, api, settings):
                 raise
-        finally:
-            hangwatch.take_trip()
     raise AssertionError("unreachable")
 
 
 # ---------------------------------------------------------------- 사이클 반복
 
-def run(context: SharedContext, page: Page, settings: Settings,
+def run(context: SharedContext, tab: LiveTab, settings: Settings,
         should_stop: Callable[[], bool] | None = None,
         on_result: Callable[[ProductResult], None] | None = None,
         on_status: Callable[[str], None] | None = None,
@@ -532,7 +528,6 @@ def run(context: SharedContext, page: Page, settings: Settings,
     stop = should_stop or (lambda: False)
     status = on_status or (lambda _t: None)
     results: list[ProductResult] = []
-    tab = LiveTab(context, page)
     api = ApiClient(tab, context.raw)
     state = SellState()
     pacer = pacing.API_PACER
@@ -676,8 +671,7 @@ class SellEngine:
             s.validate()
             while not self._closed.is_set():
                 self._emit("status", "로그인 확인 중...")
-                with auth.session(s) as (context, page):
-                    tab = LiveTab(context, page)
+                with auth.session(s) as (context, tab):
                     api = ApiClient(tab, context.raw)
                     log.info(pacing.API_PACER.describe_setup())
                     try:

@@ -15,9 +15,8 @@ from playwright.sync_api import Page
 
 from datetime import datetime
 
-from . import auth, cancel, history, history_report, pacing, pipeline, ranking, rebid, report, search, sell, shop, store
+from . import auth, cancel, hangwatch, history, history_report, pacing, pipeline, ranking, rebid, report, search, sell, shop, store
 from .api import ApiClient
-from .browser import LiveTab
 from .config import Settings
 from .errors import PageStalled
 from .history import HistoryResult
@@ -45,8 +44,9 @@ def run_history_job(settings: Settings, year: int, month: int,
                     should_stop: Callable[[], bool] | None = None) -> HistoryJobResult:
     """[내역]: 보관 판매 거래일시가 year-month 인 판매를 구매 내역과 짝지어 바탕화면에 엑셀로 저장한다."""
     log.info("판매 내역 정리: %d년 %d월 (보관 판매 거래일시 기준)", year, month)
-    with auth.session(settings) as (context, page):
-        result = history.collect(page, year, month, should_stop=should_stop)
+    with auth.session(settings) as (context, tab):
+        with hangwatch.watching(tab):   # 탭이 멈추면 감시 스레드가 닫는다 - 감시가 없으면 걸린 호출이 영영 안 돌아온다
+            result = history.collect(tab, year, month, should_stop=should_stop, context=context.raw)
     path = history_report.write_history(result)
     log.info("판매 %d건, 매입 못 찾음 %d건 → %s", len(result.sales), len(result.unmatched), path)
     return HistoryJobResult(result=result, report_path=path)
@@ -232,11 +232,10 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
     log.info("%s | %s", mode, settings_line)
 
     results: list[ProductResult] = []
-    with auth.session(settings) as (context, page):
+    with auth.session(settings) as (context, tab):
         # 마이페이지에 이미 입찰 중인 상품은 건너뛴다 (bids.json 과 별개로 실제 목록을 본다)
         # 시세 API (상품 상세) - 상품마다 한 번, 가격을 먼저 거른다 (pipeline 머리글). 헤더는 아래 목록 페이지가 보내는 요청에서 받아 둔다
-        # 목록·API 가 쓰는 탭은 작업 내내 하나다 - (멈춰서) 닫혔으면 새 탭으로 갈아 끼운다 (닫힌 탭을 들고 있으면 남은 상품이 전부 오류로 끝난다)
-        tab = LiveTab(context, page)
+        # 목록·API·다시 로그인이 쓰는 탭은 작업 내내 tab 하나다 - (멈춰서) 닫혔으면 새 탭으로 갈아 끼워진다
         api = ApiClient(tab, context.raw)
         log.info(pacing.API_PACER.describe_setup())
         log.info("마이페이지 구매 입찰 목록 확인 중...")
@@ -250,7 +249,7 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
                                            url=f"https://kream.co.kr/products/{pid}", category="지정")
                      for i, pid in enumerate(product_ids)]
             results = pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
-                                   open_bids=open_bids, page=tab(), on_status=on_status, api=api,
+                                   open_bids=open_bids, tab=tab, on_status=on_status, api=api,
                                    rejected=rejected_categories)
         else:
             sources = _product_sources(settings, categories, keywords, shop_categories)
@@ -289,7 +288,7 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
                 items, skipped = skip_low_trades(items, settings, on_result)
                 results.extend(skipped)
                 results.extend(pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
-                                            open_bids=open_bids, page=tab(), on_status=on_status, api=api,
+                                            open_bids=open_bids, tab=tab, on_status=on_status, api=api,
                                             rejected=rejected_categories))
 
     log.info("==== 결과 ====")
@@ -318,8 +317,8 @@ def run_cancel_job(settings: Settings,
     settings_line = describe_cancel_settings(settings)
     log.info("%s | %s", mode, settings_line)
 
-    with auth.session(settings) as (context, page):
-        results = cancel.run(context, page, settings, should_stop=should_stop, on_result=on_result)
+    with auth.session(settings) as (context, tab):
+        results = cancel.run(context, tab, settings, should_stop=should_stop, on_result=on_result)
 
     log.info("==== 결과 ====")
     for r in results:
@@ -375,8 +374,8 @@ def run_sell_job(settings: Settings,
         path = write(path)
 
     try:
-        with auth.session(settings) as (context, page):
-            sell.run(context, page, settings, should_stop=should_stop, on_result=collect,
+        with auth.session(settings) as (context, tab):
+            sell.run(context, tab, settings, should_stop=should_stop, on_result=collect,
                      on_status=on_status, on_cycle=cycle_done, max_cycles=max_cycles)
     except KeyboardInterrupt:
         log.info("Ctrl+C 로 중지")
@@ -445,8 +444,8 @@ def run_rebid_job(settings: Settings,
         path = _write_rebid_report(results, settings_line, mode, path)
 
     try:
-        with auth.session(settings) as (context, page):
-            rebid.run(context, page, settings, should_stop=should_stop, on_result=collect,
+        with auth.session(settings) as (context, tab):
+            rebid.run(context, tab, settings, should_stop=should_stop, on_result=collect,
                       on_status=on_status, on_cycle=cycle_done, max_cycles=max_cycles)
     except KeyboardInterrupt:
         log.info("Ctrl+C 로 중지")
