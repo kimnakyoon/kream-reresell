@@ -22,7 +22,7 @@ from playwright.sync_api import Page, Response, TimeoutError as PlaywrightTimeou
 from .api import API_BASE
 from .config import Settings
 from .debug import dump
-from .product import eval_bounded
+from .tab import eval_bounded
 
 log = logging.getLogger(__name__)
 

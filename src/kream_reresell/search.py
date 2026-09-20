@@ -18,6 +18,7 @@ from urllib.parse import quote
 from playwright.sync_api import Page
 
 from .ranking import RankedProduct, parse_count
+from .tab import goto_with_retry
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +41,7 @@ def category_label(keyword: str) -> str:
 
 def open_search(page: Page, keyword: str, quick_only: bool = True) -> int:
     """검색 결과(상품 탭)를 연다. 첫 화면에 그려진 카드 수를 돌려준다 (0 이면 결과 없음)."""
-    page.goto(search_url(keyword, quick_only), wait_until="domcontentloaded")
+    goto_with_retry(page, search_url(keyword, quick_only), f"검색 '{keyword}'")
     return wait_cards(page, f"검색 '{keyword}'" + (" (빠른배송 필터)" if quick_only else ""))
 
 

@@ -28,7 +28,9 @@ from playwright.sync_api import Error as PlaywrightError, Page, TimeoutError as 
 
 from .dates import parse_trade_date
 from .debug import dump
+from .errors import LoginNeeded, SkipProduct
 from .store import ONE_SIZE
+from .tab import eval_bounded, goto_with_retry, on_login_page, raise_if_stalled, shown_within, timeout_why
 
 log = logging.getLogger(__name__)
 
@@ -39,42 +41,12 @@ RECENT_FAST_N = 15          # R 을 낼 때 보는 최신 빠른배송 체결 �
 ALL_OPTIONS_LABEL = "모든 옵션"
 
 
-class SkipProduct(Exception):
-    """이 상품은 건너뛴다 (사유를 메시지로)."""
-
-
 class SalesNotLoaded(SkipProduct):
     """체결 내역 패널이 열렸는데 사이트가 내역을 내려주지 않았다 (오류 표시 또는 끝까지 빈 채).
 
     거래가 없는 게 아니라 '판단 불가' 다 - 0건으로 세면 [재입찰]이 기준 미달로 입찰을 지워 버린다. [입찰]·[재입찰] 은 이게
     연달아 나면 사이트가 응답을 안 주는 시간대로 보고 멈춰 기다린다 (sitewait).
     """
-
-
-class PageStalled(SkipProduct):
-    """탭(렌더러)이 응답하지 않아 버튼을 누르지 못했다 (또는 상품 페이지로 가는 이동이 안 끝났다, open_product) - 상품·사이트 문제가 아니다.
-
-    Playwright 의 클릭·보임 대기·스크린샷은 모두 화면이 한 번 그려지기를 기다리므로, 탭이 멈추면 전부 타임아웃만 채운다
-    (2026-09-06 재입찰 실측: '구매하기' 가 보인 직후부터 80초쯤 아무 명령도 안 먹음 - 클릭 15초 × 3번 뒤 '모달이 뜨지 않음').
-    같은 페이지에서 다시 응답하길 기다려도 소용없다 (2026-09-07 실측 5건: 90초를 기다려도 안 풀렸는데 다음 상품으로 이동하자 바로 정상).
-    [재입찰]은 그 탭을 닫고 새 탭에서 그 입찰을 한 번 더 본다 (hangwatch 가 탭을 닫았을 때와 같은 경로) - 탭 닫기는 브라우저
-    프로세스가 처리해 렌더러가 막혀 있어도 0.5초에 돌아오고 새 탭은 같은 사이트를 바로 연다 (2026-09-07 임시 크롬 실험).
-    """
-
-
-class LoginNeeded(Exception):
-    """로그인이 풀려 로그인 화면(/login?returnUrl=...)으로 넘어갔다 - 상품·사이트 문제가 아니라 다시 로그인하고 같은 상품을 다시 본다.
-    건너뜀(SkipProduct)이 아니라 재시도 신호라 SkipProduct 의 자식이 아니다 - except SkipProduct 가 삼키면 안 된다.
-
-    세션은 로그인 뒤 24시간쯤에 끊기는 듯하다 (2026-09-07 23:08 자동 재로그인 → 2026-09-08 23:15 다시 끊김). 끊겨도 상품 페이지는
-    그대로 열리고, '거래 내역 더보기' 처럼 로그인이 필요한 동작만 SPA 라우팅으로 로그인 화면으로 넘어간다 - 문서 이동이 아니라
-    Playwright 대기는 오류 없이 타임아웃만 채운다 (2026-09-08 23:15 [입찰] 실측: 42건 연속 '패널이 열리지 않음' 으로 건너뜀).
-    """
-
-
-def on_login_page(page: Page) -> bool:
-    """로그인 화면인지. 주소의 returnUrl 에 /products/{id}·/buy/{id} 가 그대로 들어가므로 문자열 포함이 아니라 경로로 본다."""
-    return urlparse(page.url).path.startswith("/login")
 
 
 def raise_if_login_lost(page: Page, what: str, cause: Exception) -> None:
@@ -84,72 +56,6 @@ def raise_if_login_lost(page: Page, what: str, cause: Exception) -> None:
     실패 시점의 주소를 보는 것이 가장 단순한 공통 판정이다 ([입찰]·[재입찰] 공용)."""
     if on_login_page(page):
         raise LoginNeeded(f"{what} 중 로그인 화면으로 넘어감 (로그인이 풀림): {page.url}") from cause
-
-
-# ---------------------------------------------------------------- 탭이 응답하는지 (멈춤 감지)
-
-PROBE_MS = 1500     # 늘 참인 JS 가 이 안에 안 돌아오면 멈춘 것으로 본다 (정상이면 20ms 안)
-
-
-def eval_bounded(page: Page, js: str, arg=None, what: str = "페이지 상태"):
-    """page.evaluate 대신 쓰는 시간 제한 있는 평가 (js 는 인자 하나를 받는 함수, 거짓 값을 돌려줘도 된다).
-
-    evaluate 는 타임아웃이 없어 탭이 멈추면 영영 안 돌아온다 - 시간 제한이 있는 wait_for_function 으로 대신하고
-    (타임아웃은 드라이버 쪽에서 재므로 페이지가 응답하지 않아도 제때 돌아온다), 안 돌아오면 PageStalled.
-    wait_for_function 은 참 값이 나와야 돌아오므로 결과를 객체로 감싸 한 번에 돌려받는다.
-    """
-    try:
-        return page.wait_for_function(f"(a) => ({{ v: ({js})(a) }})", arg=arg, polling=100,
-                                      timeout=PROBE_MS * 2).json_value().get("v")
-    except PlaywrightTimeout as e:
-        raise PageStalled(f"{what}를 읽지 못함 - 페이지가 응답하지 않음 (탭이 멈춤?)") from e
-
-
-def page_stall(page: Page) -> str | None:
-    """탭이 응답하고 있으면 None, 아니면 사유. wait_for_function 은 조건을 먼저 한 번 바로 평가하므로 늘 참인 조건이
-    PROBE_MS 안에 안 돌아오면 렌더러가 JS 를 돌리지 못하는 것이다.
-
-    page.evaluate 는 타임아웃이 없어 렌더러가 완전히 멈추면 영영 돌아오지 않는다 - 그래서 시간 제한이 있는 wait_for_function 을 쓴다
-    (타임아웃은 드라이버 쪽에서 재므로 페이지가 응답하지 않아도 제때 돌아온다).
-    """
-    try:
-        page.wait_for_function("() => true", timeout=PROBE_MS)
-        return None
-    except PlaywrightTimeout:
-        return "페이지가 응답하지 않음 (탭이 멈춤?)"
-    except PlaywrightError as e:
-        return f"페이지가 응답하지 않음 ({str(e).splitlines()[0]})"
-
-
-_CALL_LOG_NOISE = re.compile(r"^(Call log|retrying|\d+ × |waiting \d+ms|attempting)")
-
-
-def timeout_why(e: Exception) -> str:
-    """Playwright 시간 제한 오류를 한 줄로: 첫 줄 + 호출 기록에서 마지막으로 하던 일. 첫 줄만으로는 버튼을 다른 요소가
-    덮은 것('… intercepts pointer events')과 눌렀는데 응답이 없는 것('performing click action')을 가릴 수 없다."""
-    lines = [ln.strip().lstrip("- ") for ln in str(e).splitlines()]
-    lines = [ln for ln in lines if ln]
-    if not lines:
-        return str(e)
-    tail = [ln for ln in lines[1:] if not _CALL_LOG_NOISE.match(ln)]
-    return lines[0] if not tail else f"{lines[0]} 마지막 기록: {' / '.join(tail[-2:])}"
-
-
-def shown_within(page: Page, js: str, timeout_ms: int, arg=None) -> bool:
-    """js(인자 하나를 받는 함수)가 timeout_ms 안에 참이 되면 True, 아니면 False. 시간 제한은 드라이버가 재므로 탭이 멈춰도 제때 돌아온다."""
-    try:
-        page.wait_for_function(js, arg=arg, timeout=timeout_ms)
-        return True
-    except PlaywrightTimeout:
-        return False
-
-
-def raise_if_stalled(page: Page, button: str, cause: Exception) -> None:
-    """버튼 클릭이 타임아웃한 뒤 부른다 - 버튼이 보이는데도 못 누르는 건 탭이 응답하지 않는 것일 수 있고, 그러면 재시도해도
-    소용없으니 바로 PageStalled 로 알린다 ([재입찰]은 탭을 닫고 새 탭에서 한 번 더 본다). 응답하면 그냥 돌아온다 (재시도)."""
-    stall = page_stall(page)
-    if stall:
-        raise PageStalled(f"{button} 를 누르지 못함 - {stall}") from cause
 
 
 @dataclass
@@ -166,27 +72,6 @@ class SalesStats:
         if not self.fast_prices:
             return None
         return min(self.fast_prices[:RECENT_FAST_N])
-
-
-def goto_with_retry(page: Page, url: str, what: str) -> None:
-    """url 로 이동한다. 이동이 15초 안에 안 끝나면 탭이 응답하는지 본다 - 응답하지 않으면 PageStalled ([재입찰]은 탭을 닫고 새 탭에서
-    한 번 더 본다. 2026-09-08 재입찰 123번째 실측: 구매 페이지에서 상품 페이지로 가는 이동이 안 끝나고 스냅샷도 못 찍혔는데 다음 입찰의
-    이동은 정상이라 같은 탭에서 다시 시도해도 소용없다). 응답하면 사이트·망이 느린 것 (2026-09-06 47번째: 스냅샷은 찍힘) - 1.5초 뒤 한 번
-    더 열고, 그래도 안 되면 그 오류(PlaywrightError)를 그대로 올린다. what 은 로그용 이름 ('상품 페이지' / '구매 페이지').
-    """
-    for attempt in range(2):
-        try:
-            page.goto(url, wait_until="domcontentloaded")
-            return
-        except PlaywrightError as e:   # 시간 제한(PlaywrightTimeout) 또는 이동 중 끊김 (net::ERR_ABORTED, 2026-09-05 재입찰 실측)
-            timed_out = isinstance(e, PlaywrightTimeout)
-            stall = page_stall(page) if timed_out else None
-            if stall:
-                raise PageStalled(f"{what} 이동이 안 끝남 - {stall}") from e
-            if attempt:
-                raise
-            log.info("%s 이동이 %s (%s) - 1.5초 뒤 다시 엶", what, "안 끝남" if timed_out else "끊김", timeout_why(e))
-            page.wait_for_timeout(1500)
 
 
 def open_product(page: Page, url: str) -> str:

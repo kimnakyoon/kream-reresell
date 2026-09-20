@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 from playwright.sync_api import Error as PlaywrightError, Page
 
 from . import auth, hangwatch
+from . import tab as tab_mod
 from .browser import SharedContext
 from . import bid as bid_mod
 from . import market as market_mod
@@ -323,10 +324,7 @@ def process_product(context: SharedContext, item: RankedProduct, settings: Setti
     finally:
         hangwatch.clear_page(page)
         hangwatch.take_trip()
-        try:
-            page.close()
-        except Exception:  # noqa: BLE001
-            pass
+        tab_mod.close_quietly(page)
 
 
 def _done(results: list[ProductResult], r: ProductResult, item: RankedProduct) -> list[ProductResult]:
@@ -391,9 +389,9 @@ def _open_buy_page(page: Page, r: ProductResult, label: str, settings: Settings)
     끊기면(net::ERR_ABORTED) 1.5초 뒤 한 번 더 열고, 그래도 안 되면 SkipProduct. 옵션 상품은 상단의 옵션 표기가 고른 것과 같아야 한다.
     """
     try:
-        product_mod.goto_with_retry(page, product_mod.buy_page_url(r.product_id, r.size or ONE_SIZE), "구매 페이지")
+        tab_mod.goto_with_retry(page, product_mod.buy_page_url(r.product_id, r.size or ONE_SIZE), "구매 페이지")
     except PlaywrightError as e:
-        raise product_mod.SkipProduct(f"구매 페이지를 열지 못함 (두 번 시도): {product_mod.timeout_why(e)}") from e
+        raise product_mod.SkipProduct(f"구매 페이지를 열지 못함 (두 번 시도): {tab_mod.timeout_why(e)}") from e
     loaded = product_mod.wait_buy_page_loaded(page, r.product_id, label)
     if r.option and not loaded.option_shown:
         # 구매 페이지 상단의 옵션 표기가 고른 것과 같아야 한다 (다른 사이즈에 입찰하지 않도록)
@@ -536,7 +534,7 @@ def _process_with_relogin(context: SharedContext, page: Page | None, item: Ranke
     except product_mod.LoginNeeded as e:
         log.warning("[%d위] %s - 다시 로그인하고 한 번 더 봄", item.rank, e)
         status("로그인이 풀려 다시 로그인하는 중")
-        tab = page if page is not None and not page.is_closed() else context.new_page()
+        tab = context.live_page(page)
         try:
             auth.ensure_logged_in(tab, settings)
         except Exception as e2:  # noqa: BLE001
@@ -544,7 +542,7 @@ def _process_with_relogin(context: SharedContext, page: Page | None, item: Ranke
             return _done([], _item_result(item, status="오류", detail=f"로그인이 풀렸는데 다시 로그인하지 못함: {e2}"), item)
         finally:
             if tab is not page:
-                tab.close()
+                tab_mod.close_quietly(tab)
         api.invalidate()
     try:
         return process_product(context, item, settings, api, open_bids, stop, status, rejected)
@@ -579,7 +577,4 @@ def _site_gives_sales(context: SharedContext, item: RankedProduct, settings: Set
         log.info("확인: %s", note)
         return ok
     finally:
-        try:
-            tab.close()
-        except Exception:  # noqa: BLE001
-            pass
+        tab_mod.close_quietly(tab)

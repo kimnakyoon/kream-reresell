@@ -16,16 +16,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
 
 from playwright.sync_api import BrowserContext, Page, Request, Response, TimeoutError as PlaywrightTimeout
 
-from .product import on_login_page
+from .tab import on_login_page, on_site
 
 log = logging.getLogger(__name__)
 
 API_BASE = "https://api.kream.co.kr"
-SITE_HOST = "kream.co.kr"
 INVENTORY_FINISHED_URL = "https://kream.co.kr/my/inventory?tab=finished"
 KST = timezone(timedelta(hours=9))
 TIMEOUT_MS = 12_000             # 막히면 10초 홀드 뒤 끊기므로 그보다 조금 길게 - 그 안에 안 오면 무응답으로 본다
@@ -86,14 +84,6 @@ class ApiError(Exception):
         """헤더를 다시 잡아도 401 - 세션이 끊긴 것 (로그인 뒤 24시간쯤, product.LoginNeeded 참고). 사이트가 막은 게 아니라 다시 로그인해야 한다
         (2026-09-13 03:08 실측: 401 을 '판단 불가' 로 세어 사이트 대기에 들어가 7시간 동안 5분마다 같은 401 만 받았다)."""
         return self.status == 401
-
-
-def on_site(page: Page) -> bool:
-    """페이지가 kream.co.kr 문서에 있는지 - 다른 곳(about:blank 등)에서 fetch 하면 CORS 로 막힌다."""
-    try:
-        return not page.is_closed() and (urlparse(page.url).hostname or "").endswith(SITE_HOST)
-    except Exception:  # noqa: BLE001
-        return False
 
 
 def _is_api_request(request: Request) -> bool:

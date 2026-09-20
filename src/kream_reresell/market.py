@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 
 from . import pacing
 from .api import ApiClient, ApiError
-from .product import LoginNeeded
+from .errors import LoginNeeded
 from .store import ONE_SIZE
 
 log = logging.getLogger(__name__)

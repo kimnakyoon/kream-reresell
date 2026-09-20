@@ -41,7 +41,7 @@
 상품이 없는 응답(404)이면 확인필요로 남긴다 (지우지 않음 - 상품 페이지가 내려간 것인지 사람이 본다).
 구매 페이지가 로그인 화면으로 넘어가면(로그인이 풀림) 다시 로그인하고 그 입찰을 한 번 더 본다. 목록 페이지가 로그인 화면으로
 넘어가도 (로그인 화면 주소에도 returnUrl 로 tab=bidding 이 들어가 0건으로 읽히던 문제, 2026-09-05) 다시 로그인하고 목록을 다시 읽는다.
-탭이 응답하지 않아 버튼이 눌리지 않거나 이동이 안 끝나면(product.PageStalled) 그 탭을 닫는다 - 같은 페이지에서 기다리는 건 소용없다
+탭이 응답하지 않아 버튼이 눌리지 않거나 이동이 안 끝나면(errors.PageStalled) 그 탭을 닫는다 - 같은 페이지에서 기다리는 건 소용없다
 (2026-09-07 실측 5건). 변경 화면의 어느 단계든 Playwright 시간 제한이 나면 탭이 응답하는지 한 번 보고, 안 하면 같은 경로로 탭을 닫는다.
 탭이 아예 멈춰 호출이 돌아오지 않으면 감시 스레드(hangwatch)가 그 탭을 닫아 호출을 오류로 끝낸다. 어느 쪽이든 탭이 닫혔으면
 새 탭을 열어 그 입찰을 한 번 더 본다 (시세 API 는 새 탭에서도 같이 쓴다 - 헤더는 컨텍스트에서 이미 받아 뒀다). 새 탭에서도 또 멈추면 확인필요.
@@ -64,9 +64,10 @@ import time
 from collections.abc import Callable
 from datetime import datetime
 
-from playwright.sync_api import Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
 from . import auth, hangwatch, pipeline
+from . import tab as tab_mod
 from .browser import SharedContext
 from . import bid as bid_mod
 from . import market as market_mod
@@ -76,6 +77,7 @@ from .cancel import (CancelAborted, CancelUncertain, OpenBid, apply_bid_info, ap
                      expired_reason, list_open_bids, match_known_bid)
 from .config import Settings
 from .debug import dump
+from .errors import PageStalled
 from .report import ProductResult, summarize
 from . import pacing
 from .pacing import sleep_with_stop
@@ -127,7 +129,7 @@ CHANGE_PAGE_MATCH_TIMEOUT_MS = 12_000   # 상품명·옵션이 그려지길 기�
 
 def change_bid(page: Page, bid: OpenBid, new_price: int, settings: Settings) -> None:
     """[입찰 변경하기] 화면에서 희망가를 new_price 로 올린다. 화면은 처음 입찰과 같아 bid 모듈의 단계를 그대로 쓴다."""
-    page.goto(change_bid_url(bid), wait_until="domcontentloaded")
+    tab_mod.goto_with_retry(page, change_bid_url(bid), "입찰 변경 화면")
     try:
         page.get_by_text("즉시 판매가", exact=True).first.wait_for(state="visible", timeout=10_000)
     except PlaywrightTimeout as e:
@@ -202,14 +204,11 @@ def rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, api: Api
     try:
         try:
             _rebid_with_relogin(page, bid, settings, cycle, r, api, should_stop, on_status)
-        except product_mod.PageStalled as e:
+        except PageStalled as e:
             # 탭이 응답하지 않아 버튼을 못 누른 것 - 상품·사이트 문제가 아니다. 같은 페이지가 풀리길 기다려도 소용없어
             # (2026-09-07 실측 5건: 90초 안에 안 풀림) 탭을 닫는다 - run 이 새 탭을 열어 한 번 더 본다 (hangwatch 가 닫았을 때와 같은 경로)
             log.warning("[%d회차 %d번째] %s (지금 주소 %s) - 탭을 닫음", cycle, bid.order, e, page.url)
-            try:
-                page.close()
-            except PlaywrightError as e2:
-                log.info("탭을 닫지 못함: %s", str(e2).splitlines()[0])
+            tab_mod.close_quietly(page)
             r.status, r.detail = "확인필요", f"{NOT_LOADED_PREFIX}: {e} - 탭을 닫음"
     finally:
         r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -428,7 +427,7 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
         r.status, r.detail = market_mod.unavailable_result(e, "확인필요", NOT_LOADED_PREFIX)
     except _Stopped as e:
         r.status, r.detail = "중단", str(e)
-    except product_mod.PageStalled:
+    except PageStalled:
         raise   # rebid_one 이 탭을 닫는다 (응답 없는 탭은 스냅샷도 못 찍는다)
     except product_mod.SkipProduct as e:
         product_mod.raise_if_login_lost(page, "상품 페이지 확인", e)
@@ -450,16 +449,16 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
         trip = hangwatch.tripped()
         if trip is not None and page.is_closed():
             # 감시 스레드가 멈춘 탭을 닫아 걸려 있던 호출이 오류로 끝난 것 - 상품·사이트 문제가 아니다 (run 이 새 탭으로 한 번 더 봄)
-            log.warning("[%d회차 %d번째] %s - 걸려 있던 호출: %s", cycle, bid.order, trip.describe(), product_mod.timeout_why(e))
+            log.warning("[%d회차 %d번째] %s - 걸려 있던 호출: %s", cycle, bid.order, trip.describe(), tab_mod.timeout_why(e))
             r.status, r.detail = "확인필요", f"{NOT_LOADED_PREFIX}: {trip.describe()}"
             return
-        stall = product_mod.page_stall(page)
+        stall = tab_mod.page_stall(page)
         if stall:
             # 어느 단계의 Playwright 시간 제한이든 탭이 응답하지 않아 난 것이면 PageStalled 와 같은 경로 (rebid_one 이 탭을 닫고 run 이 새 탭으로
             # 한 번 더) - 여기서 한 번에 판정하므로 단계마다 클릭을 감쌀 필요가 없다. 스냅샷은 찍히지도 않으니 10초 낭비 없이 건너뛴다
             # (2026-09-09 173번째 실측: 창고보관 확인 뒤 '최대 사용' 클릭이 15초 안에 안 눌리고 스냅샷도 못 찍힘 - '오류' 로 남고 재시도 없었음.
             # 마지막 '입찰하기' 뒤는 BidUncertain 으로 따로 잡히므로 여기 오는 예외는 아직 입찰을 바꾸기 전이라 다시 봐도 안전하다)
-            raise product_mod.PageStalled(f"{product_mod.timeout_why(e)} - {stall}") from e
+            raise PageStalled(f"{tab_mod.timeout_why(e)} - {stall}") from e
         dump(page, f"rebid{bid.bid_id}_error")
         log.exception("입찰 #%d 재입찰 처리 중 오류", bid.bid_id)
         r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
@@ -467,10 +466,13 @@ def _rebid_one(page: Page, bid: OpenBid, settings: Settings, cycle: int, r: Prod
 
 # ---------------------------------------------------------------- 사이클 반복
 
-def _wait_for_site(api: ApiClient, probe: OpenBid, page: Page, settings: Settings, should_stop: Callable[[], bool],
-                   on_status: Callable[[str], None]) -> bool:
+def _wait_for_site(api: ApiClient, probe: OpenBid, live_tab: Callable[[], Page], settings: Settings,
+                   should_stop: Callable[[], bool], on_status: Callable[[str], None]) -> bool:
     """사이트가 응답을 안 줄 때 다시 줄 때까지 멈춘다. PROBE_SEC 마다 마지막에 막힌 입찰의 시세 API 를 한 번 불러 보고
     응답이 오면 돌아온다 (True). 중지 요청이면 False.
+
+    확인은 그때마다 live_tab() (열려 있는 작업 탭, 닫혔으면 새 탭) 에서 한다 - 확인 중 탭이 멈추면(PageStalled, 또는 감시 스레드가 닫음)
+    그 탭을 닫아 두어 다음 확인이 새 탭에서 되게 한다 (멈춘 탭을 그대로 들고 있으면 5분마다 같은 탭에서 실패만 되풀이한다).
 
     확인 중 로그인이 풀린 것이 보이면 (시세 API 401 → product.LoginNeeded) 기다려도 소용없으니 여기서 다시 로그인하고 한 번 더 부른다
     (pipeline._site_gives_sales 와 같은 꼴)."""
@@ -478,16 +480,27 @@ def _wait_for_site(api: ApiClient, probe: OpenBid, page: Page, settings: Setting
         market = market_mod.fetch_market(api, probe.product_id)   # 틱 없이 한 번 (5분마다 한 번이라 예산에 뜻이 없다)
         log.info("시세 API 가 다시 응답함 (상품 %d, 옵션 %d개)", probe.product_id, len(market.options))
 
+    def fetch_with_relogin(page: Page) -> None:
+        try:
+            fetch()
+        except product_mod.LoginNeeded as e:
+            log.warning("확인 중 %s - 다시 로그인하고 한 번 더 확인", e)
+            auth.ensure_logged_in(page, settings)
+            api.invalidate()
+            fetch()   # 또 풀리면 그대로 올라감 (wait_until_site_back 이 '아직 안 줌' 으로 봄)
+
     def check() -> bool:
-        # 확인할 상품을 모르면 (상세를 못 읽은 입찰) 한 번 쉰 뒤 그냥 이어서 본다 - 또 막히면 다시 멈춘다
-        if probe.product_id:
-            try:
-                fetch()
-            except product_mod.LoginNeeded as e:
-                log.warning("확인 중 %s - 다시 로그인하고 한 번 더 확인", e)
-                auth.ensure_logged_in(page, settings)
-                api.invalidate()
-                fetch()   # 또 풀리면 그대로 올라감 (wait_until_site_back 이 '아직 안 줌' 으로 봄)
+        if not probe.product_id:   # 확인할 상품을 모르면 (상세를 못 읽은 입찰) 한 번 쉰 뒤 그냥 이어서 본다 - 또 막히면 다시 멈춘다
+            return True
+        page = live_tab()
+        try:
+            with hangwatch.watching(page):
+                fetch_with_relogin(page)
+        except PageStalled:
+            tab_mod.close_quietly(page)
+            raise
+        finally:
+            hangwatch.take_trip()
         return True
 
     return wait_until_site_back(check, should_stop, on_status, what="시세")
@@ -539,13 +552,17 @@ def run(context: SharedContext, page: Page, settings: Settings,
     pacer = pacing.API_PACER
     log.info(pacer.describe_setup())
 
-    def look(bid: OpenBid, cycle: int) -> tuple[ProductResult, hangwatch.Trip | None]:
-        """입찰 하나를 본다. 탭이 (멈춰서) 닫혀 있으면 새로 열고, 보는 동안 감시 스레드가 탭을 닫았으면 그 기록도 돌려준다."""
+    def live_tab() -> Page:
+        """작업 탭. (멈춰서) 닫혀 있으면 새로 연다 - api 도 tab 을 따라온다."""
         nonlocal tab
-        if tab.is_closed():
-            tab = context.new_page()
-        with hangwatch.watching(tab):
-            r = rebid_one(tab, bid, settings, cycle, api, should_stop=stop, on_status=status)
+        tab = context.live_page(tab)
+        return tab
+
+    def look(bid: OpenBid, cycle: int) -> tuple[ProductResult, hangwatch.Trip | None]:
+        """입찰 하나를 본다. 보는 동안 감시 스레드가 탭을 닫았으면 그 기록도 돌려준다."""
+        current = live_tab()
+        with hangwatch.watching(current):
+            r = rebid_one(current, bid, settings, cycle, api, should_stop=stop, on_status=status)
         return r, hangwatch.take_trip()
 
     cycle = 0
@@ -556,11 +573,14 @@ def run(context: SharedContext, page: Page, settings: Settings,
         api_calls_before = pacing.BUDGET.total
         market_calls_before = api.calls
         status(f"재입찰 {cycle}회차: 구매 입찰 목록 읽는 중...")
+        page = context.live_page(page)   # 목록 탭도 멈춰 닫혔으면 새 탭에서 읽는다 (작업 탭과 같은 규칙)
         try:
             with hangwatch.watching(page):
                 bids = _list_bids(page, settings)
             list_failures = 0
         except Exception as e:  # noqa: BLE001
+            if isinstance(e, PageStalled):
+                tab_mod.close_quietly(page)   # 같은 탭으로 다시 읽어 봐야 소용없다 - 다음 시도는 새 탭에서
             list_failures += 1
             log.exception("%d회차: 구매 입찰 목록을 읽지 못함 (%d/%d)", cycle, list_failures, MAX_LIST_FAILURES)
             if list_failures >= MAX_LIST_FAILURES:
@@ -618,15 +638,12 @@ def run(context: SharedContext, page: Page, settings: Settings,
                 trouble_streak = 0
                 log.warning("판단 불가·오류가 %d건 연달아 남 - 사이트가 응답을 안 주는 듯해 멈춤. %d분마다 확인하고 "
                             "다시 주면 로그인 상태를 확인한 뒤 이어서 봄", TROUBLE_STREAK, PROBE_SEC // 60)
-                if tab.is_closed():
-                    tab = context.new_page()
-                with hangwatch.watching(tab):
-                    back = _wait_for_site(api, bid, tab, settings, stop,
-                                          lambda t: status(f"재입찰 {cycle}회차 ({bid.order}/{len(bids)} 까지 봄): {t}"))
+                back = _wait_for_site(api, bid, live_tab, settings, stop,
+                                      lambda t: status(f"재입찰 {cycle}회차 ({bid.order}/{len(bids)} 까지 봄): {t}"))
                 if not back:
                     break
                 try:
-                    auth.ensure_logged_in(page, settings)
+                    auth.ensure_logged_in(live_tab(), settings)
                 except Exception:  # noqa: BLE001
                     log.exception("쉬고 나서 로그인 상태를 확인하지 못함 - 그대로 이어서 봄")
         if cache_dirty:
@@ -654,8 +671,5 @@ def run(context: SharedContext, page: Page, settings: Settings,
             log.info("이번 사이클 %d초 걸림 - 목록을 다시 읽기 전 %d초 둠", int(elapsed), int(wait))
         status(f"재입찰 {cycle}회차 끝({int(elapsed)}초): {summary} - 바로 다음 사이클")
         sleep_with_stop(wait, stop)
-    try:
-        tab.close()
-    except Exception:  # noqa: BLE001
-        pass
+    tab_mod.close_quietly(tab)
     return results

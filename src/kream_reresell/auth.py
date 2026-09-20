@@ -16,7 +16,8 @@ from playwright.sync_api import Page, sync_playwright
 
 from . import browser, hangwatch
 from .config import Settings
-from .product import PageStalled, goto_with_retry
+from .errors import PageStalled
+from .tab import close_quietly, goto_with_retry, on_login_page, on_site
 
 log = logging.getLogger(__name__)
 
@@ -39,16 +40,20 @@ def is_logged_in(page: Page) -> bool:
         return False
 
 
-def _check_home(page: Page) -> bool:
-    # 홈 이동도 가끔 15초를 넘긴다 - 그대로 올리면 작업이 시작도 못 하고 오류 창으로 끝난다 (2026-09-20 09:38 재입찰 실측)
-    goto_with_retry(page, HOME, "홈(로그인 확인)")
-    # 상단 유틸 메뉴(로그인 또는 로그아웃 링크)가 그려질 때까지만 기다린다
+def _header_logged_in(page: Page) -> bool:
+    """지금 떠 있는 화면의 상단 유틸 메뉴(로그인 또는 로그아웃 링크)가 그려지길 기다려 로그인 상태를 읽는다 - 페이지 이동 없음."""
     try:
         page.locator("a:has-text('로그아웃'), a:has-text('로그인')").first.wait_for(state="attached", timeout=10_000)
     except Exception:  # noqa: BLE001
         pass
     page.wait_for_timeout(300)
     return is_logged_in(page)
+
+
+def _check_home(page: Page) -> bool:
+    # 홈 이동도 가끔 15초를 넘긴다 - 그대로 올리면 작업이 시작도 못 하고 오류 창으로 끝난다 (2026-09-20 09:38 재입찰 실측)
+    goto_with_retry(page, HOME, "홈(로그인 확인)")
+    return _header_logged_in(page)
 
 
 def email_login(page: Page, email: str, password: str) -> bool:
@@ -71,25 +76,31 @@ def email_login(page: Page, email: str, password: str) -> bool:
     # 성공하면 returnUrl(홈)로 이동한다. 실패하면 /login/email 에 남고 오류 문구가 뜬다.
     for _ in range(20):
         page.wait_for_timeout(500)
-        if "/login" not in page.url:
+        if not on_login_page(page):
             break
-    if "/login" in page.url:
+    if on_login_page(page):
         body = page.locator("body").inner_text()
         for line in body.splitlines():
             if any(k in line for k in ("일치하지", "올바르", "실패", "확인해", "잠김", "제한")):
                 log.warning("로그인 실패 문구: %s", line.strip())
         return False
-    return _check_home(page)
+    # 성공하면 이미 홈(returnUrl)에 와 있다 - 홈을 또 열지 않고 떠 있는 화면에서 확인하고, 거기서 안 보일 때만 홈을 다시 연다
+    return _header_logged_in(page) or _check_home(page)
 
 
 def ensure_logged_in(page: Page, settings: Settings) -> None:
-    """로그인 상태가 아니면 로그인한다. 작업들이 크롬(세션)을 나눠 쓰므로 확인·로그인은 한 번에 한 작업만 (다른 작업이 먼저 로그인했으면 확인만)."""
+    """로그인 상태가 아니면 로그인한다. 작업들이 크롬(세션)을 나눠 쓰므로 로그인은 한 번에 한 작업만 (다른 작업이 먼저 로그인했으면 확인만)."""
+    # 보통은 로그인돼 있다 - 확인은 잠금 밖에서 해 동시에 시작한 작업들이 서로의 홈 이동(느리면 30초 넘음)을 줄 서서 기다리지 않게 한다.
+    # 잠금은 로그인이 정말 필요할 때만 잡고, 잡은 뒤 다시 확인한다 (기다리는 사이 다른 작업이 로그인했을 수 있다)
+    if _check_home(page):
+        log.info("로그인 상태 확인됨")
+        return
     # 다른 작업이 로그인하는 동안(직접 로그인이면 몇 분) 기다리는 것은 Playwright 호출 밖의 쉼이라 멈춤 감시를 쉬게 한다 (hangwatch 머리글)
     with hangwatch.idle():
         _login_lock.acquire()
     try:
         if _check_home(page):
-            log.info("로그인 상태 확인됨")
+            log.info("로그인 상태 확인됨 (다른 작업이 먼저 로그인함)")
             return
         _login(page, settings)
     finally:
@@ -107,8 +118,7 @@ def session(settings: Settings):
         except PageStalled as e:
             # 탭이 응답하지 않는 것 - 같은 탭에서 기다려도 소용없다. 탭을 닫고 새 탭에서 한 번만 더 확인한다
             log.warning("로그인 확인 중 %s - 탭을 닫고 새 탭에서 다시 확인", e)
-            with contextlib.suppress(Exception):
-                page.close()
+            close_quietly(page)
             page = context.new_page()
             ensure_logged_in(page, settings)
         yield context, page
@@ -129,9 +139,11 @@ def _login(page: Page, settings: Settings) -> None:
     with browser.window_shown():
         goto_with_retry(page, LOGIN_URL, "로그인 페이지")
         deadline = time.monotonic() + MANUAL_LOGIN_WAIT_SEC
+        # 2초마다 떠 있는 화면만 본다 - 홈을 열어 확인하면 그때마다 사이트 요청이 나가고, 사람이 네이버·Apple 로그인 화면에 있을 때
+        # (주소에 /login 이 없다) 그 화면을 홈으로 바꿔 버린다. KREAM 문서일 때만 보는 것은 네이버에도 '로그아웃' 링크가 있어서다
         while time.monotonic() < deadline:
             page.wait_for_timeout(2000)
-            if "/login" not in page.url and _check_home(page):
+            if on_site(page) and not on_login_page(page) and is_logged_in(page):
                 log.info("로그인 확인됨")
                 return
     raise LoginFailed(f"{MANUAL_LOGIN_WAIT_SEC}초 안에 로그인이 되지 않았습니다.")

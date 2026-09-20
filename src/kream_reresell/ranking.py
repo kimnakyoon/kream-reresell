@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 from playwright.sync_api import Page
 
+from .tab import goto_with_retry
+
 log = logging.getLogger(__name__)
 
 RANKING_URL = "https://kream.co.kr/?tab=home_ranking_v2"
@@ -88,7 +90,7 @@ def open_category(page: Page, category: str) -> None:
     """
     cid = CATEGORY_IDS.get(category)
     if cid is not None:
-        page.goto(f"{RANKING_URL}&category_filter={cid}", wait_until="domcontentloaded")
+        goto_with_retry(page, f"{RANKING_URL}&category_filter={cid}", f"랭킹 '{category}'")
         page.locator('a[href*="/products/"]').first.wait_for(state="visible", timeout=15_000)
         page.wait_for_timeout(500)
         active = _active_chip_text(page)
@@ -96,7 +98,7 @@ def open_category(page: Page, category: str) -> None:
             return
         log.warning("category_filter=%s 로 열었더니 '%s' 가 선택됨 - '%s' 칩을 직접 누른다", cid, active, category)
     else:
-        page.goto(RANKING_URL, wait_until="domcontentloaded")
+        goto_with_retry(page, RANKING_URL, "랭킹")
         page.wait_for_timeout(2000)
 
     chip = page.locator(_CHIP, has_text=re.compile(rf"^\s*{re.escape(category)}\s*$")).first

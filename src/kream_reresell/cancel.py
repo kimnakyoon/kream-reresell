@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
 from . import pipeline
+from . import tab as tab_mod
 from .browser import SharedContext
 from . import product as product_mod
 from .bid import StoppedBeforeSubmit
@@ -103,7 +104,7 @@ class OpenBid:
 
 def list_open_bids(page: Page) -> list[OpenBid]:
     """구매 입찰 탭의 입찰을 화면 순서대로 모은다. 탭 머리의 '구매 입찰 N' 만큼 스크롤해 다 읽는다."""
-    product_mod.goto_with_retry(page, BIDDING_URL, "구매 입찰 목록")   # [입찰]·[입찰취소] 의 진입 이동 - 한 번 넘기면 작업이 통째로 끝난다
+    tab_mod.goto_with_retry(page, BIDDING_URL, "구매 입찰 목록")   # [입찰]·[입찰취소] 의 진입 이동 - 한 번 넘기면 작업이 통째로 끝난다
     try:
         page.locator('a[href*="/my/buying/"]').or_(page.get_by_text("구매 입찰 내역이 없습니다")) \
             .first.wait_for(state="attached", timeout=15_000)
@@ -425,10 +426,7 @@ def review_bid(context: SharedContext, bid: OpenBid, settings: Settings) -> Prod
             "price_a": r.price_a or "", "price_r": r.price_r or "", "price_b": r.price_b or "",
             "status": r.status, "detail": r.detail,
         })
-        try:
-            page.close()
-        except Exception:  # noqa: BLE001
-            pass
+        tab_mod.close_quietly(page)
 
 
 def run(context: SharedContext, page: Page, settings: Settings,
@@ -529,10 +527,7 @@ def open_bid_products(context: SharedContext, page: Page) -> OpenBids:
                     log.warning("입찰 #%d 상세를 읽지 못함: %s", bid.bid_id, e)
                 out.add(bid)
         finally:
-            try:
-                tab.close()
-            except Exception:  # noqa: BLE001
-                pass
+            tab_mod.close_quietly(tab)
     log.info("마이페이지에 입찰 중인 상품 %d개: %s", len(out.by_product),
              ", ".join(f"{pid}({'/'.join(opts)})" if list(opts) != [ONE_SIZE] else str(pid)
                        for pid, opts in out.by_product.items()) or "-")

@@ -19,6 +19,7 @@ from playwright.sync_api import Page
 
 from . import search
 from .ranking import RankedProduct
+from .tab import goto_with_retry
 
 log = logging.getLogger(__name__)
 
@@ -86,14 +87,14 @@ def open_category(page: Page, category: str, quick_only: bool = True) -> int:
     category = category.strip()
     name = _log_name(category, quick_only)
     if category in SHOP_CATEGORY_IDS:
-        page.goto(shop_url(category, quick_only), wait_until="domcontentloaded")
+        goto_with_retry(page, shop_url(category, quick_only), name)
         n = search.wait_cards(page, name)
         active = _active_tab_text(page)
         if active == category or not active:
             return n
         log.warning("tab=%s 로 열었더니 '%s' 탭이 선택됨 - '%s' 탭을 직접 누른다", SHOP_CATEGORY_IDS[category], active, category)
     else:
-        page.goto(shop_url(category, quick_only), wait_until="domcontentloaded")
+        goto_with_retry(page, shop_url(category, quick_only), name)
         page.wait_for_timeout(2000)
 
     tab = page.locator(_TAB, has_text=re.compile(rf"^\s*{re.escape(category)}\s*$")).first
@@ -108,7 +109,7 @@ def open_category(page: Page, category: str, quick_only: bool = True) -> int:
         log.info("SHOP '%s' -> tab=%s", category, m.group(1))
     if quick_only and "quick_delivery" not in page.url:
         # 탭을 누르면 필터가 풀리므로 새 번호로 다시 연다
-        page.goto(shop_url(category, quick_only), wait_until="domcontentloaded")
+        goto_with_retry(page, shop_url(category, quick_only), name)
     return search.wait_cards(page, name)
 
 

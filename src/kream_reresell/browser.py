@@ -44,6 +44,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import BrowserContext, Frame, Page, Playwright
 
 from . import hangwatch, pacing, winproc
+from .tab import close_quietly
 from .config import ROOT
 
 log = logging.getLogger(__name__)
@@ -126,8 +127,8 @@ def _route(route, block_images: bool, trim_api: bool) -> None:
 
 
 # 탭마다 마지막으로 센 주소 - 사이트가 같은 주소로 되풀이하는 replaceState 를 안 세려고 (pacing 대응 5 참고).
-# 공개 API 의 framenavigated 는 진짜 문서 로드와 주소 안 이동을 구분해 주지 않아 주소가 바뀔 때만 센다 - 같은 주소를
-# 다시 여는 재시도 한 번은 안 세지지만, 모든 요청을 파이썬으로 받는 request 리스너보다 싸다
+# 공개 API 의 framenavigated 는 진짜 문서 로드와 주소 안 이동을 구분해 주지 않아 주소가 바뀔 때만 센다 - 모든 요청을 파이썬으로
+# 받는 request 리스너보다 싸다. 그래서 같은 주소를 다시 여는 재시도는 여기서 안 세지고 tab.goto_with_retry 가 직접 센다
 _last_visit: dict[Page, str] = {}
 
 
@@ -165,11 +166,17 @@ class SharedContext:
         self._pages.append(page)
         return page
 
+    def live_page(self, page: Page | None) -> Page:
+        """page 가 열려 있으면 그대로, (멈춰서) 닫혔거나 없으면 새 탭 - 멈춘 탭은 tab.close_quietly 로 닫고 이걸로 갈아 끼운다."""
+        if page is not None and not page.is_closed():
+            return page
+        self._pages = [p for p in self._pages if not p.is_closed()]   # 멈춰 닫힌 탭이 장부에 쌓이지 않게
+        return self.new_page()
+
     def close_pages(self) -> None:
         """연결을 끊어도 탭은 크롬에 남으므로 이 작업이 연 탭을 직접 닫는다."""
         for page in self._pages:
-            with contextlib.suppress(Exception):
-                page.close()
+            close_quietly(page)
         self._pages.clear()
 
 
