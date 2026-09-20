@@ -16,6 +16,7 @@ from playwright.sync_api import Page, sync_playwright
 
 from . import browser, hangwatch
 from .config import Settings
+from .product import PageStalled, goto_with_retry
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +40,8 @@ def is_logged_in(page: Page) -> bool:
 
 
 def _check_home(page: Page) -> bool:
-    page.goto(HOME, wait_until="domcontentloaded")
+    # 홈 이동도 가끔 15초를 넘긴다 - 그대로 올리면 작업이 시작도 못 하고 오류 창으로 끝난다 (2026-09-20 09:38 재입찰 실측)
+    goto_with_retry(page, HOME, "홈(로그인 확인)")
     # 상단 유틸 메뉴(로그인 또는 로그아웃 링크)가 그려질 때까지만 기다린다
     try:
         page.locator("a:has-text('로그아웃'), a:has-text('로그인')").first.wait_for(state="attached", timeout=10_000)
@@ -51,7 +53,7 @@ def _check_home(page: Page) -> bool:
 
 def email_login(page: Page, email: str, password: str) -> bool:
     """이메일 로그인 폼을 채워 로그인. 성공하면 True."""
-    page.goto(EMAIL_LOGIN_URL, wait_until="domcontentloaded")
+    goto_with_retry(page, EMAIL_LOGIN_URL, "이메일 로그인 페이지")
     page.wait_for_timeout(1500)
     email_box = page.locator("input[type='email']").first
     pw_box = page.locator("input[type='password']").first
@@ -100,7 +102,15 @@ def session(settings: Settings):
     with sync_playwright() as pw, browser.real_chrome_context(pw, block_images=settings.block_images, trim_api=settings.trim_api,
                                                                 show_chrome=settings.show_chrome) as context:
         page = context.new_page()
-        ensure_logged_in(page, settings)
+        try:
+            ensure_logged_in(page, settings)
+        except PageStalled as e:
+            # 탭이 응답하지 않는 것 - 같은 탭에서 기다려도 소용없다. 탭을 닫고 새 탭에서 한 번만 더 확인한다
+            log.warning("로그인 확인 중 %s - 탭을 닫고 새 탭에서 다시 확인", e)
+            with contextlib.suppress(Exception):
+                page.close()
+            page = context.new_page()
+            ensure_logged_in(page, settings)
         yield context, page
 
 
@@ -117,7 +127,7 @@ def _login(page: Page, settings: Settings) -> None:
 
     # 사람이 로그인해야 하니 그동안만 크롬 창을 화면 안으로 불러온다
     with browser.window_shown():
-        page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        goto_with_retry(page, LOGIN_URL, "로그인 페이지")
         deadline = time.monotonic() + MANUAL_LOGIN_WAIT_SEC
         while time.monotonic() < deadline:
             page.wait_for_timeout(2000)

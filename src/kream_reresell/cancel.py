@@ -103,7 +103,7 @@ class OpenBid:
 
 def list_open_bids(page: Page) -> list[OpenBid]:
     """구매 입찰 탭의 입찰을 화면 순서대로 모은다. 탭 머리의 '구매 입찰 N' 만큼 스크롤해 다 읽는다."""
-    page.goto(BIDDING_URL, wait_until="domcontentloaded")
+    product_mod.goto_with_retry(page, BIDDING_URL, "구매 입찰 목록")   # [입찰]·[입찰취소] 의 진입 이동 - 한 번 넘기면 작업이 통째로 끝난다
     try:
         page.locator('a[href*="/my/buying/"]').or_(page.get_by_text("구매 입찰 내역이 없습니다")) \
             .first.wait_for(state="attached", timeout=15_000)
