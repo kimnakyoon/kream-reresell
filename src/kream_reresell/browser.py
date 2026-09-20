@@ -180,6 +180,28 @@ class SharedContext:
         self._pages.clear()
 
 
+class LiveTab:
+    """작업 내내 쓰는 탭 하나. 부르면 그 탭을, (멈춰서) 닫혔으면 새 탭을 돌려준다 - api.ApiClient 에 이걸 넘기면 API 호출도 새 탭을 따라온다.
+
+    탭이 멈추면 hangwatch 가 닫거나 (걸려 있던 호출이 오류로 끝남) 부른 쪽이 PageStalled 를 받고 drop() 으로 닫는다 - 어느 쪽이든
+    다음에 부를 때 새 탭이 된다. 닫힌 탭을 그대로 들고 있으면 그 뒤의 모든 호출이 같은 오류로 끝난다.
+    """
+
+    def __init__(self, context: SharedContext, page: Page | None = None) -> None:
+        self.context = context
+        self.page = page
+
+    def __call__(self) -> Page:
+        self.page = self.context.live_page(self.page)
+        return self.page
+
+    def drop(self) -> None:
+        """멈춘 탭을 버린다 - 다음에 부르면 새 탭 (닫기가 실패해도 그 탭을 다시 쓰지 않는다. 남은 탭은 close_pages 가 정리)."""
+        if self.page is not None:
+            close_quietly(self.page)
+            self.page = None
+
+
 # ---------------------------------------------------------------- 크롬 창 위치 (Windows 전용)
 
 if sys.platform == "win32":

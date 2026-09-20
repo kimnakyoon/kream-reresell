@@ -41,23 +41,27 @@ import re
 import threading
 import time
 from collections.abc import Callable
+from typing import TypeVar
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
 from playwright.sync_api import Page
 
 from . import auth, hangwatch, pacing
-from .browser import SharedContext
+from .browser import LiveTab, SharedContext
 from . import market as market_mod
 from . import product as product_mod
 from .api import ApiClient, ApiError
 from .config import DATA_DIR, Settings
+from .errors import PageStalled
 from .history import PurchaseRecord, fetch_purchases, load_purchase_details, parse_utc
 from .pacing import sleep_with_stop
 from .report import ProductResult, summarize
 from .store import ONE_SIZE
 
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 STEP = 1000                 # 경쟁 최저가보다 이만큼 아래로 (사용자 결정 2026-09-17: 1순위가 되는 값)
 CYCLE_GAP_SEC = 60          # 사이클 사이 쉼
@@ -441,16 +445,19 @@ def _probe_or_hold(api: ApiClient, item: StockItem, floor: int, r: ProductResult
     return r
 
 
-def sell_with_relogin(page: Page, item: StockItem, order: int, cycle: int, api: ApiClient, settings: Settings, state: SellState,
+def sell_with_relogin(tab: LiveTab, item: StockItem, order: int, cycle: int, api: ApiClient, settings: Settings, state: SellState,
                       should_stop: Callable[[], bool] | None, on_status: Callable[[str], None] | None,
                       floor: int | None = None) -> ProductResult:
     """sell_one 을 부르되 로그인이 풀렸으면(LoginNeeded) 다시 로그인하고 한 번 더 본다 - rebid._rebid_with_relogin 과 같은 꼴.
 
     두 번째도 풀렸으면 '확인필요' 로 적고 돌려준다 (다음 항목은 새 토큰으로 통한다). 예전에는 두 번째 LoginNeeded 가 그대로 올라가
     [판매] 엔진이 죽었다 (2026-09-17 20:23 · 09-18 11:58 실측 - 토큰이 바뀌는 로그인 2시간째마다). 다른 예외는 '오류' 로 적는다.
+
+    탭이 멈춘 것(PageStalled, 또는 감시 스레드가 탭을 닫음)은 상품·사이트 문제가 아니다 - 그 탭을 버리고 '확인필요' 로 적는다.
+    다음 항목은 새 탭에서 본다 (멈춘 탭을 그대로 들고 있으면 남은 항목이 전부 같은 오류로 끝난다).
     """
     def once() -> ProductResult:
-        with hangwatch.watching(page):
+        with hangwatch.watching(tab()):
             return sell_one(item, order, cycle, api, settings, state, should_stop, on_status, floor=floor)
 
     r = _result(item, order, cycle, settings)
@@ -459,16 +466,58 @@ def sell_with_relogin(page: Page, item: StockItem, order: int, cycle: int, api: 
             return once()
         except product_mod.LoginNeeded as e:
             log.info("로그인이 풀림 (%s) - 다시 로그인하고 이 항목을 한 번 더 봄", e)
-            auth.ensure_logged_in(page, settings)
+            auth.ensure_logged_in(tab(), settings)
             api.invalidate()
             try:
                 return once()
             except product_mod.LoginNeeded as e2:
                 r.status, r.detail = "확인필요", f"{NOT_LOADED_PREFIX} - 올리지 않음: 다시 로그인했는데도 {e2}"
+    except PageStalled as e:
+        log.warning("보관 %s: %s - 탭을 닫음 (다음 항목은 새 탭에서)", item.ask_id, e)
+        tab.drop()
+        r.status, r.detail = "확인필요", f"{NOT_LOADED_PREFIX} - 올리지 않음: {e}"
     except Exception as e:  # noqa: BLE001
-        log.exception("보관 %s 처리 중 오류", item.ask_id)
-        r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
+        trip = hangwatch.tripped()
+        if trip is not None:
+            # 감시 스레드가 멈춘 탭을 닫아 걸려 있던 호출이 오류로 끝난 것 - PageStalled 와 같은 사건이다 ([재입찰] 과 같은 분류)
+            log.warning("보관 %s: %s (다음 항목은 새 탭에서)", item.ask_id, trip.describe())
+            r.status, r.detail = "확인필요", f"{NOT_LOADED_PREFIX} - 올리지 않음: {trip.describe()}"
+        else:
+            log.exception("보관 %s 처리 중 오류", item.ask_id)
+            r.status, r.detail = "오류", f"{type(e).__name__}: {e}"
+    finally:
+        hangwatch.take_trip()
     return r
+
+
+def _relogin(tab: LiveTab, api: ApiClient, settings: Settings) -> bool:
+    """목록을 읽다 로그인이 풀린 것이 보였을 때 다시 로그인한다. 됐으면 True (바로 다시 읽어도 됨).
+
+    로그인 확인 중 탭이 멈췄으면 그 탭을 버리고 False - 부른 쪽이 쉬었다가 새 탭에서 다시 읽는다 (예외로 올리면 [판매] 가 통째로 끝난다)."""
+    log.info("로그인이 풀림 - 다시 로그인하고 목록을 다시 읽음")
+    try:
+        auth.ensure_logged_in(tab(), settings)
+    except PageStalled as e:
+        log.warning("로그인 확인 중 %s - 탭을 닫음 (다음에는 새 탭에서)", e)
+        tab.drop()
+        return False
+    api.invalidate()
+    return True
+
+
+def _read_with_relogin(tab: LiveTab, api: ApiClient, settings: Settings, read: Callable[[], T]) -> T:
+    """보관 목록 읽기(read)를 한다. 로그인이 풀렸으면(401) 다시 로그인하고 딱 한 번 더 - 그래도 안 되면 그 ApiError 를 올린다
+    (부른 쪽이 쉬었다 다시 읽는다. 쉼 없이 로그인만 되풀이하지 않게)."""
+    for again in (False, True):
+        try:
+            with hangwatch.watching(tab()):
+                return read()
+        except ApiError as e:
+            if again or not e.is_auth_lost or not _relogin(tab, api, settings):
+                raise
+        finally:
+            hangwatch.take_trip()
+    raise AssertionError("unreachable")
 
 
 # ---------------------------------------------------------------- 사이클 반복
@@ -483,7 +532,8 @@ def run(context: SharedContext, page: Page, settings: Settings,
     stop = should_stop or (lambda: False)
     status = on_status or (lambda _t: None)
     results: list[ProductResult] = []
-    api = ApiClient(page, context.raw)
+    tab = LiveTab(context, page)
+    api = ApiClient(tab, context.raw)
     state = SellState()
     pacer = pacing.API_PACER
     log.info(pacer.describe_setup())
@@ -492,16 +542,14 @@ def run(context: SharedContext, page: Page, settings: Settings,
         cycle += 1
         started = time.monotonic()
         status(f"판매 {cycle}회차: 보관 목록 읽는 중...")
+        def read() -> list[StockItem]:
+            found = list_stock(api, stop)
+            attach_buy_prices(api, found, state.known_buy, stop)
+            return found
+
         try:
-            with hangwatch.watching(page):
-                items = list_stock(api, stop)
-                attach_buy_prices(api, items, state.known_buy, stop)
-        except ApiError as e:
-            if e.is_auth_lost:
-                log.info("로그인이 풀림 (%s) - 다시 로그인하고 목록을 다시 읽음", e)
-                auth.ensure_logged_in(page, settings)
-                api.invalidate()
-                continue
+            items = _read_with_relogin(tab, api, settings, read)
+        except ApiError:
             log.exception("%d회차: 보관 목록을 읽지 못함 - %d초 뒤 다시", cycle, CYCLE_GAP_SEC)
             if not sleep_with_stop(CYCLE_GAP_SEC, stop):
                 break
@@ -519,7 +567,7 @@ def run(context: SharedContext, page: Page, settings: Settings,
                 log.info("사용자 요청으로 중지 - 남은 항목 %d건은 보지 않음", len(items) - len(cycle_results))
                 break
             status(f"판매 {cycle}회차: {order}/{len(items)} {item.name[:24]} ({pacer.describe()})")
-            r = sell_with_relogin(page, item, order, cycle, api, settings, state, stop, status)
+            r = sell_with_relogin(tab, item, order, cycle, api, settings, state, stop, status)
             r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             log.info("[%d회차 %d번째] 결과: %s - %s", cycle, order, r.status, r.detail)
             cycle_results.append(r)
@@ -629,10 +677,11 @@ class SellEngine:
             while not self._closed.is_set():
                 self._emit("status", "로그인 확인 중...")
                 with auth.session(s) as (context, page):
-                    api = ApiClient(page, context.raw)
+                    tab = LiveTab(context, page)
+                    api = ApiClient(tab, context.raw)
                     log.info(pacing.API_PACER.describe_setup())
                     try:
-                        self._loop(page, api)
+                        self._loop(tab, api)
                         return
                     except Exception as e:  # noqa: BLE001
                         log.exception("판매 엔진 오류 - %d초 뒤 브라우저 세션을 다시 열어 이어서 돕니다", RECONNECT_SEC)
@@ -644,7 +693,7 @@ class SellEngine:
         finally:
             self._emit("closed")
 
-    def _loop(self, page: Page, api: ApiClient) -> None:
+    def _loop(self, tab: LiveTab, api: ApiClient) -> None:
         state = SellState()
         cycle = 0
         order = 0
@@ -672,13 +721,13 @@ class SellEngine:
             if pending:
                 item = pending.pop(0)
                 order += 1
-                self._sell_one(page, api, state, item, cycle, order)
+                self._sell_one(tab, api, state, item, cycle, order)
                 if not pending:
                     self._emit("status", f"{cycle}회차 끝 - {CYCLE_GAP_SEC}초 뒤 다시")
                     wait = CYCLE_GAP_SEC
                 continue
             # 목록 읽기: 경쟁 중이면 사이클 시작(팔린 것 빠짐, 남이 바꾼 가격 반영), 아니면 새 입고가 창에 보이도록 읽기만
-            self._refresh(page, api, state, manual)
+            self._refresh(tab, api, state, manual)
             manual = False
             wait = NEW_STOCK_CHECK_SEC
             if self.running:
@@ -691,11 +740,11 @@ class SellEngine:
                 else:
                     self._emit("status", f"{cycle}회차: 경쟁에 넣은 항목이 없음 - {CYCLE_GAP_SEC}초 뒤 다시")
 
-    def _sell_one(self, page: Page, api: ApiClient, state: SellState, item: StockItem, cycle: int, order: int) -> None:
+    def _sell_one(self, tab: LiveTab, api: ApiClient, state: SellState, item: StockItem, cycle: int, order: int) -> None:
         """항목 하나를 판정하고 결과를 창에 보낸다 (로그인이 풀렸으면 sell_with_relogin 이 다시 로그인하고 한 번 더)."""
         rule = self._rule(item)
         self._emit("status", f"{cycle}회차 {order}: {item.name[:24]} ({pacing.API_PACER.describe()})")
-        r = sell_with_relogin(page, item, order, cycle, api, self.settings, state, self._stop_tick.is_set, None, floor=rule.floor)
+        r = sell_with_relogin(tab, item, order, cycle, api, self.settings, state, self._stop_tick.is_set, None, floor=rule.floor)
         r.time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log.info("[%d회차 %d번째] 결과: %s - %s", cycle, order, r.status, r.detail)
         self.results.append(r)
@@ -709,27 +758,26 @@ class SellEngine:
         rule = self._rule(item)
         return item.is_free_mode(self.settings) or (rule.compete and rule.floor is not None)
 
-    def _refresh(self, page: Page, api: ApiClient, state: SellState, manual: bool) -> None:
+    def _refresh(self, tab: LiveTab, api: ApiClient, state: SellState, manual: bool) -> None:
         """목록을 읽고 매입가를 붙여 GUI 로 보낸다 (내용이 바뀌었을 때만). 매입가·하한 제안은 규칙에 채워 둔다 (경쟁 여부는 건드리지 않음).
 
         매입가 짝을 못 찾은 항목은 다시 찾지 않는다 (구매 내역 전체를 읽는 일이라 사이클마다 반복하면 안 됨) - 사용자가 새로고침(manual)하면 다시 찾는다.
         """
         if manual:
             self._emit("status", "보관 목록 읽는 중...")
+        def read() -> list[StockItem]:
+            found = list_stock(api)
+            for i in found:
+                rule = self._rule(i)
+                if rule.buy_price:
+                    i.buy_price, i.buy_oid = rule.buy_price, rule.buy_oid
+            attach_buy_prices(api, [i for i in found if manual or i.ask_id not in state.buy_tried], state.known_buy)
+            state.buy_tried.update(i.ask_id for i in found)
+            return found
+
         try:
-            with hangwatch.watching(page):
-                items = list_stock(api)
-                for i in items:
-                    rule = self._rule(i)
-                    if rule.buy_price:
-                        i.buy_price, i.buy_oid = rule.buy_price, rule.buy_oid
-                attach_buy_prices(api, [i for i in items if manual or i.ask_id not in state.buy_tried], state.known_buy)
-                state.buy_tried.update(i.ask_id for i in items)
+            items = _read_with_relogin(tab, api, self.settings, read)
         except ApiError as e:
-            if e.is_auth_lost:
-                auth.ensure_logged_in(page, self.settings)
-                api.invalidate()
-                return self._refresh(page, api, state, manual)
             log.exception("보관 목록을 읽지 못함")
             self._emit("error", f"보관 목록을 읽지 못함: {e}")
             return

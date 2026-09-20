@@ -17,7 +17,9 @@ from datetime import datetime
 
 from . import auth, cancel, history, history_report, pacing, pipeline, ranking, rebid, report, search, sell, shop, store
 from .api import ApiClient
+from .browser import LiveTab
 from .config import Settings
+from .errors import PageStalled
 from .history import HistoryResult
 from .ranking import DEFAULT_CATEGORY
 from .report import REPORT_DIR, ProductResult
@@ -233,10 +235,12 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
     with auth.session(settings) as (context, page):
         # 마이페이지에 이미 입찰 중인 상품은 건너뛴다 (bids.json 과 별개로 실제 목록을 본다)
         # 시세 API (상품 상세) - 상품마다 한 번, 가격을 먼저 거른다 (pipeline 머리글). 헤더는 아래 목록 페이지가 보내는 요청에서 받아 둔다
-        api = ApiClient(page, context.raw)
+        # 목록·API 가 쓰는 탭은 작업 내내 하나다 - (멈춰서) 닫혔으면 새 탭으로 갈아 끼운다 (닫힌 탭을 들고 있으면 남은 상품이 전부 오류로 끝난다)
+        tab = LiveTab(context, page)
+        api = ApiClient(tab, context.raw)
         log.info(pacing.API_PACER.describe_setup())
         log.info("마이페이지 구매 입찰 목록 확인 중...")
-        open_bids = cancel.open_bid_products(context, page)
+        open_bids = cancel.open_bid_products(context, tab())
         rejected_categories = store.CategoryRejections()   # 오늘 사이트가 카테고리 단위로 거절한 입찰 - 그날은 전부 건너뜀 (store 참고)
         if rejected_categories.rejected:
             log.info("오늘 사이트가 거절한 카테고리 (상품을 전부 건너뜀): %s", rejected_categories.describe())
@@ -246,7 +250,7 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
                                            url=f"https://kream.co.kr/products/{pid}", category="지정")
                      for i, pid in enumerate(product_ids)]
             results = pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
-                                   open_bids=open_bids, page=page, on_status=on_status, api=api,
+                                   open_bids=open_bids, page=tab(), on_status=on_status, api=api,
                                    rejected=rejected_categories)
         else:
             sources = _product_sources(settings, categories, keywords, shop_categories)
@@ -258,9 +262,11 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
                     break
                 log.info("===== %s %d/%d: '%s' =====", src.kind, n, len(sources), src.name)
                 try:
-                    items = src.collect(page)
+                    items = src.collect(tab())
                 except Exception as e:  # noqa: BLE001
                     log.exception("%s '%s' 목록을 열지 못해 건너뜀", src.kind, src.name)
+                    if isinstance(e, PageStalled):
+                        tab.drop()   # 다음 목록은 새 탭에서
                     results.append(ProductResult(
                         rank=0, product_id=0, name=f"[{src.label}] 목록 열기 실패", url=src.url, category=src.label,
                         status="오류", detail=f"{type(e).__name__}: {e}"))
@@ -283,7 +289,7 @@ def run_job(settings: Settings, categories: str | list[str] | None = None,
                 items, skipped = skip_low_trades(items, settings, on_result)
                 results.extend(skipped)
                 results.extend(pipeline.run(context, items, settings, should_stop=should_stop, on_result=on_result,
-                                            open_bids=open_bids, page=page, on_status=on_status, api=api,
+                                            open_bids=open_bids, page=tab(), on_status=on_status, api=api,
                                             rejected=rejected_categories))
 
     log.info("==== 결과 ====")
