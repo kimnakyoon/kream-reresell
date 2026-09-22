@@ -11,6 +11,7 @@
      같은 구매의 상세(api/m/bids/{id})에서 keep.ask_id 로 확인. 매입가 = 그 상세의 price_breakdown.total_price. 짝이 없으면 건너뛴다 (보고서에 남김).
      한 번 붙인 매입가는 실행 내내 기억한다 (사이클마다 다시 읽지 않음).
   3. 하한 = 매입가 × (1 + 하한 마진율) ÷ (1 − 판매 수수료율) 을 1,000원 단위로 올림. 판매 수수료율은 항목의 price_breakdown 에서 읽는다 (지금 0.5%).
+     어떤 하한이든(직접 넣은 것·보관료 기한 항목 포함) KREAM 판매 희망가 최저값 MIN_ASK(20,000원) 아래로는 걸 수 없어 그 값이 바닥 (2026-09-22 실측).
   4. 항목 하나마다 시세 API 한 번(market.fetch_market_paced, 틱 6초)으로 그 옵션의 빠른배송 최저가(lowest_100 = A)를 읽는다.
      - A 가 내 가격보다 낮으면 (남이 아래로 걸음) → 목표가 = max(하한, A − 1,000). 목표가가 지금 가격과 같으면 '하한대기'.
      - A 가 내 가격과 같으면 내 것인지 남의 것인지 API 로는 알 수 없다 (같은 값에 먼저 등록한 사람이 먼저 팔린다) → **탐침**: 내 가격을 잠깐 올려
@@ -62,6 +63,7 @@ log = logging.getLogger(__name__)
 T = TypeVar("T")
 
 STEP = 1000                 # 경쟁 최저가보다 이만큼 아래로 (사용자 결정 2026-09-17: 1순위가 되는 값)
+MIN_ASK = 20000             # KREAM 판매 희망가 최저값 - 이보다 낮으면 review_live 가 400 {success: false} (2026-09-22 실측: 19,000 거절, 20,000 통과)
 CYCLE_GAP_SEC = 60          # 사이클 사이 쉼
 PROBE_EVERY_SEC = 600       # 같은 항목의 탐침은 이 간격으로만
 PROBE_MIN_UP = 5000         # 탐침 때 올리는 최소 폭
@@ -230,8 +232,9 @@ def attach_buy_prices(api: ApiClient, items: list[StockItem], known: dict[int, t
 
 
 def floor_price(buy_price: int, margin_rate: float, fee_rate: float) -> int:
-    """하한 = 매입가 × (1 + 마진율) ÷ (1 − 판매 수수료율), 1,000원 단위 올림 - 이 값에 팔리면 정산금이 매입가 × (1 + 마진율) 이상."""
-    return int(math.ceil(buy_price * (1 + margin_rate) / (1 - fee_rate) / 1000.0)) * 1000
+    """하한 = 매입가 × (1 + 마진율) ÷ (1 − 판매 수수료율), 1,000원 단위 올림 - 이 값에 팔리면 정산금이 매입가 × (1 + 마진율) 이상.
+    사이트 최저값(MIN_ASK) 아래로는 걸 수 없으므로 그 값이 바닥."""
+    return max(MIN_ASK, int(math.ceil(buy_price * (1 + margin_rate) / (1 - fee_rate) / 1000.0)) * 1000)
 
 
 def probe_up(price: int) -> int:
@@ -321,8 +324,8 @@ def sell_one(item: StockItem, order: int, cycle: int, api: ApiClient, settings: 
     try:
         free = item.is_free_mode(settings)
         if free:
-            # 보관료 무료 기간이 끝나기 전에 팔아야 하는 항목 - 하한 없이 경쟁 (머리글 4). 1,000원은 형식상 최저값
-            floor = STEP
+            # 보관료 무료 기간이 끝나기 전에 팔아야 하는 항목 - 하한 없이 경쟁 (머리글 4). 바닥은 사이트 최저값
+            floor = MIN_ASK
             r.detail = f"[보관 {item.stored_days}일째 - 하한 없이 경쟁] "
         elif floor is None and item.buy_price is None:
             r.status, r.detail = "건너뜀", "매입 내역을 찾지 못해 하한을 정할 수 없음 (수동으로 산 상품이면 하한을 직접 넣거나 이 프로그램으로 팔지 않음)"
@@ -336,6 +339,7 @@ def sell_one(item: StockItem, order: int, cycle: int, api: ApiClient, settings: 
             state.base_price.setdefault(item.ask_id, item.price)
         if floor is None:
             floor = floor_price(item.buy_price, settings.sell_margin_rate, item.fee_rate)
+        floor = max(floor, MIN_ASK)   # 판매 관리 창에서 직접 넣은 하한도 사이트 최저값 아래로는 못 건다
         r.price_r = None if free else floor
 
         market = market_mod.fetch_market_paced(api, item.product_id, should_stop, on_status)
@@ -363,6 +367,7 @@ def sell_one(item: StockItem, order: int, cycle: int, api: ApiClient, settings: 
                 _set(r, "유지", f"경쟁 최저가 {_won(lowest)}, 내 가격 그대로")
             return r
         why = (f"경쟁 최저가 {lowest:,}원 − {STEP:,}원" if lowest is not None and target == lowest - STEP
+               else f"경쟁 최저가 {lowest:,}원 − {STEP:,}원이 KREAM 최저 판매가 아래 - {MIN_ASK:,}원에 둠" if lowest is not None and target == MIN_ASK
                else f"경쟁 최저가 {_won(lowest)}이 하한 아래 - 하한에 둠" if lowest is not None
                else "빠른배송 판매자 없음 - 하한에 둠")
         if not live:

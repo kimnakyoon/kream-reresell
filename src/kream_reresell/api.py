@@ -13,6 +13,7 @@ API 는 브라우저 밖에서 부르면 막히지만(요청 서명, 2026-09-04 
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -171,7 +172,9 @@ class ApiClient:
             return ApiError(f"API 호출 실패 ({path}): {res.get('text', '')[:200]}", status=-1, kind="network")
         if status == 0:
             return ApiError(f"API 호출 실패 ({path}): {res.get('text', '')[:200]}", status=0, kind="page")
-        return ApiError(f"API 응답 오류 {status} ({path}): {res.get('text', '')[:200]}", status=status, kind="http")
+        # 본문이 JSON 이면 JS 쪽이 text 를 비워 보낸다 - 그때는 본문을 적는다 (2026-09-22: review_live 400 의 {success: false} 가 로그에 안 남았음)
+        detail = res.get("text") or (json.dumps(res["body"], ensure_ascii=False) if res.get("body") is not None else "")
+        return ApiError(f"API 응답 오류 {status} ({path}): {detail[:200]}", status=status, kind="http")
 
     def _fetch(self, paths: list[str], retry: bool = True) -> list[dict | ApiError]:
         """GET 여러 개를 한 번에 받는다 (PARALLEL_FETCH 개 이하). 항목마다 응답 dict 또는 ApiError."""
